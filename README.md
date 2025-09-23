@@ -1,4 +1,4 @@
-# MIN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning (NeurIPS 2025)
+# MiN: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning (NeurIPS 2025)
 
 <p align="center">
   <a href='https://arxiv.org/abs/2509.16738'><img src='https://img.shields.io/badge/Arxiv-2509.16738-b31b1b.svg?logo=arXiv'></a>
@@ -65,12 +65,10 @@ We hasv tested our code before uploading. The log files can be found in MiN/log.
 
 **If you use any content of this repo for your work, please cite the following bib entries:**
 
-    @misc{jiang2025minmixturenoisepretrained,
+    @inproceedings{MiN,
       title={Min: Mixture of Noise for Pre-Trained Model-Based Class-Incremental Learning}, 
       author={Kai Jiang and Zhengyan Shi and Dell Zhang and Hongyuan Zhang and Xuelong Li},
+      booktitle={The Thirty-Ninth Annual Conference on Neural Information Processing Systems (NeurIPS)},
       year={2025},
-      eprint={2509.16738},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2509.16738}
-      }
+      pages={},
+    }
