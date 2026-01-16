@@ -61,116 +61,113 @@ class Noise_weigh(nn.Module):
         return x * self.weight
 
 
-class PiNoise(torch.nn.Linear):
+import torch
+import torch.nn as nn
+import copy
+
+class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(PiNoise, self).__init__()
         
-        # --- 1. Down/Up Projection (Giống code gốc) ---
-        # Code gốc dùng mẹo register_buffer đè lên weight của nn.Linear để init
-        # Ở đây ta viết tường minh: Khởi tạo ngẫu nhiên (Kaiming/Xavier) cho phép chiếu
-        self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
-        nn.init.xavier_uniform_(self.w_down) # Hoặc Kaiming Uniform tùy preference
-        
-        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
-        nn.init.xavier_uniform_(self.w_up)
-
-        # Nhánh Residual chính (Identity shortcut)
+        # --- Shared Fixed Parts ---
         self.MLP = nn.Linear(in_dim, out_dim)
         torch.nn.init.constant_(self.MLP.weight, 0)
         torch.nn.init.constant_(self.MLP.bias, 0)
 
+        self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
+        nn.init.xavier_uniform_(self.w_down) 
+        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
+        nn.init.xavier_uniform_(self.w_up)
+
         self.hidden_dim = hidden_dim
         self.act = nn.GELU()
 
-        # --- 2. Hai MLP chính (MU & SIGMA) ---
-        # CHUẨN CODE GỐC: Khởi tạo Linear
+        # --- Trainable Parts (Sẽ được Merge) ---
+        # Chỉ duy trì 1 bản thể duy nhất của mạng Noise
         self.mu = nn.Linear(hidden_dim, hidden_dim)
         self.sigma = nn.Linear(hidden_dim, hidden_dim)
         
-        # CHUẨN CODE GỐC: Init toàn bộ trọng số và bias về 0
-        # Để đảm bảo ban đầu Noise = 0
-        torch.nn.init.constant_(self.mu.weight, 0.)
-        torch.nn.init.constant_(self.mu.bias, 0.)
-        torch.nn.init.constant_(self.sigma.weight, 0.)
-        torch.nn.init.constant_(self.sigma.bias, 0.)
+        # Init = 0 (Base)
+        self._init_zero(self.mu)
+        self._init_zero(self.sigma)
 
-        # --- 3. Kho lưu trữ cho MagMax ---
-        self.history_tau_mu = []    
-        self.history_tau_sigma = [] 
+        # --- History Storage (CPU) ---
+        # Lưu các "Task Vectors" (chính là bộ weight của từng task sau khi train)
+        self.history_mu = []    
+        self.history_sigma = [] 
+
+    def _init_zero(self, module):
+        torch.nn.init.constant_(module.weight, 0.)
+        torch.nn.init.constant_(module.bias, 0.)
 
     def update_noise(self):
         """
-        Chuẩn bị cho task mới.
+        [Bước 2]: Sequential Init.
+        Không reset weight. Giữ nguyên weight (đã merge từ task trước) để train tiếp.
+        Chỉ cần mở khóa gradient.
         """
-        # Nếu là Task 0 (đầu tiên): Đảm bảo nó là số 0 thuần túy (như code gốc)
-        if len(self.history_tau_mu) == 0:
-            torch.nn.init.constant_(self.mu.weight, 0.)
-            torch.nn.init.constant_(self.mu.bias, 0.)
-            torch.nn.init.constant_(self.sigma.weight, 0.)
-            torch.nn.init.constant_(self.sigma.bias, 0.)
-        
-        # Nếu là Task > 0:
-        # Code gốc: Reset về 0.
-        # Code MagMax: KHÔNG RESET. Giữ nguyên trọng số hiện tại (Sequential Init).
-        # Lý do: Ta muốn task mới học tiếp từ kiến thức task cũ.
-        
-        # Unfreeze để bắt đầu train
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
 
     def after_task_training(self):
-        """Lưu Task Vector (Theta_t) và Merge"""
-        # 1. Lưu trọng số task vừa học (Task Vector)
-        # Vì khởi tạo base = 0, nên Weight này chính là Tau
-        mu_end = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_end = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        """
+        [Bước 3 & 4]: Lưu Task Vector và thực hiện Parameter-wise MagMax
+        """
+        # 1. Lưu trọng số task vừa học (Task Vector t)
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
-        self.history_tau_mu.append(mu_end)
-        self.history_tau_sigma.append(sigma_end)
+        self.history_mu.append(mu_state)
+        self.history_sigma.append(sigma_state)
 
-        # 2. Thực hiện MagMax Merge
-        self._perform_magmax_merge()
+        # 2. Tính MagMax và Load lại vào mạng (Merge cứng)
+        self._perform_parameter_magmax()
 
-    def _perform_magmax_merge(self):
-        if not self.history_tau_mu: return
+    def _perform_parameter_magmax(self):
+        if not self.history_mu: return
 
-        def merge_dicts(history_list):
+        def merge_state_dicts(history_list):
             keys = history_list[0].keys()
             merged_dict = {}
+            
             for key in keys:
-                # Stack: [Num_Tasks, Out, In]
+                # Stack toàn bộ lịch sử weights: [Num_Tasks, Out_Features, In_Features]
                 stacked_params = torch.stack([d[key] for d in history_list], dim=0)
                 
-                # --- MAGMAX: Max Magnitude Selection ---
+                # --- MAGMAX LOGIC TRÊN PARAMETER ---
+                # 1. Tính độ lớn (Magnitude) của từng tham số
                 magnitudes = torch.abs(stacked_params)
+                
+                # 2. Tìm index của task có tham số lớn nhất tại vị trí đó
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
+                
+                # 3. Chọn tham số đó (Gather)
                 best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
                 
+                # Trả về GPU để load vào model
                 merged_dict[key] = best_param.to(self.w_down.device)
+            
             return merged_dict
 
-        # Load bộ tham số đã merge vào mạng
-        self.mu.load_state_dict(merge_dicts(self.history_tau_mu))
-        self.sigma.load_state_dict(merge_dicts(self.history_tau_sigma))
-    
-    def unfreeze_noise(self):
+        # Merge xong thì load ngược lại vào self.mu và self.sigma
+        # Lúc này self.mu chứa các trọng số "mạnh nhất" từ tất cả các task
+        self.mu.load_state_dict(merge_state_dicts(self.history_mu))
+        self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 
-        for param in self.mu[-1].parameters():
-            param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
-            param.requires_grad = True
-
-    def forward(self, hyper_features):
+    def forward(self, hyper_features, new_forward=False):
+        # Forward đơn giản: Chỉ chạy qua mạng hiện tại (đã được merge)
         x1 = self.MLP(hyper_features)
-
         x_down = hyper_features @ self.w_down
-
+        
         noise = self.mu(x_down) + self.sigma(x_down)
         
         return x1 + (noise @ self.w_up) + hyper_features
-
+    
+    # Hàm tương thích ngược
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
+    def init_weight_noise(self, prototypes): pass
+    def unfreeze_noise(self): self.update_noise()
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
