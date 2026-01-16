@@ -116,13 +116,32 @@ class MiNbaseNet(nn.Module):
             # Task đầu: Có bias
             fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
-        if self.normal_fc is None:
-            self.normal_fc = fc
+        if self.normal_fc is not None:
+            # Lấy số output cũ (số class đã học)
+            old_nb_output = self.normal_fc.out_features
+            
+            # Copy trọng số (Weight)
+            # new_fc.weight shape: [new_total_classes, feature_dim]
+            # Copy phần cũ vào
+            with torch.no_grad():
+                new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
+                
+                # Phần mới (từ old_nb_output đến hết) khởi tạo bằng 0 
+                # (để không gây nhiễu ban đầu, học dần lên từ 0)
+                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
+                
+                # Copy bias (nếu cả 2 đều có bias - thường chỉ xảy ra nếu ta đổi thiết kế)
+                # Nhưng theo logic trên: Task 0 có bias -> Task 1 không bias. 
+                # Nên ta bỏ qua việc copy bias ở các task sau để tránh lỗi shape/logic.
         else:
-            # Reset weight về 0 (hoặc init lại) cho sạch
-            nn.init.constant_(fc.weight, 0.)
-            del self.normal_fc
-            self.normal_fc = fc
+            # Task đầu tiên: Init bình thường (hoặc 0)
+            nn.init.constant_(new_fc.weight, 0.)
+            if new_fc.bias is not None:
+                nn.init.constant_(new_fc.bias, 0.)
+
+        # Xóa cũ, gán mới
+        del self.normal_fc
+        self.normal_fc = new_fc
 
     # =========================================================================
     # [MAGMAX & NOISE CONTROL SECTION]
@@ -274,3 +293,4 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
+
