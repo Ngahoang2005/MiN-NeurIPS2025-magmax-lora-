@@ -76,8 +76,12 @@ class PiNoise(torch.nn.Linear):
 
         self.hidden_dim = hidden_dim
 
-        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.w_down = nn.Parameter(torch.empty((in_dim, hidden_dim)))
+        nn.init.xavier_uniform_(self.w_down) 
+        self.w_up = nn.Parameter(torch.empty((hidden_dim, out_dim)))
+        nn.init.xavier_uniform_(self.w_up)
         self.register_buffer("weight", self.w_down)
+        
 
         self.reset_parameters()
 
@@ -86,11 +90,13 @@ class PiNoise(torch.nn.Linear):
         self.mu = nn.ModuleList()
         self.sigmma = nn.ModuleList()
 
-        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_up)
         self.reset_parameters()
 
         self.weight_noise = None
+        # Kho chứa lịch sử tham số (Lưu trên CPU để tránh chiếm VRAM)
+        self.history_mu = []    # List chứa các state_dict của mu
+        self.history_sigma = [] # List chứa các state_dict của sigma
 
     def update_noise(self):
 
@@ -102,13 +108,64 @@ class PiNoise(torch.nn.Linear):
             torch.nn.init.constant_(self.sigmma[0].weight, 0.)
             torch.nn.init.constant_(self.sigmma[0].bias, 0.)
         else:
-            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.mu[-1].weight, 0.)
-            torch.nn.init.constant_(self.mu[-1].bias, 0.)
-            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
-            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
-    
+            for param in self.mu.parameters(): param.requires_grad = True
+            for param in self.sigma.parameters(): param.requires_grad = True
+    def after_task_training(self):
+        """
+        Gọi hàm này SAU KHI train xong 1 task.
+        """
+        # [Bước 3 của bạn]: Lưu Task Vector (Tham số của 2 MLP)
+        # Đưa về CPU để tiết kiệm bộ nhớ GPU
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        
+        self.history_mu.append(mu_state)
+        self.history_sigma.append(sigma_state)
+
+        # [Bước 4 của bạn]: Tính Tau MagMax và cập nhật lại tham số mạng
+        self._perform_magmax_merge()
+
+    def _perform_magmax_merge(self):
+        """
+        Hợp nhất tất cả lịch sử thành một bộ tham số tối ưu theo MagMax
+        """
+        if not self.history_mu:
+            return
+
+        # Hàm helper để merge một list các state_dict
+        def merge_dictionaries(history_list):
+            # Lấy key đầu tiên làm mẫu (weight, bias)
+            keys = history_list[0].keys()
+            merged_dict = {}
+            
+            for key in keys:
+                # Stack tất cả trọng số của các task lại: [Num_Task, Out, In]
+                # Ví dụ: Task 1, Task 2, Task 3...
+                stacked_params = torch.stack([d[key] for d in history_list], dim=0)
+                
+                # --- MAGMAX LOGIC ---
+                # Tính độ lớn (Magnitude)
+                magnitudes = torch.abs(stacked_params)
+                
+                # Tìm index của task có magnitude lớn nhất (argmax theo trục 0)
+                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
+                
+                # Lấy giá trị tham số tại index đó
+                best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
+                
+                # Gán vào dict kết quả (Đưa lại về device của model)
+                merged_dict[key] = best_param.to(self.w_down.device)
+            
+            return merged_dict
+
+        # Merge Mu và Sigma
+        new_mu_state = merge_dictionaries(self.history_mu)
+        new_sigma_state = merge_dictionaries(self.history_sigma)
+
+        # Load bộ tham số đã merge vào mạng
+        # Lúc này self.mu và self.sigma chứa kiến thức của TẤT CẢ các task
+        self.mu.load_state_dict(new_mu_state)
+        self.sigma.load_state_dict(new_sigma_state)
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
@@ -139,19 +196,9 @@ class PiNoise(torch.nn.Linear):
 
         x_down = hyper_features @ self.w_down
 
-        noise = None
-
-        for i in range(len(self.mu)):
-            mu = self.mu[i](x_down)
-            sigmma = self.sigmma[i](x_down)
-            if noise is None:
-                noise = (mu + sigmma) * self.weight_noise[i]
-            else:
-                noise += (mu + sigmma) * self.weight_noise[i]
-
-        noise = noise @ self.w_up
-
-        return x1 + noise + hyper_features
+        noise = self.mu(x_down) + self.sigma(x_down)
+        
+        return x1 + (noise @ self.w_up) + hyper_features
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
