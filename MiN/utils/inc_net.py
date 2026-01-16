@@ -47,7 +47,6 @@ class BaseIncNet(nn.Module):
 class RandomBuffer(torch.nn.Linear):
     """
     Lớp mở rộng đặc trưng ngẫu nhiên (Random Projection).
-    Giúp tăng chiều không gian để thuật toán Analytic Learning phân tách lớp tốt hơn.
     """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(torch.nn.Linear, self).__init__()
@@ -111,18 +110,29 @@ class MiNbaseNet(nn.Module):
         # Tạo mới Normal FC cho task hiện tại
         if self.cur_task > 0:
             # Task sau: Không dùng Bias để tránh bias vào lớp mới quá nhiều
-            fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
+            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
             # Task đầu: Có bias
-            fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
+            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
+            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
-        if self.normal_fc is None:
-            self.normal_fc = fc
-        else:
-            # Reset weight về 0 (hoặc init lại) cho sạch
-            nn.init.constant_(fc.weight, 0.)
+        if self.normal_fc is not None:
+            # Sequential Init: Copy trọng số cũ
+            old_nb_output = self.normal_fc.out_features
+            with torch.no_grad():
+                # Copy phần cũ
+                new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
+                # Init phần mới về 0
+                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
+            
             del self.normal_fc
-            self.normal_fc = fc
+            self.normal_fc = new_fc
+        else:
+            # Task đầu tiên
+            nn.init.constant_(new_fc.weight, 0.)
+            if new_fc.bias is not None:
+                nn.init.constant_(new_fc.bias, 0.)
+            self.normal_fc = new_fc
 
     # =========================================================================
     # [MAGMAX & NOISE CONTROL SECTION]
@@ -143,6 +153,7 @@ class MiNbaseNet(nn.Module):
         """
         print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
         for j in range(self.backbone.layer_num):
+            # Hàm này nằm trong PiNoise
             self.backbone.noise_maker[j].after_task_training()
 
     def unfreeze_noise(self):
@@ -201,17 +212,11 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.weight.shape[1]:
-                # Trường hợp này hiếm khi xảy ra trong CIL chuẩn (chỉ thêm, ko bớt)
-                # Nhưng thêm vào để robust (ví dụ khi refit chỉ trên tập con)
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. Công thức cập nhật RLS (Sherman-Morrison formula block-wise)
-            # K = R * X^T * (I + X * R * X^T)^-1
-            # W_new = W_old + K * (Y - X * W_old)
-            # R_new = R - K * X * R
-            
+            # 3. Công thức cập nhật RLS
             I = torch.eye(X.shape[0]).to(X)
             term = I + X @ self.R @ X.T
             
@@ -237,7 +242,6 @@ class MiNbaseNet(nn.Module):
         Chạy qua backbone (đã merge noise) -> Buffer -> Analytic Classifier.
         """
         if new_forward:
-            # Nếu cần chế độ forward đặc biệt (thường ít dùng với MagMax parameter-level)
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
