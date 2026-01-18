@@ -130,6 +130,9 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
+        # [FIX] Cập nhật known_class NGAY SAU update_fc
+        self.known_class = self.init_class
+        
         # [HYBRID PROTOTYPE] - Lưu CFS samples vào network
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
@@ -180,6 +183,9 @@ class MinNet(object):
         self._clear_gpu()
 
         self._network.update_fc(self.increment)
+        
+        # [FIX] Cập nhật known_class NGAY SAU update_fc
+        self.known_class += self.increment
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self._network.update_noise()
