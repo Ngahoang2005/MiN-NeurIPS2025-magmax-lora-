@@ -22,43 +22,6 @@ from torch.amp import autocast, GradScaler
 
 EPSILON = 1e-8
 
-# --- CFS Helper Classes ---
-class NegativeContrastiveLoss(torch.nn.Module):
-    def __init__(self, tau=0.1):
-        super().__init__()
-        self.tau = tau
-    
-    def forward(self, x): 
-        # x: [Batch, Dim]
-        x = F.normalize(x, dim=1)
-        
-        # Tính Cosine Similarity Matrix
-        cos = x @ x.T / self.tau
-        
-        exp_cos = torch.exp(cos)
-        
-        # Mask bỏ đường chéo (chính nó)
-        mask = torch.eye(x.size(0), device=x.device).bool()
-        exp_cos = exp_cos.masked_fill(mask, 0)
-        
-        loss = torch.log(exp_cos.sum(dim=1) / (x.size(0) - 1) + 1e-8)
-        return torch.mean(loss)
-
-class CFS_Mapping(torch.nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.f_cont = torch.nn.Sequential(
-            torch.nn.Linear(dim, dim),
-            torch.nn.LayerNorm(dim), 
-            torch.nn.GELU(),
-            torch.nn.Linear(dim, dim)
-        )
-    
-    def forward(self, x):
-        x = self.f_cont(x)
-        return F.normalize(x, p=2, dim=1)
-
-# --- Main Class ---
 class MinNet(object):
     def __init__(self, args, loger):
         super().__init__()
@@ -96,6 +59,7 @@ class MinNet(object):
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
+        # [ADDED] Hàm dọn dẹp GPU
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -127,6 +91,7 @@ class MinNet(object):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
+        # [MODIFIED] Thêm no_grad và autocast để test nhanh và nhẹ hơn
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
@@ -168,14 +133,15 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
+        # [FIX OOM] Dọn GPU trước và sau khi tính proto
         self._clear_gpu()
+        
         
         self.run(train_loader)
-        # Nếu bên inc_net chưa có hàm này thì xóa dòng dưới đi
-        if hasattr(self._network, 'after_task_magmax_merge'):
-             self._network.after_task_magmax_merge()
+        self._network.after_task_magmax_merge()
         
         self._clear_gpu()
+       
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
@@ -194,19 +160,9 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # --- [SỬA LỖI ZERO DIVISION] ---
-        # Ở Task 0, known_class = 0, nên phải dùng init_class để chia
-        n_samples = self.buffer_size // self.init_class
+        self.re_fit(train_loader, test_loader)
         
-        cfs_feats, cfs_lbls = self.select_diverse_features_cfs(
-            self._network, 
-            train_loader, 
-            n_samples_per_class=n_samples
-        )
-
-        self.re_fit((cfs_feats, cfs_lbls), test_loader)
-        # -------------------------------
-        
+        # [ADDED] Clear memory
         del train_set, test_set
         self._clear_gpu()
 
@@ -242,10 +198,11 @@ class MinNet(object):
         
         self._clear_gpu()
 
+        
         self.run(train_loader)
-        if hasattr(self._network, 'after_task_magmax_merge'):
-             self._network.after_task_magmax_merge()
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
+
 
         del train_set
 
@@ -261,19 +218,7 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # --- [SỬA LOGIC CHO TASK > 0] ---
-        # Ở Task > 0, tổng số lớp là (Cũ + Mới)
-        total_classes = self.known_class + self.increment
-        n_samples = self.buffer_size // total_classes
-        
-        cfs_feats, cfs_lbls = self.select_diverse_features_cfs(
-            self._network, 
-            train_loader, 
-            n_samples_per_class=n_samples
-        )
-
-        self.re_fit((cfs_feats, cfs_lbls), test_loader)
-        # --------------------------------
+        self.re_fit(train_loader, test_loader)
 
         del train_set, test_set
         self._clear_gpu()
@@ -281,67 +226,40 @@ class MinNet(object):
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        
-        if hasattr(self._network.backbone, 'set_grad_checkpointing'):
-            self._network.backbone.set_grad_checkpointing(True)
-
-        # [CHUẨN HÓA] Lấy số class trực tiếp từ mạng
-        real_num_classes = self._network.normal_fc.out_features
 
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
             self._network.to(self.device)
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # [FIX] Ép num_classes cố định để tránh lỗi shape ma trận
-                targets_onehot = F.one_hot(targets, num_classes=real_num_classes)
-                
-                # Fit Analytical (Dùng FP32 cho chính xác)
-                self._network.fit(inputs, targets_onehot)
+                targets = torch.nn.functional.one_hot(targets)
+                # Logic gốc: Fit Analytical (RLS). 
+                # Không dùng Autocast ở đây vì RLS cần độ chính xác cao (ma trận nghịch đảo)
+                self._network.fit(inputs, targets)
             
-            info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
+            info = "Task {} --> Update Analytical Classifier!".format(
+                self.cur_task,
+            )
             self.logger.info(info)
             prog_bar.set_description(info)
+            # [ADDED] Clear cache sau mỗi epoch fit
             self._clear_gpu()
 
-    def re_fit(self, train_data, test_loader=None):
+    def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        
-        # [CHUẨN HÓA] Lấy số class chuẩn từ mạng
-        real_num_classes = self._network.normal_fc.out_features
+        prog_bar = tqdm(train_loader)
+        for i, (_, inputs, targets) in enumerate(prog_bar):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            targets = torch.nn.functional.one_hot(targets)
+            self._network.fit(inputs, targets)
 
-        # 1. Nếu dùng CFS (Features, Targets)
-        if isinstance(train_data, tuple) or isinstance(train_data, list):
-            features, targets = train_data
-            features = features.to(self.device)
-            targets = targets.to(self.device)
+            info = "Task {} --> Reupdate Analytical Classifier!".format(
+                self.cur_task,
+            )
             
-            # One-hot chuẩn
-            targets_onehot = F.one_hot(targets.long(), num_classes=real_num_classes)
-            
-            # Gọi hàm fit_features (Bypass backbone)
-            if hasattr(self._network, 'fit_features'):
-                self._network.fit_features(features, targets_onehot)
-            else:
-                # Fallback nếu chưa update inc_net (Dùng fit thường nhưng sẽ chậm)
-                # Lưu ý: fit thường cần input là ảnh, đây là feature nên sẽ lỗi nếu chạy vào đây
-                print("Warning: fit_features not found in inc_net. Please update inc_net.py")
-            
-            self.logger.info(f"Task {self.cur_task} --> Re-fit done using {len(targets)} CFS features.")
-
-        # 2. Nếu dùng DataLoader (Ảnh)
-        else:
-            prog_bar = tqdm(train_data)
-            for i, (_, inputs, targets) in enumerate(prog_bar):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets_onehot = F.one_hot(targets, num_classes=real_num_classes)
-                self._network.fit(inputs, targets_onehot)
-
-                info = "Task {} --> Reupdate Analytical Classifier!".format(self.cur_task)
-                prog_bar.set_description(info)
-        
+            self.logger.info(info)
+            prog_bar.set_description(info)
         self._clear_gpu()
 
     def run(self, train_loader):
@@ -350,8 +268,8 @@ class MinNet(object):
             lr = self.init_lr
             weight_decay = self.init_weight_decay
         else:
-            epochs = self.epochs
-            lr = self.lr 
+            epochs = 5
+            lr = self.lr * 0.1
             weight_decay = self.weight_decay
 
         for param in self._network.parameters():
@@ -378,8 +296,10 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
+                # [ADDED] set_to_none=True tiết kiệm RAM hơn
                 optimizer.zero_grad(set_to_none=True) 
 
+                # [ADDED] Autocast để giảm 50% VRAM khi train
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
@@ -396,6 +316,7 @@ class MinNet(object):
                         loss = F.cross_entropy(logits, targets.long())
                         logits_final = logits
 
+                # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -406,6 +327,7 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
+                # [ADDED] Xóa biến tạm
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
@@ -421,12 +343,14 @@ class MinNet(object):
             self.logger.info(info)
             prog_bar.set_description(info)
             
+            # [ADDED] Clear cache sau mỗi epoch
             if epoch % 5 == 0:
                 self._clear_gpu()
 
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
+        # [ADDED] no_grad
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
@@ -447,104 +371,35 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
 
+    # =========================================================================
+    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
+    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
+    # =========================================================================
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
         features = []
+        
+        # 1. Thu thập features (CHUYỂN VỀ CPU NGAY LẬP TỨC)
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 
+                # Dùng autocast khi extract feature để nhanh hơn
                 with autocast('cuda'):
                     feature = model.extract_feature(inputs)
                 
+                # .detach().cpu() là chìa khóa để tránh OOM
                 features.append(feature.detach().cpu())
         
+        # 2. Concat trên CPU (RAM thường lớn hơn VRAM)
         all_features = torch.cat(features, dim=0)
+        
+        # 3. Tính Mean (Vẫn tính trên CPU hoặc đưa về GPU nếu cần)
+        # Vì chỉ tính mean của 1 tensor lớn, đưa về GPU tính sẽ nhanh, 
+        # nhưng nếu tensor quá lớn > VRAM thì tính trên CPU luôn.
+        # Ở đây tôi để tính trên GPU cho nhanh, nếu vẫn OOM thì xóa .to(self.device)
         prototype = torch.mean(all_features, dim=0).to(self.device)
         
         self._clear_gpu()
         return prototype
-
-    def select_diverse_features_cfs(self, model, train_loader, n_samples_per_class=20):
-        """
-        Chọn feature đa dạng dùng CFS (Contrastive Feature Selection).
-        """
-        model.eval()
-        device = self.device
-        
-        # 1. Thu thập toàn bộ feature (Đưa về CPU để tránh OOM)
-        all_features = []
-        all_labels = []
-        
-        with torch.no_grad(), autocast('cuda'):
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(device)
-                features = model.extract_feature(inputs)
-                all_features.append(features.detach().cpu())
-                all_labels.append(targets.cpu())
-        
-        all_features = torch.cat(all_features, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
-        
-        feature_dim = all_features.shape[1]
-        unique_classes = torch.unique(all_labels)
-        
-        selected_features = []
-        selected_targets = []
-        
-        print(f"Selecting {n_samples_per_class} diverse features/class via CFS...")
-        
-        # 2. Train nhẹ một mạng CFS
-        perm = torch.randperm(all_features.size(0))[:1000]
-        train_feats = all_features[perm].to(device).float() 
-        
-        cfs_net = CFS_Mapping(feature_dim).to(device).float()
-        optimizer = torch.optim.Adam(cfs_net.parameters(), lr=1e-3)
-        criterion = NegativeContrastiveLoss(tau=0.1)
-        
-        cfs_net.train()
-        for _ in range(20):
-            optimizer.zero_grad(set_to_none=True)
-            embeds = cfs_net(train_feats)
-            loss = criterion(embeds)
-            loss.backward()
-            optimizer.step()
-            
-        cfs_net.eval()
-        
-        # 3. Chọn mẫu cho từng Class
-        for c in unique_classes:
-            indices = (all_labels == c)
-            class_feats = all_features[indices].to(device).float()
-            
-            if class_feats.size(0) <= n_samples_per_class:
-                selected_features.append(class_feats.cpu())
-                selected_targets.append(torch.full((class_feats.size(0),), c))
-                continue
-
-            with torch.no_grad():
-                class_embeds = cfs_net(class_feats)
-                class_mean = torch.mean(class_embeds, dim=0, keepdim=True)
-                sim_to_mean = (class_embeds @ class_mean.T).squeeze()
-                best_idx = torch.argmax(sim_to_mean)
-                
-                chosen_indices = [best_idx.item()]
-                chosen_embeds = class_embeds[best_idx].unsqueeze(0)
-                
-                for _ in range(n_samples_per_class - 1):
-                    sim_matrix = class_embeds @ chosen_embeds.T
-                    max_sim_values, _ = torch.max(sim_matrix, dim=1)
-                    max_sim_values[chosen_indices] = 999.0
-                    next_idx = torch.argmin(max_sim_values).item()
-                    
-                    chosen_indices.append(next_idx)
-                    chosen_embeds = torch.cat([chosen_embeds, class_embeds[next_idx].unsqueeze(0)], dim=0)
-            
-            selected_features.append(class_feats[chosen_indices].cpu())
-            selected_targets.append(torch.full((len(chosen_indices),), c))
-            
-        del cfs_net, train_feats, optimizer, criterion
-        self._clear_gpu()
-        
-        return torch.cat(selected_features, dim=0), torch.cat(selected_targets, dim=0)
