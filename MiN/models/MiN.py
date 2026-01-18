@@ -418,7 +418,7 @@ class MinNet(object):
 
         # [NEW] LƯU 20 CFS SAMPLES VÀO NETWORK
         # Chuyển về feature space gốc (chưa qua buffer) để re-fit có thể dùng
-        model._network.task_cfs_samples.append(all_selected_feats.detach().clone())
+        model.task_cfs_samples.append(all_selected_feats.detach().clone())
         self.logger.info(f"Task {self.cur_task} --> Saved {all_selected_feats.size(0)} CFS samples for re-fit")
 
         # Batch-wise Calculation
