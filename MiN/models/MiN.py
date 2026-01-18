@@ -217,6 +217,9 @@ class MinNet(object):
         
         self.known_class += self.increment
 
+  # =========================================================================
+    # [FIXED] FIT_FC: TÍNH SỐ LỚP CHUẨN THEO CÔNG THỨC (KHÔNG DÙNG BIẾN CỘNG DỒN)
+    # =========================================================================
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
@@ -225,70 +228,134 @@ class MinNet(object):
             self._network.set_grad_checkpointing(True)
 
         prog_bar = tqdm(range(self.fit_epoch))
-        for _, epoch in enumerate(prog_bar):
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets)
+        
+        # [CÔNG THỨC] Tính tổng số class hiện tại dựa trên số thứ tự Task
+        # Task 0: 10. Task 1: 10+10=20. Task 4: 10+40=50.
+        if self.cur_task == 0:
+            current_total_classes = self.init_class
+        else:
+            current_total_classes = self.init_class + self.cur_task * self.increment
+
+        with torch.no_grad():
+            for _, epoch in enumerate(prog_bar):
+                for i, (_, inputs, targets) in enumerate(train_loader):
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    
+                    # [QUAN TRỌNG] One-hot với đúng size 50 (ở Task 4)
+                    # Điều này ép RLS trong inc_net.py chỉ mở rộng đến 50, không thể lên 60 được.
+                    targets_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_classes).float()
+                    
+                    self._network.fit(inputs, targets_oh)
                 
-                self._network.fit(inputs, targets)
-            
-            info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            if epoch % 5 == 0: gc.collect()
+                info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
+                self.logger.info(info)
+                prog_bar.set_description(info)
+                if epoch % 5 == 0: gc.collect()
 
     # =========================================================================
-    # [NEW] RE-FIT VỚI CFS SAMPLES
+    # [FIXED] RE_FIT: TRỘN CFS PROTOTYPES VÀ CÂN BẰNG SIZE
     # =========================================================================
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
         
-        # [NEW] PHASE 1: Fit CFS Representative Samples trước
-        if hasattr(self._network, 'task_cfs_samples') and self.cur_task < len(self._network.task_cfs_samples):
-            cfs_samples = self._network.task_cfs_samples[self.cur_task]  # [20, feature_dim]
+        # 1. Tính toán size chuẩn y hệt fit_fc
+        if self.cur_task == 0:
+            current_total_classes = self.init_class
+        else:
+            current_total_classes = self.init_class + self.cur_task * self.increment
             
-            # Tính toán base class ID và số class trong task
-            if self.cur_task == 0:
-                num_classes_in_task = self.init_class
-                base_class_id = 0
-            else:
-                num_classes_in_task = self.increment
-                base_class_id = self.init_class + (self.cur_task - 1) * self.increment
-            
-            # Phân bổ 20 CFS samples cho các class (chia đều)
-            samples_per_class = 20 // num_classes_in_task
-            cfs_labels = []
-            for c in range(num_classes_in_task):
-                class_id = base_class_id + c
-                cfs_labels.extend([class_id] * samples_per_class)
-            
-            # Bù phần dư
-            remainder = 20 - len(cfs_labels)
-            if remainder > 0:
-                cfs_labels.extend([base_class_id] * remainder)
-            
-            # Chuyển sang one-hot
-            cfs_labels = torch.tensor(cfs_labels, device=self.device, dtype=torch.long)
-            cfs_targets = torch.nn.functional.one_hot(cfs_labels, num_classes=self.known_class)
-            
-            # Fit CFS samples (KHÔNG dùng autocast vì RLS cần FP32)
-            self._network.fit(cfs_samples, cfs_targets)
-            
-            self.logger.info(f"Task {self.cur_task} --> Fitted {len(cfs_samples)} CFS representative samples first!")
-            print(f"[Re-fit] Fitted {len(cfs_samples)} CFS samples for Task {self.cur_task}")
+        # 2. Lấy Feature Mới (Task hiện tại)
+        X_new_list, Y_new_list = [], []
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                with autocast('cuda'):
+                    # Detach để tránh tràn RAM
+                    features = self._network.extract_feature(inputs).detach().float()
+                X_new_list.append(features)
+                Y_new_list.append(targets)
         
-        # [ORIGINAL] PHASE 2: Fit real data như cũ
-        prog_bar = tqdm(train_loader)
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets)
-            self._network.fit(inputs, targets)
-            
-            info = "Task {} --> Reupdate Analytical Classifier with Real Data!".format(self.cur_task)
-            self.logger.info(info)
-            prog_bar.set_description(info)
+        X_new = torch.cat(X_new_list, dim=0)
+        Y_new = torch.cat(Y_new_list, dim=0)
+        
+        # 3. Lấy Prototype (CFS Samples) của các Task CŨ
+        X_old_list, Y_old_list = [], []
+        
+        # Kiểm tra xem list CFS samples có tồn tại không
+        if hasattr(self._network, 'task_cfs_samples') and len(self._network.task_cfs_samples) > 0:
+            # Chỉ duyệt các task CŨ (từ 0 đến cur_task - 1)
+            for t_idx in range(self.cur_task): 
+                if t_idx < len(self._network.task_cfs_samples):
+                    # Lấy samples [20, dim]
+                    cfs_feats = self._network.task_cfs_samples[t_idx].to(self.device)
+                    
+                    # Tái tạo nhãn (Label) cho các sample này
+                    # Tính class bắt đầu và số class của task cũ đó
+                    if t_idx == 0:
+                        start_cls = 0
+                        n_cls = self.init_class
+                    else:
+                        start_cls = self.init_class + (t_idx - 1) * self.increment
+                        n_cls = self.increment
+                    
+                    # Tạo nhãn giả lập: Chia đều samples cho các class
+                    samples_count = cfs_feats.size(0) # thường là 20
+                    per_class = samples_count // n_cls
+                    labels_gen = []
+                    for c in range(n_cls):
+                        labels_gen.extend([start_cls + c] * per_class)
+                    
+                    # Bù phần dư (nếu 20 không chia hết cho số class)
+                    while len(labels_gen) < samples_count:
+                        labels_gen.append(start_cls) # Gán tạm vào class đầu
+                        
+                    cfs_labels = torch.tensor(labels_gen, device=self.device, dtype=torch.long)
+                    
+                    X_old_list.append(cfs_feats)
+                    Y_old_list.append(cfs_labels)
 
+        if len(X_old_list) > 0:
+            X_old = torch.cat(X_old_list, dim=0)
+            Y_old = torch.cat(Y_old_list, dim=0)
+            
+            # 4. Balancing: Nhân bản Prototype lên để cân bằng với Task mới
+            # Task mới ~500 ảnh/class. Prototype ~2 ảnh/class. Tỷ lệ ~250 lần.
+            avg_new = X_new.size(0) // (self.increment if self.cur_task > 0 else self.init_class)
+            avg_old = max(1, X_old.size(0) // (current_total_classes - (self.increment if self.cur_task > 0 else self.init_class)))
+            
+            # Tính hệ số nhân (nhân ít hơn một chút để không overfit)
+            repeat_factor = max(1, int((avg_new / avg_old) * 0.8))
+            
+            X_old = X_old.repeat(repeat_factor, 1)
+            Y_old = Y_old.repeat(repeat_factor)
+            
+            X_total = torch.cat([X_new, X_old], dim=0)
+            Y_total = torch.cat([Y_new, Y_old], dim=0)
+            
+            # print(f"DEBUG: Re-fit Merged -> New: {len(X_new)}, Old: {len(X_old)} (x{repeat_factor})")
+        else:
+            X_total, Y_total = X_new, Y_new
+
+        # 5. Fit One-Shot (Batch-wise để nhẹ RAM)
+        Y_total_oh = torch.nn.functional.one_hot(Y_total, num_classes=current_total_classes).float()
+        
+        batch_size_fit = 4096
+        total_samples = X_total.size(0)
+        perm = torch.randperm(total_samples)
+        
+        info = f"Task {self.cur_task} --> Re-fit RLS with CFS Prototypes..."
+        self.logger.info(info)
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, total_samples, batch_size_fit), desc="Re-fitting"):
+                idx = perm[i : i + batch_size_fit]
+                x_batch = X_total[idx]
+                y_batch = Y_total_oh[idx]
+                # Gọi hàm fit (inc_net.py đã sửa để nhận feature 2D)
+                self._network.fit(x_batch, y_batch)
+        self._clear_gpu()
     def run(self, train_loader):
         if self.cur_task == 0:
             epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
