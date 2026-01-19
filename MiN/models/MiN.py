@@ -49,7 +49,7 @@ class MinNet(object):
         
         self.scaler = GradScaler('cuda')
         
-        # [MODIFIED] Buffer lưu trữ Mean của từng Class (Dictionary: {class_id: mean_vector})
+        # Buffer lưu trữ Mean của từng Class {class_id: mean_vector}
         self.class_means = {} 
 
     def save_check_point(self, path_name):
@@ -110,7 +110,7 @@ class MinNet(object):
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(train_loader_buf, test_loader)
 
-        # [NEW] Tính Simple Mean (Prototype) cho các Class vừa học
+        # Tính Simple Mean (Prototype)
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
@@ -156,7 +156,7 @@ class MinNet(object):
         self._network.after_task_magmax_merge()
         self._clear_gpu()
         
-        # [NEW] Tính Mean cho Task MỚI
+        # Tính Mean cho Task MỚI
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
@@ -170,7 +170,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # [NEW] HÀM TÍNH PROTOTYPE BẰNG SIMPLE MEAN
+    #  HÀM TÍNH PROTOTYPE BẰNG SIMPLE MEAN
     # =========================================================================
     def compute_class_means(self, model, train_loader):
         """Tính trung bình feature cho mỗi class và lưu vào self.class_means"""
@@ -180,12 +180,10 @@ class MinNet(object):
         all_features = []
         all_labels = []
         
-        # 1. Thu thập Feature
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(device)
                 with autocast('cuda'):
-                    # Lấy feature gốc
                     feats = model.extract_feature(inputs).detach()
                 # Normalize feature giúp Mean đại diện tốt hơn trên mặt cầu
                 feats = F.normalize(feats, p=2, dim=1)
@@ -197,7 +195,7 @@ class MinNet(object):
         
         unique_classes = torch.unique(all_labels).cpu().numpy()
         
-        # 2. Tính Mean từng Class
+        # Tính Mean từng Class
         for cls in unique_classes:
             cls_mask = (all_labels == cls)
             cls_feats = all_features[cls_mask].to(device)
@@ -213,7 +211,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # [FIXED] FIT_FC: CÔNG THỨC CHUẨN
+    #  FIT_FC: CÔNG THỨC CHUẨN
     # =========================================================================
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
@@ -242,7 +240,7 @@ class MinNet(object):
                 if epoch % 5 == 0: gc.collect()
 
     # =========================================================================
-    # [MODIFIED] RE-FIT: DÙNG GAUSSIAN SAMPLING
+    #  RE-FIT: DÙNG GAUSSIAN SAMPLING
     # =========================================================================
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
@@ -274,30 +272,21 @@ class MinNet(object):
         
         # Chỉ lấy các class thuộc Task Cũ (class id < start của task này)
         base_class_idx = current_total_classes - (self.increment if self.cur_task > 0 else 0)
-        
         old_classes = [c for c in self.class_means.keys() if c < base_class_idx]
         
         if len(old_classes) > 0:
-            # Tính số lượng mẫu cần sinh ra
-            # Để cân bằng: Tổng số mẫu cũ ~ 50% - 80% Tổng số mẫu mới
-            # Ví dụ: Task mới có 5000 ảnh. Ta muốn sinh ra khoảng 2500-4000 ảnh cũ.
+            # Cân bằng: Tổng số mẫu cũ ~ 50% Tổng số mẫu mới
             total_new_samples = X_new.size(0)
-            samples_per_old_class = int((total_new_samples * 0.5) / len(old_classes)) # Tỷ lệ 0.5 (nhẹ nhàng)
+            samples_per_old_class = int((total_new_samples * 0.5) / len(old_classes)) 
             samples_per_old_class = max(20, samples_per_old_class) # Đảm bảo ít nhất 20 mẫu/lớp
             
-            # Phương sai (Variance) cho Gaussian: Nhỏ thôi để điểm không bay quá xa Mean
-            # Feature đã normalize (độ dài 1), nên sigma khoảng 0.05 - 0.1 là hợp lý.
-            sigma = 0.05 
+            sigma = 0.05 # Độ lệch chuẩn nhỏ để tạo đám mây xung quanh Mean
             
             for cls in old_classes:
                 mean_vec = self.class_means[cls].to(self.device) # [Dim]
                 
-                # --- [LOGIC GAUSSIAN SAMPLING] ---
-                # Thay vì repeat, ta lấy mẫu từ phân phối chuẩn N(Mean, Sigma)
-                # Tạo [N_samples, Dim]
+                # Gaussian Sampling: N(Mean, Sigma)
                 generated_feats = torch.normal(mean=mean_vec.repeat(samples_per_old_class, 1), std=sigma)
-                
-                # Normalize lại để đảm bảo feature vẫn nằm trên mặt cầu
                 generated_feats = F.normalize(generated_feats, p=2, dim=1)
                 
                 label_vec = torch.full((samples_per_old_class,), cls, dtype=torch.long, device=self.device)
@@ -333,11 +322,19 @@ class MinNet(object):
                 self._network.fit(x_batch, y_batch)
         self._clear_gpu()
 
+    # =========================================================================
+    #  [FIXED] RUN: RESTORE USER'S ORIGINAL EPOCH/LR LOGIC
+    # =========================================================================
     def run(self, train_loader):
+        # Logic gốc của bạn
         if self.cur_task == 0:
-            epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
+            epochs = self.init_epochs
+            lr = self.init_lr
+            weight_decay = self.init_weight_decay
         else:
-            epochs, lr, weight_decay = self.epochs, self.lr, self.weight_decay
+            epochs = 5
+            lr = self.lr * 0.1
+            weight_decay = self.weight_decay
 
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
