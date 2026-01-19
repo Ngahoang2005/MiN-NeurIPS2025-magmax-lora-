@@ -11,42 +11,10 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from utils.toolkit import tensor2numpy, count_parameters, calculate_class_metrics, calculate_task_metrics
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
 
 from torch.amp import autocast, GradScaler 
-
-EPSILON = 1e-8
-
-# --- CFS Helper Classes ---
-class NegativeContrastiveLoss(torch.nn.Module):
-    def __init__(self, tau=0.1):
-        super().__init__()
-        self.tau = tau
-    def forward(self, x): 
-        x = F.normalize(x, dim=1)
-        x_1 = torch.unsqueeze(x, dim=0)
-        x_2 = torch.unsqueeze(x, dim=1)
-        cos = torch.sum(x_1 * x_2, dim=2) / self.tau
-        exp_cos = torch.exp(cos)
-        mask = torch.eye(x.size(0), device=x.device).bool()
-        exp_cos = exp_cos.masked_fill(mask, 0)
-        loss = torch.log(exp_cos.sum(dim=1) / (x.size(0) - 1) + EPSILON)
-        return torch.mean(loss)
-
-class CFS_Mapping(torch.nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.f_cont = torch.nn.Sequential(
-            torch.nn.Linear(dim, dim),
-            torch.nn.LayerNorm(dim), 
-            torch.nn.GELU(),
-            torch.nn.Linear(dim, dim)
-        )
-    def forward(self, x):
-        x = self.f_cont(x)
-        return F.normalize(x, p=2, dim=1)
 
 # --- Main Class ---
 class MinNet(object):
@@ -80,6 +48,9 @@ class MinNet(object):
         self.total_acc = []
         
         self.scaler = GradScaler('cuda')
+        
+        # [MODIFIED] Buffer lưu trữ Mean của từng Class (Dictionary: {class_id: mean_vector})
+        self.class_means = {} 
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
@@ -130,37 +101,31 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # [FIX] Cập nhật known_class NGAY SAU update_fc
-        self.known_class = self.init_class
-        
-        # [HYBRID PROTOTYPE] - Lưu CFS samples vào network
-        prototype = self.get_task_prototype(self._network, train_loader)
-        self._network.extend_task_prototype(prototype)
-        self._clear_gpu()
-
+        # Train Noise Generator
         self.run(train_loader)
-        
-        # Refinement
-        prototype = self.get_task_prototype(self._network, train_loader)
-        self._network.update_task_prototype(prototype)
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
         
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
+        # Fit RLS lần 1 (cho Task hiện tại)
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        self.fit_fc(train_loader_buf, test_loader)
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        # [NEW] Tính Simple Mean (Prototype) cho các Class vừa học
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        
+        self.compute_class_means(self._network, clean_loader)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
+        # Re-fit (Task 0 chưa có đồ cũ, nhưng vẫn chạy để đồng bộ)
+        self.re_fit(clean_loader, test_loader)
         
-        self.known_class = self.init_class
+        del train_set, test_set
+        self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -179,46 +144,76 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
         
+        # 1. Fit FC (Mở rộng RLS cho Task mới)
         self.fit_fc(train_loader, test_loader)
         self._clear_gpu()
 
+        # 2. Train Noise
         self._network.update_fc(self.increment)
-        
-        # [FIX] Cập nhật known_class NGAY SAU update_fc
-        self.known_class += self.increment
-
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-        self._network.update_noise()
-        
-        # [HYBRID PROTOTYPE] - Lưu CFS samples vào network
-        prototype = self.get_task_prototype(self._network, train_loader)
-        self._network.extend_task_prototype(prototype)
+        train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+        self._network.update_noise() 
+        self.run(train_loader_run)
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
         
-        self.run(train_loader)
+        # [NEW] Tính Mean cho Task MỚI
+        train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
+        clean_loader = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
         
-        # Refinement
-        prototype = self.get_task_prototype(self._network, train_loader)
-        self._network.update_task_prototype(prototype)
+        self.compute_class_means(self._network, clean_loader)
+
+        # 3. Re-fit (Trộn Mean cũ + Data mới)
+        self.re_fit(clean_loader, test_loader)
+        
+        del train_set, test_set
         self._clear_gpu()
+
+    # =========================================================================
+    # [NEW] HÀM TÍNH PROTOTYPE BẰNG SIMPLE MEAN
+    # =========================================================================
+    def compute_class_means(self, model, train_loader):
+        """Tính trung bình feature cho mỗi class và lưu vào self.class_means"""
+        model.eval()
+        device = self.device
         
-        del train_set, train_loader
-
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
-
-        if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
-
-        self.re_fit(train_loader, test_loader)
+        all_features = []
+        all_labels = []
         
-        self.known_class += self.increment
+        # 1. Thu thập Feature
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(device)
+                with autocast('cuda'):
+                    # Lấy feature gốc
+                    feats = model.extract_feature(inputs).detach()
+                # Normalize feature giúp Mean đại diện tốt hơn trên mặt cầu
+                feats = F.normalize(feats, p=2, dim=1)
+                all_features.append(feats)
+                all_labels.append(targets)
+        
+        all_features = torch.cat(all_features).float()
+        all_labels = torch.cat(all_labels).to(device)
+        
+        unique_classes = torch.unique(all_labels).cpu().numpy()
+        
+        # 2. Tính Mean từng Class
+        for cls in unique_classes:
+            cls_mask = (all_labels == cls)
+            cls_feats = all_features[cls_mask].to(device)
+            
+            # Tính Mean Vector
+            mean_vector = torch.mean(cls_feats, dim=0) # [Feature_Dim]
+            mean_vector = F.normalize(mean_vector, p=2, dim=0) # Normalize lại Mean
+            
+            # Lưu vào dictionary (CPU để tiết kiệm VRAM)
+            self.class_means[cls] = mean_vector.cpu()
+            
+        self.logger.info(f"Computed Means for {len(unique_classes)} classes.")
+        self._clear_gpu()
 
-  # =========================================================================
-    # [FIXED] FIT_FC: TÍNH SỐ LỚP CHUẨN THEO CÔNG THỨC (KHÔNG DÙNG BIẾN CỘNG DỒN)
+    # =========================================================================
+    # [FIXED] FIT_FC: CÔNG THỨC CHUẨN
     # =========================================================================
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
@@ -229,8 +224,6 @@ class MinNet(object):
 
         prog_bar = tqdm(range(self.fit_epoch))
         
-        # [CÔNG THỨC] Tính tổng số class hiện tại dựa trên số thứ tự Task
-        # Task 0: 10. Task 1: 10+10=20. Task 4: 10+40=50.
         if self.cur_task == 0:
             current_total_classes = self.init_class
         else:
@@ -240,11 +233,7 @@ class MinNet(object):
             for _, epoch in enumerate(prog_bar):
                 for i, (_, inputs, targets) in enumerate(train_loader):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    
-                    # [QUAN TRỌNG] One-hot với đúng size 50 (ở Task 4)
-                    # Điều này ép RLS trong inc_net.py chỉ mở rộng đến 50, không thể lên 60 được.
                     targets_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_classes).float()
-                    
                     self._network.fit(inputs, targets_oh)
                 
                 info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
@@ -253,99 +242,87 @@ class MinNet(object):
                 if epoch % 5 == 0: gc.collect()
 
     # =========================================================================
-    # [FIXED] RE_FIT: TRỘN CFS PROTOTYPES VÀ CÂN BẰNG SIZE
+    # [MODIFIED] RE-FIT: DÙNG GAUSSIAN SAMPLING
     # =========================================================================
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
         
-        # 1. Tính toán size chuẩn y hệt fit_fc
         if self.cur_task == 0:
             current_total_classes = self.init_class
         else:
             current_total_classes = self.init_class + self.cur_task * self.increment
             
-        # 2. Lấy Feature Mới (Task hiện tại)
+        # 1. Feature Mới
         X_new_list, Y_new_list = [], []
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 with autocast('cuda'):
-                    # Detach để tránh tràn RAM
                     features = self._network.extract_feature(inputs).detach().float()
+                # Normalize Feature Mới cho đồng bộ với Mean đã lưu
+                features = F.normalize(features, p=2, dim=1)
                 X_new_list.append(features)
                 Y_new_list.append(targets)
         
         X_new = torch.cat(X_new_list, dim=0)
         Y_new = torch.cat(Y_new_list, dim=0)
         
-        # 3. Lấy Prototype (CFS Samples) của các Task CŨ
+        # 2. Tạo Feature Cũ từ Mean (Gaussian Sampling)
         X_old_list, Y_old_list = [], []
         
-        # Kiểm tra xem list CFS samples có tồn tại không
-        if hasattr(self._network, 'task_cfs_samples') and len(self._network.task_cfs_samples) > 0:
-            # Chỉ duyệt các task CŨ (từ 0 đến cur_task - 1)
-            for t_idx in range(self.cur_task): 
-                if t_idx < len(self._network.task_cfs_samples):
-                    # Lấy samples [20, dim]
-                    cfs_feats = self._network.task_cfs_samples[t_idx].to(self.device)
-                    
-                    # Tái tạo nhãn (Label) cho các sample này
-                    # Tính class bắt đầu và số class của task cũ đó
-                    if t_idx == 0:
-                        start_cls = 0
-                        n_cls = self.init_class
-                    else:
-                        start_cls = self.init_class + (t_idx - 1) * self.increment
-                        n_cls = self.increment
-                    
-                    # Tạo nhãn giả lập: Chia đều samples cho các class
-                    samples_count = cfs_feats.size(0) # thường là 20
-                    per_class = samples_count // n_cls
-                    labels_gen = []
-                    for c in range(n_cls):
-                        labels_gen.extend([start_cls + c] * per_class)
-                    
-                    # Bù phần dư (nếu 20 không chia hết cho số class)
-                    while len(labels_gen) < samples_count:
-                        labels_gen.append(start_cls) # Gán tạm vào class đầu
-                        
-                    cfs_labels = torch.tensor(labels_gen, device=self.device, dtype=torch.long)
-                    
-                    X_old_list.append(cfs_feats)
-                    Y_old_list.append(cfs_labels)
-
-        if len(X_old_list) > 0:
+        # Chỉ lấy các class thuộc Task Cũ (class id < start của task này)
+        base_class_idx = current_total_classes - (self.increment if self.cur_task > 0 else 0)
+        
+        old_classes = [c for c in self.class_means.keys() if c < base_class_idx]
+        
+        if len(old_classes) > 0:
+            # Tính số lượng mẫu cần sinh ra
+            # Để cân bằng: Tổng số mẫu cũ ~ 50% - 80% Tổng số mẫu mới
+            # Ví dụ: Task mới có 5000 ảnh. Ta muốn sinh ra khoảng 2500-4000 ảnh cũ.
+            total_new_samples = X_new.size(0)
+            samples_per_old_class = int((total_new_samples * 0.5) / len(old_classes)) # Tỷ lệ 0.5 (nhẹ nhàng)
+            samples_per_old_class = max(20, samples_per_old_class) # Đảm bảo ít nhất 20 mẫu/lớp
+            
+            # Phương sai (Variance) cho Gaussian: Nhỏ thôi để điểm không bay quá xa Mean
+            # Feature đã normalize (độ dài 1), nên sigma khoảng 0.05 - 0.1 là hợp lý.
+            sigma = 0.05 
+            
+            for cls in old_classes:
+                mean_vec = self.class_means[cls].to(self.device) # [Dim]
+                
+                # --- [LOGIC GAUSSIAN SAMPLING] ---
+                # Thay vì repeat, ta lấy mẫu từ phân phối chuẩn N(Mean, Sigma)
+                # Tạo [N_samples, Dim]
+                generated_feats = torch.normal(mean=mean_vec.repeat(samples_per_old_class, 1), std=sigma)
+                
+                # Normalize lại để đảm bảo feature vẫn nằm trên mặt cầu
+                generated_feats = F.normalize(generated_feats, p=2, dim=1)
+                
+                label_vec = torch.full((samples_per_old_class,), cls, dtype=torch.long, device=self.device)
+                
+                X_old_list.append(generated_feats)
+                Y_old_list.append(label_vec)
+                
             X_old = torch.cat(X_old_list, dim=0)
             Y_old = torch.cat(Y_old_list, dim=0)
-            
-            # 4. Balancing: Nhân bản Prototype lên để cân bằng với Task mới
-            # Task mới ~500 ảnh/class. Prototype ~2 ảnh/class. Tỷ lệ ~250 lần.
-            avg_new = X_new.size(0) // (self.increment if self.cur_task > 0 else self.init_class)
-            avg_old = max(1, X_old.size(0) // (current_total_classes - (self.increment if self.cur_task > 0 else self.init_class)))
-            
-            # Tính hệ số nhân (nhân ít hơn một chút để không overfit)
-            repeat_factor = max(1, int((avg_new / avg_old) * 0.8))
-            
-            X_old = X_old.repeat(repeat_factor, 1)
-            Y_old = Y_old.repeat(repeat_factor)
             
             X_total = torch.cat([X_new, X_old], dim=0)
             Y_total = torch.cat([Y_new, Y_old], dim=0)
             
-            # print(f"DEBUG: Re-fit Merged -> New: {len(X_new)}, Old: {len(X_old)} (x{repeat_factor})")
+            self.logger.info(f"Re-fit Data: New {X_new.size(0)} + Old {X_old.size(0)} (Gaussian Generated)")
         else:
             X_total, Y_total = X_new, Y_new
 
-        # 5. Fit One-Shot (Batch-wise để nhẹ RAM)
+        # 3. Fit
         Y_total_oh = torch.nn.functional.one_hot(Y_total, num_classes=current_total_classes).float()
         
         batch_size_fit = 4096
         total_samples = X_total.size(0)
         perm = torch.randperm(total_samples)
         
-        info = f"Task {self.cur_task} --> Re-fit RLS with CFS Prototypes..."
+        info = f"Task {self.cur_task} --> Re-fit RLS with Gaussian Prototypes..."
         self.logger.info(info)
         
         with torch.no_grad():
@@ -353,9 +330,9 @@ class MinNet(object):
                 idx = perm[i : i + batch_size_fit]
                 x_batch = X_total[idx]
                 y_batch = Y_total_oh[idx]
-                # Gọi hàm fit (inc_net.py đã sửa để nhận feature 2D)
                 self._network.fit(x_batch, y_batch)
         self._clear_gpu()
+
     def run(self, train_loader):
         if self.cur_task == 0:
             epochs, lr, weight_decay = self.init_epochs, self.init_lr, self.init_weight_decay
@@ -384,7 +361,6 @@ class MinNet(object):
             losses, correct, total = 0.0, 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
                 optimizer.zero_grad(set_to_none=True)
                 
                 with autocast('cuda'):
@@ -416,118 +392,6 @@ class MinNet(object):
             prog_bar.set_description(info)
             if epoch % 5 == 0: gc.collect()
         self._clear_gpu()
-
-    # =========================================================================
-    #  [UPDATED] HYBRID PROTOTYPE + LƯU CFS SAMPLES
-    # =========================================================================
-    def get_task_prototype(self, model, train_loader):
-        device = self.device
-        model.eval()
-        model.to(device)
-        
-        # 1. Thu thập Feature
-        features_cpu = []
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(device)
-                with autocast('cuda'):
-                    feature = model.extract_feature(inputs)
-                features_cpu.append(feature.detach().cpu())
-        
-        all_features = torch.cat(features_cpu, dim=0)
-        
-        # --- PART A: SIMPLE MEAN ---
-        raw_simple_mean = torch.mean(all_features, dim=0).to(device)
-        norm_simple_mean = F.normalize(raw_simple_mean, dim=0)
-        
-        # --- PART B: CFS MEAN ---
-        feature_dim = all_features.shape[1]
-        MAX_CFS_SAMPLES = 500
-        
-        if all_features.size(0) > MAX_CFS_SAMPLES:
-            indices = torch.randperm(all_features.size(0))[:MAX_CFS_SAMPLES]
-            train_feats = all_features[indices].to(device)
-        else:
-            train_feats = all_features.to(device)
-
-        train_feats = train_feats.float()
-
-        f_cont = CFS_Mapping(feature_dim).to(device)
-        f_cont.float() 
-        
-        optimizer = torch.optim.Adam(f_cont.parameters(), lr=1e-3)
-        criterion = NegativeContrastiveLoss(tau=0.1)
-        
-        f_cont.train()
-        for _ in range(30): 
-            optimizer.zero_grad(set_to_none=True)
-            embeddings = f_cont(train_feats)
-            loss = criterion(embeddings)
-            loss.backward()
-            optimizer.step()
-            
-        f_cont.eval()
-        all_selected_feats = None
-        samples_needed = 20
-        sup_batch = 100
-        
-        # Greedy Selection
-        with torch.no_grad():
-            for step in range(samples_needed):
-                eps = torch.randn([sup_batch, feature_dim], device=device)
-                std_temp = torch.std(train_feats, dim=0) + EPSILON
-                if step == 0: eps[0] = 0 
-                candidate_feats = eps * std_temp + raw_simple_mean 
-                
-                if all_selected_feats is None:
-                    all_selected_feats = candidate_feats[:1] 
-                else:
-                    cont_cand = f_cont(candidate_feats)
-                    cont_selected = f_cont(all_selected_feats)
-                    sim_matrix = torch.matmul(cont_cand, cont_selected.t())
-                    avg_sim = torch.mean(sim_matrix, dim=1)
-                    slt_ids = torch.argsort(avg_sim)[:1]
-                    all_selected_feats = torch.cat([all_selected_feats, candidate_feats[slt_ids]], dim=0)
-
-        # [NEW] LƯU 20 CFS SAMPLES VÀO NETWORK
-        # Chuyển về feature space gốc (chưa qua buffer) để re-fit có thể dùng
-        model.task_cfs_samples.append(all_selected_feats.detach().clone())
-        self.logger.info(f"Task {self.cur_task} --> Saved {all_selected_feats.size(0)} CFS samples for re-fit")
-
-        # Batch-wise Calculation
-        cfs_mean_numerator = torch.zeros(feature_dim, device=device)
-        total_weight_sum = 0.0
-        batch_calc = 1024 
-        
-        with torch.no_grad():
-            z_anchors = f_cont(all_selected_feats)
-            
-            for i in range(0, all_features.size(0), batch_calc):
-                batch_real = all_features[i:i+batch_calc].to(device).float()
-                z_real = f_cont(batch_real)
-                
-                sim_matrix = torch.matmul(z_real, z_anchors.t())
-                max_sim, _ = torch.max(sim_matrix, dim=1)
-                
-                max_sim = torch.clamp(max_sim / 0.1, max=50) 
-                raw_weights = torch.exp(max_sim)
-                
-                weighted_sum = torch.sum(batch_real * raw_weights.unsqueeze(1), dim=0)
-                cfs_mean_numerator += weighted_sum
-                total_weight_sum += torch.sum(raw_weights)
-                
-                del batch_real, z_real
-
-        cfs_mean = cfs_mean_numerator / (total_weight_sum + EPSILON)
-        norm_cfs_mean = F.normalize(cfs_mean, dim=0)
-
-        # --- PART C: HYBRID FUSION ---
-        final_prototype = 0.5 * norm_simple_mean + 0.5 * norm_cfs_mean
-        
-        del f_cont, optimizer, criterion, all_features, train_feats
-        self._clear_gpu()
-        
-        return F.normalize(final_prototype, dim=0)
 
     def after_train(self, data_manger):
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
