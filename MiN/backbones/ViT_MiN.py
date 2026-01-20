@@ -98,7 +98,8 @@ class InfLoRA_PiNoise(nn.Module):
         # Init = 0 (Base)
         self._init_zero(self.mu)
         self._init_zero(self.sigma)
-
+        self.mu_fixed = None 
+        self.sigma_fixed = None
         # --- History Storage (CPU) ---
         # Lưu các "Task Vectors" (chính là bộ weight của từng task sau khi train)
         self.history_mu = []    
@@ -125,93 +126,104 @@ class InfLoRA_PiNoise(nn.Module):
             nn.init.constant_(module.bias, 0.)
     def update_noise(self):
         """
-        [Bước 2]: Sequential Init.
-        Không reset weight. Giữ nguyên weight (đã merge từ task trước) để train tiếp.
-        Chỉ cần mở khóa gradient.
+        [DUAL PATH LOGIC]
+        Trước khi train task mới:
+        1. Copy trọng số hiện tại sang nhánh Frozen (Fixed).
+        2. Reset trọng số Trainable về 0 (để học Delta).
         """
+        # 1. Tạo bản sao đóng băng (Memory Path)
+        self.mu_fixed = copy.deepcopy(self.mu)
+        self.sigma_fixed = copy.deepcopy(self.sigma)
+        
+        for p in self.mu_fixed.parameters(): p.requires_grad = False
+        for p in self.sigma_fixed.parameters(): p.requires_grad = False
+        
+        # 2. Reset Trainable Path (Learning Path)
+        # Vì đây là Dual Path, nhánh này học phần "thêm vào" (Residual),
+        # nên ta reset nó về 0 chứ không để nó kế thừa giá trị cũ (tránh bị double output).
+        self._init_near_zero(self.mu)
+        self._init_near_zero(self.sigma)
+        
+        # 3. Mở khóa gradient
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigma.parameters(): param.requires_grad = True
     def unfreeze_noise(self):
         self.update_noise()
     def after_task_training(self):
         """
-        [Bước 3 & 4]: Lưu Task Vector và thực hiện Parameter-wise MagMax
+        [MERGE STEP]
+        Sau khi train xong, ta gộp Delta (Trainable) vào Memory (Fixed)
+        để tạo thành trọng số thống nhất cho MagMax.
         """
-        # 1. Lưu trọng số task vừa học (Task Vector t)
+        if self.mu_fixed is not None:
+            # W_final = W_fixed + W_delta
+            # Vì W_delta học trên không gian trực giao, việc cộng này ít gây can nhiễu.
+            with torch.no_grad():
+                self.mu.weight.data.add_(self.mu_fixed.weight.data)
+                self.mu.bias.data.add_(self.mu_fixed.bias.data)
+                
+                self.sigma.weight.data.add_(self.sigma_fixed.weight.data)
+                self.sigma.bias.data.add_(self.sigma_fixed.bias.data)
+            
+            # Xóa nhánh fixed để tiết kiệm bộ nhớ
+            self.mu_fixed = None
+            self.sigma_fixed = None
+
+        # --- MagMax Logic (Giữ nguyên) ---
         mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
-
-        # 2. Tính MagMax và Load lại vào mạng (Merge cứng)
         self._perform_parameter_magmax()
 
     def _perform_parameter_magmax(self):
+        # (Giữ nguyên logic MagMax cũ của bạn)
         if not self.history_mu: return
-
-        def merge_state_dicts(history_list):
-            keys = history_list[0].keys()
-            merged_dict = {}
-            
-            for key in keys:
-                # Stack toàn bộ lịch sử weights: [Num_Tasks, Out_Features, In_Features]
-                stacked_params = torch.stack([d[key] for d in history_list], dim=0)
-                
-                # --- MAGMAX LOGIC TRÊN PARAMETER ---
-                # 1. Tính độ lớn (Magnitude) của từng tham số
-                magnitudes = torch.abs(stacked_params)
-                
-                # 2. Tìm index của task có tham số lớn nhất tại vị trí đó
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                
-                # 3. Chọn tham số đó (Gather)
-                best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
-                
-                # Trả về GPU để load vào model
-                merged_dict[key] = best_param.to(self.w_down.device)
-            
-            return merged_dict
-
-        # Merge xong thì load ngược lại vào self.mu và self.sigma
-        # Lúc này self.mu chứa các trọng số "mạnh nhất" từ tất cả các task
-        self.mu.load_state_dict(merge_state_dicts(self.history_mu))
-        self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
-
+        def merge(history):
+            keys = history[0].keys()
+            merged = {}
+            for k in keys:
+                stacked = torch.stack([d[k] for d in history], dim=0)
+                best = torch.gather(stacked, 0, torch.argmax(torch.abs(stacked), dim=0, keepdim=True)).squeeze(0)
+                merged[k] = best.to(self.w_down.device)
+            return merged
+        self.mu.load_state_dict(merge(self.history_mu))
+        self.sigma.load_state_dict(merge(self.history_sigma))
     def forward(self, x, get_cur_feat=False):
-        # x: [B, N, D]
-        x_down = x @ self.w_down # [B, N, hidden]
+        x_down = x @ self.w_down
 
-        # --- [FIX ISSUE 3] Covariance/Correlation Accumulation ---
+        # --- Step 1: Thu thập dữ liệu (trên input gốc) ---
         if get_cur_feat:
-            # Flatten: [B*N, hidden]
-            x_flat = x_down.detach().reshape(-1, self.hidden_dim)
-            
-            # Tùy chọn: Nếu muốn Covariance chuẩn thì phải trừ Mean. 
-            # Tuy nhiên GPM gốc dùng Correlation (X^T X). Ta giữ nguyên Correlation 
-            # để đúng bài toán gốc, nhưng đảm bảo tính toán ổn định.
+            x_flat = x_down.detach().reshape(-1, self.hidden_dim).float()
             batch_corr = torch.mm(x_flat.T, x_flat) 
-            
-            # Update Moving Average
             total = self.n_cur_matrix + x_flat.shape[0]
-            # Công thức cập nhật trung bình: (Old_Avg * Old_N + New_Sum) / New_N
             self.cur_matrix = (self.cur_matrix * self.n_cur_matrix + batch_corr) / total
             self.n_cur_matrix = total
 
-        # --- [FIX ISSUE 2] Correct Projection Formula ---
-        # Chỉ chiếu khi basis tồn tại và đang training
-        if self.basis.shape[1] > 0 and self.training:
-            # Basis B phải là Orthonormal (B^T B = I). Điều này được đảm bảo ở update_GPM.
-            # Công thức chiếu: x_proj = x @ B @ B^T
-            # Toán học: (x_down [B,N,h] @ basis [h,k]) -> [B,N,k]
-            #           result @ basis.T [k,h] -> [B,N,h]
-            proj = (x_down @ self.basis) @ self.basis.T
-            
-            # Trừ đi phần chiếu để lấy phần vuông góc
-            x_down = x_down - proj
+        # --- DUAL PATH FORWARD ---
+        
+        # Nhánh 1: Frozen Path (Luôn chạy trên input gốc đầy đủ)
+        # Giúp giữ tri thức cũ không bị sốc
+        noise_fixed = 0
+        if self.mu_fixed is not None:
+            with torch.no_grad():
+                noise_fixed = self.mu_fixed(x_down) + self.sigma_fixed(x_down)
 
-        noise = self.mu(x_down) + self.sigma(x_down)
-        return x + (noise @ self.w_up)
+        # Nhánh 2: Trainable Path (Chạy trên input đã chiếu trực giao)
+        x_train = x_down
+        if self.basis.shape[1] > 0 and self.training:
+            # Chiếu input để tìm phần dư mới: x_safe = x - Px
+            proj = (x_down @ self.basis) @ self.basis.T
+            x_train = x_down - proj 
+        
+        # Học trên không gian mới
+        noise_train = self.mu(x_train) + self.sigma(x_train)
+
+        # Tổng hợp: Noise = Cũ + Mới (Delta)
+        total_noise = noise_fixed + noise_train
+
+        return x + (total_noise @ self.w_up)
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass

@@ -298,12 +298,16 @@ class MiNbaseNet(nn.Module):
         return {
             "logits": logits
         }
-    def update_GPM(self, threshold=0.99):
+    def update_GPM(self, start_threshold=0.96, end_threshold=0.99):
         """
         [FIX ISSUE 4] Robust GPM Update with Orthonormalization
         """
-        print(f"--> [GPM] Updating Basis (Threshold={threshold})...")
-        
+        total_tasks = self.args.get('total_sessions', 10) 
+        current_task = self.args.get('current_task', 0) # Cần cập nhật biến này từ trainer
+
+        # Công thức Dynamic Threshold của InfLoRA
+        threshold = start_threshold + (end_threshold - start_threshold) * (current_task / total_tasks)
+        print(f"--> [GPM] Calculating Basis with Dynamic Threshold: {threshold:.4f} (Task {current_task}/{total_tasks})")
         for module in self.backbone.noise_maker:
             R = module.cur_matrix
             if R.sum() == 0: continue
