@@ -132,6 +132,7 @@ class MinNet(object):
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
+        self._network.to(self.device)
         
         # [INFLORA STEP 1] Thu thập activation cho task đầu tiên
         # Chúng ta cần forward một lượt để lấy đặc trưng không gian của Task 0
@@ -201,7 +202,7 @@ class MinNet(object):
         # Cập nhật classifier RLS cho lớp mới
         self.fit_fc(train_loader, test_loader)
         self._network.update_fc(self.increment)
-
+        self._network.to(self.device)
         # [INFLORA STEP 1] Thu thập activation của task mới
         # Chạy forward để các lớp Attention_LoRA tích lũy ma trận hiệp phương sai
         self._network.eval()
