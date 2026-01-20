@@ -133,14 +133,19 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         self._network.to(self.device)
+
+        print("--> [Task 0] Start Training (Free Space)...")
+        self.run(train_loader)
         
         # [INFLORA STEP 1] Thu thập activation cho task đầu tiên
         # Chúng ta cần forward một lượt để lấy đặc trưng không gian của Task 0
+        print("--> [Task 0] Collecting Basis for Future Protection...")
         self._network.eval()
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 self._network.backbone(inputs, get_cur_feat=True)
+                if i > 250: break
         
         # [INFLORA STEP 2] Tính toán Basis gốc từ Task 0
         self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.965))
@@ -148,8 +153,7 @@ class MinNet(object):
         self._clear_gpu()
         
         # [HUẤN LUYỆN TRỰC GIAO] Chạy thực tế (lúc này gradient đã được bảo vệ)
-        self.run(train_loader)
-        
+       
         # [MAGMAX MERGE] Gộp tri thức sau task đầu
         self._network.after_task_magmax_merge()
         
@@ -203,35 +207,44 @@ class MinNet(object):
         self.fit_fc(train_loader, test_loader)
         self._network.update_fc(self.increment)
         self._network.to(self.device)
-        # [INFLORA STEP 1] Thu thập activation của task mới
-        # Chạy forward để các lớp Attention_LoRA tích lũy ma trận hiệp phương sai
+        # Load lại loader với batch size training chuẩn
+        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
+                                    num_workers=self.num_workers)
+        
+        self._network.update_noise() # Mở khóa gradient cho module Noise
+        self._clear_gpu()
+
+        print(f"--> [Task {self.cur_task}] Training Start (Protected by Previous Basis)...")
+        # Hàm run() sẽ gọi forward(), nơi có phép chiếu P = I - MM^T.
+        # Vì M chỉ chứa basis cũ, nên task mới không bị cắt bỏ.
+        self.run(train_loader)
+
+        # -------------------------------------------------
+        # GIAI ĐOẠN 2: THU THẬP & UPDATE (UPDATE SAU!)
+        # -------------------------------------------------
+        # Sau khi train xong Task t, ta mới nạp nó vào Basis để chuẩn bị cho Task t+1
+        # Nếu làm bước này trước bước Train -> Acc sẽ sập (Self-Blocking).
+        
+        print(f"--> [Task {self.cur_task}] Updating Basis (Locking Task {self.cur_task})...")
         self._network.eval()
         with torch.no_grad():
             # Theo logic InfLoRA, chạy toàn bộ train_loader để lấy thống kê chính xác nhất
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 self._network.backbone(inputs, get_cur_feat=True)
+                if i > 250: break
 
         # [INFLORA STEP 2] Tính toán không gian trực giao (Null Space)
         # Hàm này sẽ tính SVD và cập nhật biến 'basis' trong từng module Noise
-        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.99))
-
-        # [HUẤN LUYỆN TRỰC GIAO] 
-        # Bắt đầu train Noise với Sequential Fine-tuning (kế thừa từ task cũ)
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
-        self._network.update_noise() # Mở khóa gradient
-        self._clear_gpu()
-
-        # Bước Run này thực hiện Forward/Backward. 
-        # Phép chiếu P = I - MM^T bên trong module Noise đảm bảo task cũ an toàn.
-        self.run(train_loader)
-
-        # [MAGMAX MERGE] Sau khi train xong task mới, gộp trọng số lại
+        self._network.update_GPM(threshold=self.args.get('gpm_threshold', 0.98))
+        if hasattr(self._network.backbone.noise_maker[0], 'basis'):
+            sz = self._network.backbone.noise_maker[0].basis.shape
+            print(f"--> [Check] Layer 0 Basis Updated. New Shape: {sz}")
         self._network.after_task_magmax_merge()
         self._clear_gpu()
 
         del train_set
+        
 
         # Re-fit Classifier để tối ưu hóa cuối cùng
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)

@@ -215,12 +215,23 @@ class InfLoRA_PiNoise(nn.Module):
         if self.basis.shape[1] > 0 and self.training:
             # Chiếu input để tìm phần dư mới: x_safe = x - Px
             proj = (x_down @ self.basis) @ self.basis.T
-            x_train = x_down - proj 
+            x_residual = x_down - proj 
         
-        # Học trên không gian mới
+            norm_original = torch.norm(x_down, dim=-1, keepdim=True)
+            norm_residual = torch.norm(x_residual, dim=-1, keepdim=True)
+            
+            # Scale factor: Kéo residual to bằng original
+            scaler = norm_original / (norm_residual + 1e-6)
+            
+            # Chặn scaler không cho quá lớn (tránh nổ gradient với noise)
+            scaler = torch.clamp(scaler, max=10.0) 
+            
+            x_train = x_residual * scaler
+
+        # Học trên không gian đã được cân bằng năng lượng
         noise_train = self.mu(x_train) + self.sigma(x_train)
 
-        # Tổng hợp: Noise = Cũ + Mới (Delta)
+        # Tổng hợp
         total_noise = noise_fixed + noise_train
 
         return x + (total_noise @ self.w_up)
