@@ -18,7 +18,7 @@ from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 # Mixed Precision
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 EPSILON = 1e-8
 

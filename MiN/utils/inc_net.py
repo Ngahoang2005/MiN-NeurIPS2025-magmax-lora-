@@ -8,7 +8,7 @@ from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 # Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
-from torch.cuda.amp import autocast 
+from torch.amp import autocast
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
@@ -204,7 +204,7 @@ class MiNbaseNet(nn.Module):
         """
         # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
         # Nếu dùng FP16, ma trận hiệp phương sai sẽ rất dễ bị suy biến (singular)
-        with autocast(enabled=False):
+        with autocast(device_type='cuda', enabled=False):
             # 1. Feature Extraction & Expansion
             X = self.backbone(X).float() # ViT Features
             X = self.buffer(X)           # Random Expansion -> float32
