@@ -94,7 +94,7 @@ class MinNet(object):
         return targets
 
     # =========================================================================
-    # TASK 0 (Quy trình 3 bước)
+    # TASK 0
     # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
@@ -103,6 +103,7 @@ class MinNet(object):
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
+        # Loader
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         train_loader_analytic = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
@@ -115,7 +116,7 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Analytic Warm-up
+        # STEP 1: Analytic Warm-up (Dùng fit_fc)
         self.logger.info(">>> Step 1: Analytic Warm-up...")
         self.fit_fc(train_loader_analytic)
 
@@ -123,20 +124,23 @@ class MinNet(object):
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
         self.run(train_loader_noise)
 
-        # STEP 3: Merge & Refit
+        # STEP 3: Merge & Refit (Dùng re_fit)
         self.logger.info(">>> Step 3: MagMax Merge & Refit...")
         self._network.after_task_magmax_merge()
         
         del train_set
+        # Dùng train_no_aug cho bước refit cuối (quan trọng cho độ chính xác)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         
-        self.fit_fc(train_loader_refit)
+        # [SỬA LẠI]: Gọi re_fit thay vì fit_fc
+        self.re_fit(train_loader_refit)
+        
         self._clear_gpu()
 
     # =========================================================================
-    # TASK > 0 (Quy trình 3 bước)
+    # TASK > 0
     # =========================================================================
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -157,15 +161,15 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1
+        # STEP 1: Analytic Update (Warm-up với data mới)
         self.logger.info(">>> Step 1: Analytic Update...")
         self.fit_fc(train_loader_analytic)
 
-        # STEP 2
+        # STEP 2: Train Noise
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
         self.run(train_loader_noise)
 
-        # STEP 3
+        # STEP 3: Merge & Refit
         self.logger.info(">>> Step 3: MagMax Merge & Refit...")
         self._network.after_task_magmax_merge()
         
@@ -174,11 +178,13 @@ class MinNet(object):
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_refit = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         
-        self.fit_fc(train_loader_refit)
+        # [SỬA LẠI]: Gọi re_fit
+        self.re_fit(train_loader_refit)
+        
         self._clear_gpu()
 
     # =========================================================================
-    # ANALYTIC FITTING (FIXED BUG 'fc')
+    # FIT FC (Dùng loop fit_epochs - Cho Step 1)
     # =========================================================================
     def fit_fc(self, train_loader):
         self._network.eval()
@@ -190,7 +196,7 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # [FIXED HERE]: Dùng normal_fc.out_features để lấy số class hiện tại
+                # Fix lỗi attribute: Dùng normal_fc để lấy số lượng class hiện tại
                 num_classes = self._network.normal_fc.out_features
                 targets_onehot = F.one_hot(targets, num_classes=num_classes).float()
                 
@@ -198,7 +204,35 @@ class MinNet(object):
                     self._network.fit(inputs, targets_onehot)
             self._clear_gpu()
 
+    # =========================================================================
+    # RE-FIT (Chạy 1 lần qua data - Cho Step 3)
+    # =========================================================================
+    def re_fit(self, train_loader):
+        """
+        Refit lại Classifier sau khi đã Merge Noise.
+        Chỉ chạy 1 pass qua dataset (không cần lặp epoch nhiều).
+        """
+        self._network.eval()
+        self._network.to(self.device)
+        
+        prog_bar = tqdm(train_loader, desc="Analytic Re-fitting")
+        for i, (_, inputs, targets) in enumerate(prog_bar):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            
+            num_classes = self._network.normal_fc.out_features
+            targets_onehot = F.one_hot(targets, num_classes=num_classes).float()
+            
+            with autocast('cuda', enabled=False):
+                self._network.fit(inputs, targets_onehot)
+                
+        self._clear_gpu()
 
+    # =========================================================================
+    # TRAIN LOOP (SGD - No Scaler for BiLORA)
+    # =========================================================================
+    # =========================================================================
+    # TRAIN LOOP (SGD) - CÓ IN TRAIN ACCURACY
+    # =========================================================================
     def run(self, train_loader):
         if self.cur_task == 0:
             epochs = self.init_epochs
@@ -209,11 +243,11 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        # 1. Freeze All
+        # Freeze All
         for param in self._network.parameters():
             param.requires_grad = False
             
-        # 2. Unfreeze BiLORA
+        # Unfreeze BiLORA
         if self.cur_task == 0:
             self._network.init_unfreeze()
         else:
@@ -222,7 +256,6 @@ class MinNet(object):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
         if not params: return
 
-        # 3. Optimizer
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
@@ -232,32 +265,41 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs), desc=f"Training Noise T{self.cur_task}")
         for epoch in prog_bar:
             losses = 0.0
+            correct = 0
+            total = 0
             
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
                 optimizer.zero_grad(set_to_none=True)
 
-                # [CHIẾN THUẬT QUAN TRỌNG]
-                # Vẫn giữ autocast để Backbone chạy FP16 -> TIẾT KIỆM VRAM
-                # BiLORA là số phức (ComplexFloat) nên Autocast sẽ tự động bỏ qua nó (giữ FP32) -> CHÍNH XÁC
                 with autocast('cuda'):
                     outputs = self._network.forward_normal_fc(inputs)
-                    loss = F.cross_entropy(outputs['logits'], targets.long())
+                    logits = outputs['logits']
+                    loss = F.cross_entropy(logits, targets.long())
 
-                # [FIXED] Bỏ Scaler để tránh lỗi "NotImplementedError"
-                # Loss backward trực tiếp (chấp nhận rủi ro underflow nhỏ, nhưng với BiLORA thường ko sao)
                 loss.backward()
-                
-                # Clip Grad vẫn hoạt động tốt
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
-                
                 optimizer.step()
                 
                 losses += loss.item()
 
+                # [ADDED] Tính Accuracy
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets).sum().item()
+                total += len(targets)
+
             scheduler.step()
-            prog_bar.set_description(f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f}")
+            
+            # Tính toán Acc của Epoch
+            train_acc = 100. * correct / total if total > 0 else 0.0
+            
+            # [ADDED] In ra Log
+            info = f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%"
+            prog_bar.set_description(info)
+            
+            # Ghi vào logger để xem lại sau này nếu cần
+            self.logger.info(info)
             
             if epoch % 5 == 0:
                 self._clear_gpu()
