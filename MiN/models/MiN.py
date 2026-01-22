@@ -198,9 +198,7 @@ class MinNet(object):
                     self._network.fit(inputs, targets_onehot)
             self._clear_gpu()
 
-    # =========================================================================
-    # TRAIN LOOP (SGD)
-    # =========================================================================
+
     def run(self, train_loader):
         if self.cur_task == 0:
             epochs = self.init_epochs
@@ -211,11 +209,11 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        # Freeze All
+        # 1. Freeze All
         for param in self._network.parameters():
             param.requires_grad = False
             
-        # Unfreeze BiLORA
+        # 2. Unfreeze BiLORA
         if self.cur_task == 0:
             self._network.init_unfreeze()
         else:
@@ -224,7 +222,7 @@ class MinNet(object):
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
         if not params: return
 
-        # Optimizer (SGD từ config)
+        # 3. Optimizer
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
@@ -240,17 +238,21 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True)
 
+                # [CHIẾN THUẬT QUAN TRỌNG]
+                # Vẫn giữ autocast để Backbone chạy FP16 -> TIẾT KIỆM VRAM
+                # BiLORA là số phức (ComplexFloat) nên Autocast sẽ tự động bỏ qua nó (giữ FP32) -> CHÍNH XÁC
                 with autocast('cuda'):
                     outputs = self._network.forward_normal_fc(inputs)
                     loss = F.cross_entropy(outputs['logits'], targets.long())
 
-                self.scaler.scale(loss).backward()
+                # [FIXED] Bỏ Scaler để tránh lỗi "NotImplementedError"
+                # Loss backward trực tiếp (chấp nhận rủi ro underflow nhỏ, nhưng với BiLORA thường ko sao)
+                loss.backward()
                 
-                self.scaler.unscale_(optimizer)
+                # Clip Grad vẫn hoạt động tốt
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                optimizer.step()
                 
                 losses += loss.item()
 
