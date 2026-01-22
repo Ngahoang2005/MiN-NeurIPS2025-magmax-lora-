@@ -182,3 +182,27 @@ class MiNbaseNet(nn.Module):
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
+    # Thêm vào trong class MiNbaseNet
+    def sync_analytic_to_normal(self):
+        """
+        Copy trọng số từ Analytic Classifier (RLS) sang Normal FC (SGD).
+        Giúp SGD bắt đầu từ điểm tối ưu thay vì random.
+        """
+        if self.normal_fc is None: return
+
+        # RLS Weight shape: [Feature_Dim, Num_Classes]
+        # Linear Weight shape: [Num_Classes, Feature_Dim]
+        # -> Cần Transpose (.T)
+        
+        with torch.no_grad():
+            # Lấy trọng số RLS
+            rls_weight = self.weight.data.T 
+            
+            # Copy sang normal_fc
+            # Chỉ copy phần Weight, Bias set về 0 (vì RLS trong code này ko tính bias rời)
+            if self.normal_fc.weight.shape == rls_weight.shape:
+                self.normal_fc.weight.data.copy_(rls_weight)
+                if self.normal_fc.bias is not None:
+                    self.normal_fc.bias.data.zero_()
+            else:
+                print("Warning: Shape mismatch during sync!")
