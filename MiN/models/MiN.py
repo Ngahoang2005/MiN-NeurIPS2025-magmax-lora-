@@ -15,7 +15,7 @@ from torch.utils.data import WeightedRandomSampler
 from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
-# [FIXED] Chỉ import autocast, bỏ GradScaler vì không dùng cho số phức
+# [FIXED] Chỉ import autocast
 from torch.amp import autocast
 
 class MinNet(object):
@@ -45,8 +45,6 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        
-        # [FIXED] Bỏ self.scaler = GradScaler('cuda') vì gây lỗi với BiLORA
 
     def _clear_gpu(self):
         gc.collect()
@@ -101,10 +99,7 @@ class MinNet(object):
         return targets
 
     # =========================================================================
-    # TASK 0
-    # =========================================================================
-    # =========================================================================
-    # TASK 0: TRAIN -> FIT -> REFIT (Theo yêu cầu của bạn)
+    # TASK 0: TRAIN (SGD) -> FIT (RLS) -> REFIT
     # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
@@ -114,8 +109,7 @@ class MinNet(object):
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        
-        # [QUAN TRỌNG] Vẫn cần loader này cho bước Re-fit cuối cùng
+        # Vẫn cần loader này cho refit
         train_loader_refit = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
@@ -127,27 +121,19 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
-        # [REMOVED] Bỏ bước Analytic Warm-up và Sync đầu vào
-        # self.logger.info(">>> Step 1: Analytic Warm-up...")
-        # self.fit_fc(train_loader_analytic)
-        # self._network.sync_analytic_to_normal()
-
-        # STEP 1: Train BiLORA Noise (Chạy ngay SGD)
-        self.logger.info(">>> Step 1: Training BiLORA Noise (SGD)...")
-        
-        # [LƯU Ý] Vì bỏ Warm-up, Classifier đang là Random.
-        # Ta cần đảm bảo trong hàm run(), Classifier được update hoặc Noise đủ mạnh để học.
+        # [STEP 1] Train SGD (BiLORA + Classifier)
+        # Vì chưa có RLS, bắt buộc phải train cả Classifier trong bước này
+        self.logger.info(">>> Step 1: Training BiLORA Noise (Joint Training)...")
         self.run(train_loader_noise)
 
-        # STEP 2: Merge 
+        # [STEP 2] Merge
         self.logger.info(">>> Step 2: MagMax Merge...")
         self._network.after_task_magmax_merge()
         
-        # STEP 3: Re-fit (Chốt đơn bằng RLS)
+        # [STEP 3] Re-fit (Chốt đơn bằng RLS)
         self.logger.info(">>> Step 3: Analytic Re-fit...")
         
         del train_set
-        # Dùng train_no_aug cho chuẩn xác
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_final = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
@@ -155,6 +141,7 @@ class MinNet(object):
         self.re_fit(train_loader_final)
         
         self._clear_gpu()
+
     # =========================================================================
     # TASK > 0
     # =========================================================================
@@ -177,10 +164,13 @@ class MinNet(object):
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Analytic Update
+        # STEP 1: Analytic Update (Warm-up với data mới)
         self.logger.info(">>> Step 1: Analytic Update...")
         self.fit_fc(train_loader_analytic)
+        
+        # [QUAN TRỌNG] Đồng bộ trọng số RLS sang SGD để train Noise
         self._network.sync_analytic_to_normal()
+
         # STEP 2: Train Noise
         self.logger.info(">>> Step 2: Training BiLORA Noise...")
         self.run(train_loader_noise)
@@ -199,7 +189,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # FIT FC (Step 1)
+    # FIT FC
     # =========================================================================
     def fit_fc(self, train_loader):
         self._network.eval()
@@ -219,7 +209,7 @@ class MinNet(object):
             self._clear_gpu()
 
     # =========================================================================
-    # RE-FIT (Step 3)
+    # RE-FIT
     # =========================================================================
     def re_fit(self, train_loader):
         self._network.eval()
@@ -238,7 +228,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # TRAIN LOOP (SGD) - NO SCALER
+    # TRAIN LOOP (SGD)
     # =========================================================================
     def run(self, train_loader):
         if self.cur_task == 0:
@@ -253,6 +243,12 @@ class MinNet(object):
         # Freeze All
         for param in self._network.parameters():
             param.requires_grad = False
+        
+        # [QUAN TRỌNG] Unfreeze Classifier (như code gốc bạn đưa)
+        # Nếu task > 0, ta đã sync trọng số RLS rồi nên unfreeze hay không cũng đỡ hơn
+        # Nhưng code gốc luôn unfreeze, nên ta giữ nguyên.
+        for param in self._network.normal_fc.parameters():
+            param.requires_grad = True
             
         # Unfreeze BiLORA
         if self.cur_task == 0:
@@ -280,20 +276,17 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True)
 
-                # Giữ Autocast cho backbone (FP16), BiLORA tự chạy FP32
                 with autocast('cuda'):
                     outputs = self._network.forward_normal_fc(inputs)
                     logits = outputs['logits']
                     loss = F.cross_entropy(logits, targets.long())
 
-                # [FIXED] Backward trực tiếp, không dùng scaler
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(params, max_norm=1.0)
                 optimizer.step()
                 
                 losses += loss.item()
 
-                # Tính Accuracy
                 _, preds = torch.max(logits, dim=1)
                 correct += preds.eq(targets).sum().item()
                 total += len(targets)
@@ -304,7 +297,6 @@ class MinNet(object):
             info = f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%"
             prog_bar.set_description(info)
             self.logger.info(info)
-            # in ra train accuracy từng epoch
-            print(f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%")
+            
             if epoch % 5 == 0:
                 self._clear_gpu()
