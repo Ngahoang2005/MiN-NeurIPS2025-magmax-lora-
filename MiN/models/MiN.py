@@ -286,5 +286,6 @@ class MinNet(object):
             info = f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%"
             prog_bar.set_description(info)
             self.logger.info(info)
+            print(f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%")
             
             if epoch % 5 == 0: self._clear_gpu()
