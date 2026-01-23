@@ -9,7 +9,7 @@ from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 from torch.amp import autocast
 
-# BaseIncNet vẫn giữ để tham khảo, nhưng MiNbaseNet sẽ chạy độc lập
+# BaseIncNet giữ nguyên
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -66,10 +66,8 @@ class MiNbaseNet(nn.Module):
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
 
-        # Random Buffer
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
-        # Analytic Learning Params (Thay thế FC truyền thống)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight) 
@@ -78,17 +76,14 @@ class MiNbaseNet(nn.Module):
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R) 
 
-        # Normal FC (Dùng để train Noise bằng SGD/AdamW)
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
 
     def update_fc(self, nb_classes):
-        """Cập nhật Normal FC và tăng số lượng known_class"""
         self.cur_task += 1
         self.known_class += nb_classes
         
-        # Normal FC luôn giữ kích thước output bằng tổng số class hiện tại
         if self.cur_task > 0:
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
@@ -108,43 +103,50 @@ class MiNbaseNet(nn.Module):
                 nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
 
-    # --- Bridge to BiLORA ---
+    # --- Noise Management ---
     def update_noise(self):
-        for i in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[i].update_noise()
+        if hasattr(self.backbone, 'noise_maker'):
+            for i in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[i].update_noise()
 
+    # [QUAN TRỌNG] Thêm hàm này vì min.py gọi nó
     def after_task_magmax_merge(self):
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for i in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[i].after_task_training()
+        if hasattr(self.backbone, 'noise_maker'):
+            print(f"--> [IncNet] Task {self.cur_task}: Triggering MagMax Merging...")
+            for i in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[i].after_task_training()
 
     def unfreeze_noise(self):
-        for i in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[i].unfreeze_noise()
+        if hasattr(self.backbone, 'noise_maker'):
+            for i in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[i].unfreeze_noise()
 
     def init_unfreeze(self):
-        for i in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[i].unfreeze_noise()
-            for p in self.backbone.blocks[i].norm1.parameters(): p.requires_grad = True
-            for p in self.backbone.blocks[i].norm2.parameters(): p.requires_grad = True
-        for p in self.backbone.norm.parameters():
-            p.requires_grad = True
+        if hasattr(self.backbone, 'noise_maker'):
+            for i in range(len(self.backbone.noise_maker)):
+                self.backbone.noise_maker[i].unfreeze_noise()
+                if hasattr(self.backbone, 'blocks'):
+                    for p in self.backbone.blocks[i].norm1.parameters(): p.requires_grad = True
+                    for p in self.backbone.blocks[i].norm2.parameters(): p.requires_grad = True
+        
+        if hasattr(self.backbone, 'norm'):
+            for p in self.backbone.norm.parameters():
+                p.requires_grad = True
 
-    # --- Analytic & Forward ---
+    # --- Forward & Fit ---
     def forward_fc(self, features):
         features = features.to(self.weight) 
         return features @ self.weight
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """RLS Update"""
+        # Tắt Autocast khi tính toán ma trận nghịch đảo để tránh lỗi
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
-            X = self.buffer(X)            
+            X = self.buffer(X).float()
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
             num_targets = Y.shape[1]
-            # Mở rộng classifier nếu có class mới
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
@@ -182,27 +184,3 @@ class MiNbaseNet(nn.Module):
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    # Thêm vào trong class MiNbaseNet
-    def sync_analytic_to_normal(self):
-        """
-        Copy trọng số từ Analytic Classifier (RLS) sang Normal FC (SGD).
-        Giúp SGD bắt đầu từ điểm tối ưu thay vì random.
-        """
-        if self.normal_fc is None: return
-
-        # RLS Weight shape: [Feature_Dim, Num_Classes]
-        # Linear Weight shape: [Num_Classes, Feature_Dim]
-        # -> Cần Transpose (.T)
-        
-        with torch.no_grad():
-            # Lấy trọng số RLS
-            rls_weight = self.weight.data.T 
-            
-            # Copy sang normal_fc
-            # Chỉ copy phần Weight, Bias set về 0 (vì RLS trong code này ko tính bias rời)
-            if self.normal_fc.weight.shape == rls_weight.shape:
-                self.normal_fc.weight.data.copy_(rls_weight)
-                if self.normal_fc.bias is not None:
-                    self.normal_fc.bias.data.zero_()
-            else:
-                print("Warning: Shape mismatch during sync!")

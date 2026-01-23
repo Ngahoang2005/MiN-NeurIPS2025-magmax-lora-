@@ -122,21 +122,57 @@ class BiLORA_Linear(nn.Module):
         self.is_initialized = True
 
     def forward(self, x):
-        # 1. Tái tạo trọng số: Global (Cũ) + Active (Mới)
+        # 1. Lấy Global Weight (Nền tảng)
         current_freq_weight = self.global_freq_weight.clone()
         
+        # 2. Cộng Active Params (BiLORA Learning)
         if self.is_initialized:
-            # Scatter add: Cộng dồn nhiễu mới vào nền tảng cũ
-            flat_weight = current_freq_weight.view(-1)
-            flat_weight.scatter_add_(0, self.active_indices, self.active_params)
-            current_freq_weight = flat_weight.view(self.freq_h, self.freq_w)
+            # Tạo ma trận delta thưa (Sparse Delta)
+            delta_weight = torch.zeros_like(current_freq_weight)
             
-        # 2. IFFT (Frequency -> Spatial)
-        spatial_weight = torch.fft.irfft2(current_freq_weight, s=(self.out_features, self.in_features))
-        
-        # 3. Linear Projection
-        return F.linear(x, spatial_weight)
+            # Scatter active params vào đúng vị trí indices
+            # active_params: [K] (Complex)
+            # active_indices: [K] (Long)
+            # Flatten delta để scatter cho dễ
+            delta_flat = delta_weight.view(-1)
+            delta_flat.scatter_add_(0, self.active_indices, self.active_params)
+            delta_weight = delta_flat.view_as(delta_weight)
+            
+            # Cộng vào trọng số hiện tại
+            current_freq_weight = current_freq_weight + delta_weight
 
+        # =====================================================================
+        # [CRITICAL FIX] ENFORCE HERMITIAN SYMMETRY
+        # Để đảm bảo irfft2 ra số thực chuẩn toán học:
+        # Các tần số đặc biệt (DC và Nyquist) bắt buộc phải là số THỰC (Imag=0).
+        # =====================================================================
+        
+        # 1. DC Component tại (0,0) phải là số thực
+        current_freq_weight[..., 0, 0] = current_freq_weight[..., 0, 0].real + 0j
+        
+        # 2. Nyquist Frequencies (Nếu kích thước chẵn)
+        # Kiểm tra xem chiều cao/rộng có chẵn không để xử lý các điểm biên
+        H, W_half = current_freq_weight.shape[-2], current_freq_weight.shape[-1]
+        
+        # (Optional) Xử lý các điểm Nyquist khác nếu cần thiết chặt chẽ hơn
+        # Thường chỉ cần xử lý DC (0,0) là đã sửa được 99% lỗi rồi.
+        # Nhưng để chắc chắn, ta ép cụ thể các điểm góc nếu H chẵn
+        if self.out_shape[0] % 2 == 0: # Height chẵn
+             current_freq_weight[..., H//2, 0] = current_freq_weight[..., H//2, 0].real + 0j
+        
+        if self.out_shape[1] % 2 == 0: # Width chẵn
+             current_freq_weight[..., 0, -1] = current_freq_weight[..., 0, -1].real + 0j
+             if self.out_shape[0] % 2 == 0:
+                 current_freq_weight[..., H//2, -1] = current_freq_weight[..., H//2, -1].real + 0j
+
+        # =====================================================================
+
+        # 3. Thực hiện Inverse FFT (Frequency -> Spatial)
+        # s=self.out_shape để đảm bảo output size đúng (H, W)
+        spatial_weight = torch.fft.irfft2(current_freq_weight, s=self.out_shape, norm='ortho')
+
+        # 4. Convolution (hoặc Linear) trong không gian thực
+        return F.linear(x, spatial_weight)
     def merge_task(self):
         """
         [MAGMAX MERGING]
