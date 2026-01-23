@@ -99,7 +99,7 @@ class MinNet(object):
         return targets
 
     # =========================================================================
-    # TASK 0: TRAIN (SGD) -> FIT (RLS) -> REFIT
+    # TASK 0
     # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
@@ -109,28 +109,31 @@ class MinNet(object):
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
         train_loader_noise = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        # Vẫn cần loader này cho refit
         train_loader_refit = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
                 
+        # 1. Khởi tạo & Mở rộng Classifier
         self._network.update_fc(self.init_class)
+        
+        # 2. [QUAN TRỌNG] Kích hoạt BiLORA (is_initialized=True)
+        self.logger.info(">>> Activating BiLORA for Task 0...")
         self._network.update_noise() 
+        
         self._network.to(self.device)
         self._clear_gpu()
 
-        # [STEP 1] Train SGD (BiLORA + Classifier)
-        # Vì chưa có RLS, bắt buộc phải train cả Classifier trong bước này
-        self.logger.info(">>> Step 1: Training BiLORA Noise (Joint Training)...")
+        # STEP 1: Train SGD (Chỉ SGD, vì chưa có Analytic cũ)
+        self.logger.info(">>> Step 1: Training BiLORA Noise (SGD)...")
         self.run(train_loader_noise)
 
-        # [STEP 2] Merge
+        # STEP 2: Merge
         self.logger.info(">>> Step 2: MagMax Merge...")
         self._network.after_task_magmax_merge()
         
-        # [STEP 3] Re-fit (Chốt đơn bằng RLS)
+        # STEP 3: Re-fit (Chốt đơn bằng RLS)
         self.logger.info(">>> Step 3: Analytic Re-fit...")
         
         del train_set
@@ -143,7 +146,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # TASK > 0
+    # TASK > 0 (Logic Ensemble: Logits = Analytic + SGD)
     # =========================================================================
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -158,21 +161,23 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-                
+        
+        # 1. Mở rộng mạng (Expand Network)
         self._network.update_fc(self.increment) 
         self._network.update_noise()
         self._network.to(self.device)
         self._clear_gpu()
 
-        # STEP 1: Analytic Update (Warm-up với data mới)
-        self.logger.info(">>> Step 1: Analytic Update...")
+        # STEP 1: Analytic Update (Cập nhật RLS cho class mới)
+        # Cần làm trước để có Logits_Analytic dùng cho Ensemble
+        self.logger.info(">>> Step 1: Analytic Update (Preparing Teacher)...")
         self.fit_fc(train_loader_analytic)
         
-        # [QUAN TRỌNG] Đồng bộ trọng số RLS sang SGD để train Noise
-        self._network.sync_analytic_to_normal()
+        # [QUAN TRỌNG] KHÔNG GỌI SYNC Ở ĐÂY!
+        # Vì ta dùng cơ chế cộng gộp (Logits = A + B), nên SGD phải học phần dư (Residual), không copy.
 
-        # STEP 2: Train Noise
-        self.logger.info(">>> Step 2: Training BiLORA Noise...")
+        # STEP 2: Train Noise (ENSEMBLE MODE)
+        self.logger.info(">>> Step 2: Training BiLORA Noise (Ensemble Mode)...")
         self.run(train_loader_noise)
 
         # STEP 3: Merge & Refit
@@ -228,7 +233,7 @@ class MinNet(object):
         self._clear_gpu()
 
     # =========================================================================
-    # TRAIN LOOP (SGD)
+    # TRAIN LOOP (SGD) - ENSEMBLE LOGIC
     # =========================================================================
     def run(self, train_loader):
         if self.cur_task == 0:
@@ -244,9 +249,7 @@ class MinNet(object):
         for param in self._network.parameters():
             param.requires_grad = False
         
-        # [QUAN TRỌNG] Unfreeze Classifier (như code gốc bạn đưa)
-        # Nếu task > 0, ta đã sync trọng số RLS rồi nên unfreeze hay không cũng đỡ hơn
-        # Nhưng code gốc luôn unfreeze, nên ta giữ nguyên.
+        # Unfreeze Classifier (Normal FC)
         for param in self._network.normal_fc.parameters():
             param.requires_grad = True
             
@@ -277,8 +280,27 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast('cuda'):
-                    outputs = self._network.forward_normal_fc(inputs)
-                    logits = outputs['logits']
+                    # -------------------------------------------
+                    # LOGIC CỘNG GỘP (ENSEMBLE) CHO TASK > 0
+                    # -------------------------------------------
+                    if self.cur_task > 0:
+                        # 1. Lấy kết quả từ Analytic (Cố định, không tính grad)
+                        with torch.no_grad():
+                            # new_forward=False -> Chạy qua Analytic
+                            outputs_analytic = self._network(inputs, new_forward=False)
+                            logits_analytic = outputs_analytic['logits']
+                        
+                        # 2. Lấy kết quả từ SGD (Đang train)
+                        outputs_sgd = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits_sgd = outputs_sgd['logits']
+                        
+                        # 3. CỘNG GỘP
+                        logits = logits_analytic + logits_sgd
+                    else:
+                        # Task 0 chỉ chạy SGD
+                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits = outputs['logits']
+
                     loss = F.cross_entropy(logits, targets.long())
 
                 loss.backward()
@@ -298,5 +320,6 @@ class MinNet(object):
             prog_bar.set_description(info)
             self.logger.info(info)
             print(f"Ep {epoch+1}/{epochs} | Loss: {losses/len(train_loader):.3f} | Acc: {train_acc:.2f}%")
+            
             if epoch % 5 == 0:
                 self._clear_gpu()
