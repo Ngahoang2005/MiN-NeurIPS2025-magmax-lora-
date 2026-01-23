@@ -79,7 +79,12 @@ class BiLORA_Linear(nn.Module):
         self.out_features = out_features
         self.k = k
         
-        # Kích thước miền tần số
+        # [FIX QUAN TRỌNG] Định nghĩa kích thước không gian thực (Spatial Shape)
+        # Để hàm forward biết kích thước ma trận trọng số (Out, In)
+        self.out_shape = (out_features, in_features) 
+        
+        # Kích thước miền tần số (Frequency Domain)
+        # RFFT của ma trận (H, W) sẽ có kích thước (H, W//2 + 1)
         self.freq_h = out_features
         self.freq_w = in_features // 2 + 1
         
@@ -87,123 +92,87 @@ class BiLORA_Linear(nn.Module):
         self.register_buffer('global_freq_weight', torch.zeros((self.freq_h, self.freq_w), dtype=torch.cfloat))
         
         # 2. Active Params: Tham số train cho task hiện tại
-        # Dạng vector thưa (Sparse) kích thước k
         self.active_params = nn.Parameter(torch.zeros(k, dtype=torch.cfloat))
         self.register_buffer('active_indices', torch.zeros(k, dtype=torch.long))
         
         self.is_initialized = False
 
     def init_zero(self):
-        # [CRITICAL FIX]
-        # Phải là ZERO TUYỆT ĐỐI. Không dùng normal_ * 1e-4.
-        # Nếu có bất kỳ giá trị nào khác 0, nó sẽ làm hỏng feature của Backbone ngay lập tức.
+        # [CRITICAL FIX] Phải là ZERO TUYỆT ĐỐI
         nn.init.constant_(self.active_params, 0) 
         
-        # Reset các tham số khác nếu cần
         if self.is_initialized:
              self.active_indices.zero_()
-             self.is_initialized = False # Reset trạng thái về chưa kích hoạt
+             self.is_initialized = False 
 
     def new_task(self):
-        """
-        [Start New Task]
-        1. Chọn k vị trí tần số ngẫu nhiên mới.
-        2. Reset active_params về trạng thái Near-Zero.
-        """
         total_freqs = self.freq_h * self.freq_w
-        
         # 1. Chọn vị trí ngẫu nhiên
         indices = torch.randperm(total_freqs)[:self.k].to(self.global_freq_weight.device)
         self.active_indices.copy_(indices)
         
-        # 2. Reset Active Params (Near Zero)
+        # 2. Reset Active Params (Absolute Zero)
         self.init_zero() 
         self.active_params.requires_grad = True
         self.is_initialized = True
 
     def forward(self, x):
-        # 1. Lấy Global Weight (Nền tảng)
+        # 1. Lấy Global Weight
         current_freq_weight = self.global_freq_weight.clone()
         
-        # 2. Cộng Active Params (BiLORA Learning)
+        # 2. Cộng Active Params
         if self.is_initialized:
-            # Tạo ma trận delta thưa (Sparse Delta)
             delta_weight = torch.zeros_like(current_freq_weight)
-            
-            # Scatter active params vào đúng vị trí indices
-            # active_params: [K] (Complex)
-            # active_indices: [K] (Long)
-            # Flatten delta để scatter cho dễ
             delta_flat = delta_weight.view(-1)
             delta_flat.scatter_add_(0, self.active_indices, self.active_params)
             delta_weight = delta_flat.view_as(delta_weight)
-            
-            # Cộng vào trọng số hiện tại
             current_freq_weight = current_freq_weight + delta_weight
 
         # =====================================================================
         # [CRITICAL FIX] ENFORCE HERMITIAN SYMMETRY
-        # Để đảm bảo irfft2 ra số thực chuẩn toán học:
-        # Các tần số đặc biệt (DC và Nyquist) bắt buộc phải là số THỰC (Imag=0).
+        # Ép phần ảo tại các tần số đặc biệt về 0 để IRFFT ra số thực chuẩn
         # =====================================================================
         
-        # 1. DC Component tại (0,0) phải là số thực
+        # 1. DC Component (0,0) phải là thực
         current_freq_weight[..., 0, 0] = current_freq_weight[..., 0, 0].real + 0j
         
         # 2. Nyquist Frequencies (Nếu kích thước chẵn)
-        # Kiểm tra xem chiều cao/rộng có chẵn không để xử lý các điểm biên
-        H, W_half = current_freq_weight.shape[-2], current_freq_weight.shape[-1]
-        
-        # (Optional) Xử lý các điểm Nyquist khác nếu cần thiết chặt chẽ hơn
-        # Thường chỉ cần xử lý DC (0,0) là đã sửa được 99% lỗi rồi.
-        # Nhưng để chắc chắn, ta ép cụ thể các điểm góc nếu H chẵn
+        # Dùng self.out_shape đã khai báo ở __init__
         if self.out_shape[0] % 2 == 0: # Height chẵn
-             current_freq_weight[..., H//2, 0] = current_freq_weight[..., H//2, 0].real + 0j
+             current_freq_weight[..., self.freq_h//2, 0] = current_freq_weight[..., self.freq_h//2, 0].real + 0j
         
         if self.out_shape[1] % 2 == 0: # Width chẵn
              current_freq_weight[..., 0, -1] = current_freq_weight[..., 0, -1].real + 0j
              if self.out_shape[0] % 2 == 0:
-                 current_freq_weight[..., H//2, -1] = current_freq_weight[..., H//2, -1].real + 0j
+                 current_freq_weight[..., self.freq_h//2, -1] = current_freq_weight[..., self.freq_h//2, -1].real + 0j
 
         # =====================================================================
 
-        # 3. Thực hiện Inverse FFT (Frequency -> Spatial)
-        # s=self.out_shape để đảm bảo output size đúng (H, W)
+        # 3. Inverse FFT
         spatial_weight = torch.fft.irfft2(current_freq_weight, s=self.out_shape, norm='ortho')
 
-        # 4. Convolution (hoặc Linear) trong không gian thực
+        # 4. Linear Projection
         return F.linear(x, spatial_weight)
+
     def merge_task(self):
-        """
-        [MAGMAX MERGING]
-        So sánh Element-wise Magnitude giữa (Global cũ) và (Task mới).
-        """
+        # [MAGMAX MERGING] Logic giữ nguyên
         if not self.is_initialized: return
 
         with torch.no_grad():
-            # 1. Tạo ma trận update thưa
             update_matrix = torch.zeros_like(self.global_freq_weight).view(-1)
             update_matrix.scatter_(0, self.active_indices, self.active_params)
             update_matrix = update_matrix.view(self.freq_h, self.freq_w)
             
-            # 2. Trọng số của Task hiện tại = Global cũ + Phần mới học
             task_freq_weight = self.global_freq_weight + update_matrix
             
-            # 3. MagMax: So sánh độ lớn (Magnitude)
             mag_task = torch.abs(task_freq_weight)
             mag_global = torch.abs(self.global_freq_weight)
             
-            # Mask: Vị trí nào Task mới mạnh hơn thì lấy
             mask = mag_task > mag_global
-            
-            # Update Global
             self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
             
-            # 4. Freeze Active (Dọn dẹp)
-            self.init_zero() # Reset về near zero
+            self.init_zero()
             self.active_params.requires_grad = False
-
-
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
