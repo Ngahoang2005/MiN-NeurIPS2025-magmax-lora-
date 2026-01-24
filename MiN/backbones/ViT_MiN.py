@@ -133,6 +133,27 @@ class BiLORA_Linear(nn.Module):
         spatial_weight = torch.fft.irfft2(current_freq_weight, s=self.out_shape, norm='ortho')
         return F.linear(x, spatial_weight)
 
+    # def merge_task(self):
+    #     if not self.is_initialized: return
+
+    #     with torch.no_grad():
+    #         update_matrix = torch.zeros_like(self.global_freq_weight).view(-1)
+    #         update_matrix.scatter_(0, self.active_indices, self.active_params)
+    #         update_matrix = update_matrix.view(self.freq_h, self.freq_w)
+            
+    #         task_freq_weight = self.global_freq_weight + update_matrix
+            
+    #         mag_task = torch.abs(task_freq_weight)
+    #         mag_global = torch.abs(self.global_freq_weight)
+            
+    #         mask = mag_task > mag_global
+    #         self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
+            
+    #         # Reset cho task sau
+    #         self.init_zero()
+    #         self.active_params.requires_grad = False
+    #         # self.is_initialized = False # Có thể giữ True hoặc False tùy logic, nhưng an toàn nhất là để nguyên
+    # ép đx 
     def merge_task(self):
         if not self.is_initialized: return
 
@@ -143,16 +164,33 @@ class BiLORA_Linear(nn.Module):
             
             task_freq_weight = self.global_freq_weight + update_matrix
             
+            # MagMax Logic
             mag_task = torch.abs(task_freq_weight)
             mag_global = torch.abs(self.global_freq_weight)
-            
             mask = mag_task > mag_global
+            
+            # Cập nhật Global
             self.global_freq_weight[:] = torch.where(mask, task_freq_weight, self.global_freq_weight)
+            
+            # [FIX QUAN TRỌNG]: ÉP ĐỐI XỨNG NGAY SAU KHI MERGE
+            # Để đảm bảo Global Weight luôn "sạch" phần ảo tại các điểm đặc biệt
+            self.global_freq_weight[..., 0, 0] = self.global_freq_weight[..., 0, 0].real + 0j
+            
+            if self.out_shape[0] % 2 == 0:
+                 self.global_freq_weight[..., self.freq_h//2, 0] = \
+                     self.global_freq_weight[..., self.freq_h//2, 0].real + 0j
+            
+            if self.out_shape[1] % 2 == 0:
+                 self.global_freq_weight[..., 0, -1] = \
+                     self.global_freq_weight[..., 0, -1].real + 0j
+                 
+                 if self.out_shape[0] % 2 == 0:
+                     self.global_freq_weight[..., self.freq_h//2, -1] = \
+                         self.global_freq_weight[..., self.freq_h//2, -1].real + 0j
             
             # Reset cho task sau
             self.init_zero()
             self.active_params.requires_grad = False
-            # self.is_initialized = False # Có thể giữ True hoặc False tùy logic, nhưng an toàn nhất là để nguyên
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
