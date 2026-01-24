@@ -171,7 +171,7 @@ class PiNoise(nn.Module):
             
             # [FIX 2 - QUAN TRỌNG]: Xử lý số phức trong môi trường an toàn (FP32)
             # Tắt Autocast đoạn này để tránh tạo ra ComplexHalf gây lỗi index_add_
-            with autocast(enabled=False):
+            with autocast('cuda', enabled=False):
                 # d. Tái tạo số phức từ output MLP
                 # Ép kiểu .float() (FP32) cho các thành phần thực/ảo
                 real_part = theta_val[..., :self.hidden_dim].float()
