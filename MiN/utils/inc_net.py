@@ -205,11 +205,11 @@ class MiNbaseNet(nn.Module):
         except ImportError:
             from torch.cuda.amp import autocast
 
-        with autocast(enabled=True): 
+        with autocast('cuda', enabled=True): 
             X = self.backbone(X)
         
         # 2. Tính toán RLS (Bắt buộc FP32 & Tắt Autocast)
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             # [Quan Trọng] Ép kiểu FP32 và tách khỏi graph
             X = X.detach().float()
             
