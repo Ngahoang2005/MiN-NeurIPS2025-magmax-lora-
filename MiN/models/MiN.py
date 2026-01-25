@@ -298,7 +298,7 @@ class MinNet(object):
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs, targets = inputs.to(self.device).float(), targets.to(self.device)
                 
                 optimizer.zero_grad(set_to_none=True) 
 

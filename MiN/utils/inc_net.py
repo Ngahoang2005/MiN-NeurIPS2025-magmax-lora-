@@ -108,9 +108,9 @@ class MiNbaseNet(nn.Module):
         
         # Tạo Normal FC mới để train task hiện tại
         if self.cur_task > 0:
-            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
+            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False).float()
         else:
-            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
+            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True).float()
             
         # Copy trọng số cũ (nếu muốn warm-start normal FC, dù RLS mới là chính)
         if self.normal_fc is not None:
@@ -262,7 +262,7 @@ class MiNbaseNet(nn.Module):
         # Hàm forward dành riêng cho lúc Training PiNoise (dùng SGD)
         hyper_features = self.backbone(x)
         hyper_features = self.buffer(hyper_features)
-        
+        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         # Dùng Normal FC (có bias, đang học)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
