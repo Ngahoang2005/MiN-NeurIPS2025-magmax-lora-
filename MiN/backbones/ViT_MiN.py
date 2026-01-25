@@ -88,26 +88,13 @@ class PiNoise(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-        """
-        Khởi tạo an toàn cho Beneficial Noise Generator.
-        
-        Quy tắc vàng:
-        - mu: Có thể khởi tạo mạnh (Kaiming) vì là mean
-        - sigma: PHẢI nhỏ (constant) vì là std deviation
-        """
-        if self.current_task_id <= 0:
-            # ============ TASK 0 ============
-            # mu: Khởi tạo chuẩn với Kaiming
-            init.kaiming_normal_(self.mu.weight, mode='fan_out', nonlinearity='relu')
-            init.constant_(self.mu.bias, 0.)
-            
-            # sigma: Bắt đầu từ 0 hoặc RẤT NHỎ
-            init.constant_(self.sigma.weight, 0.)      # Không có linear transform
-            init.constant_(self.sigma.bias, 5e-4)      # Chỉ có bias nhỏ → sigma ≈ 0.0005
-            
-            print(f"🎯 Task 0: Initialized safely")
-            print(f"   mu: Kaiming Normal (std ≈ 0.08)")
-            print(f"   sigma: Constant (value = 0.0005)")
+    if self.current_task_id == 0:
+        # Giảm std của Kaiming xuống rất nhỏ
+        init.normal_(self.mu.weight, std=0.001) 
+        init.constant_(self.mu.bias, 0.)
+        # Sigma cũng phải rất nhỏ để không làm nổ nhiễu
+        init.constant_(self.sigma.weight, 1e-4) 
+        init.constant_(self.sigma.bias, 1e-4)
             
         else:
             # ============ TASK N (N > 0) ============
