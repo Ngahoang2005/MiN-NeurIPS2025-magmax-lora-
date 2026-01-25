@@ -4,14 +4,16 @@ import math
 import numpy as np
 import torch
 from torch import nn, Tensor
-from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from backbones.pretrained_backbone import get_pretrained_backbone
-from backbones.linears import SimpleLinear
-# Import autocast cho Mixed Precision
-try:
-    from torch.amp import autocast
-except ImportError:
-    from torch.cuda.amp import autocast
+from backbones.linears import SimpleLinear, SplitCosineLinear, CosineLinear
+from einops.layers.torch import Rearrange, Reduce
+from einops import rearrange, reduce, repeat
+from torch.nn import functional as F
+import scipy.stats as stats
+import timm
+import random
+
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
@@ -35,36 +37,36 @@ class BaseIncNet(nn.Module):
 
     @staticmethod
     def generate_fc(in_dim, out_dim):
-        return SimpleLinear(in_dim, out_dim)
+        fc = SimpleLinear(in_dim, out_dim)
+        return fc
 
     def forward(self, x):
         hyper_features = self.backbone(x)
         logits = self.fc(hyper_features)['logits']
-        return {'features': hyper_features, 'logits': logits}
+        return {
+            'features': hyper_features,
+            'logits': logits
+        }
 
-# -------------------------------------------------
-# ✅ FIX 1: RandomBuffer kế thừa nn.Module (Sạch hơn)
-# -------------------------------------------------
-class RandomBuffer(nn.Module):
+
+class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
-        super(RandomBuffer, self).__init__()
+        super(torch.nn.Linear, self).__init__()
+        self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        
-        # Tạo ma trận chiếu cố định (Không học)
-        factory_kwargs = {"device": device, "dtype": torch.float32}
+        factory_kwargs = {"device": device, "dtype": torch.double}
+        # self.W = torch.empty((self.out_features, self.in_features), **factory_kwargs)
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
-        
-        # Kaiming Init cho projection tốt
-        nn.init.kaiming_normal_(self.W, nonlinearity='linear')
-        
-        # Đăng ký là buffer để nó được lưu vào state_dict nhưng không có gradient
-        self.register_buffer("proj_weight", self.W)
+        self.register_buffer("weight", self.W)
 
+        self.reset_parameters()
+
+    # @torch.no_grad()
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        X = X.to(self.proj_weight.dtype)
-        # Random Projection + ReLU activation
-        return F.relu(X @ self.proj_weight)
+        X = X.to(self.weight)
+        return F.relu(X @ self.W)
+
 
 # -------------------------------------------------
 # MAIN NETWORK
@@ -140,13 +142,19 @@ class MiNbaseNet(nn.Module):
 
     def init_unfreeze(self):
         # Mở khóa các lớp cần thiết ban đầu
-        self.unfreeze_noise()
-        for p in self.backbone.norm.parameters(): p.requires_grad = True
-        # Mở khóa LayerNorm của backbone (tùy chọn)
         for j in range(self.backbone.layer_num):
-             for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
-             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
-
+            # Unfreeze Noise
+            self.backbone.noise_maker[j].unfreeze_noise()
+            
+            # Unfreeze LayerNorms trong từng Block ViT
+            for p in self.backbone.blocks[j].norm1.parameters():
+                p.requires_grad = True
+            for p in self.backbone.blocks[j].norm2.parameters():
+                p.requires_grad = True
+                
+        # Unfreeze LayerNorm cuối cùng
+        for p in self.backbone.norm.parameters():
+            p.requires_grad = True
     def forward_fc(self, features):
         features = features.to(self.weight.dtype)
         # Classifier chính thức (RLS Weight)
@@ -239,6 +247,9 @@ class MiNbaseNet(nn.Module):
 
     def forward(self, x, new_forward: bool = False):
         # Hàm forward tổng quát cho Inference
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+
         hyper_features = self.backbone(x)
         hyper_features = hyper_features.to(self.weight.dtype)
         
