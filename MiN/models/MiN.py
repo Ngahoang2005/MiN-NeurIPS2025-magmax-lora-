@@ -81,6 +81,7 @@ class MinNet(object):
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        
         del test_set
 
     def save_check_point(self, path_name):
@@ -136,6 +137,7 @@ class MinNet(object):
         self.run(train_loader)
         self._network.after_task_magmax_merge()
         self.analyze_model_sparsity()
+        
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -156,7 +158,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        
+        self.check_rls_quality()
         del train_set, test_set
         self._clear_gpu()
 
@@ -195,6 +197,7 @@ class MinNet(object):
         self.run(train_loader)
         self._network.after_task_magmax_merge()
         self.analyze_model_sparsity()
+        
         self._clear_gpu()
 
 
@@ -213,7 +216,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-
+        self.check_rls_quality()
         del train_set, test_set
         self._clear_gpu()
 
@@ -389,49 +392,74 @@ class MinNet(object):
         return prototype
     
 
-    def analyze_model_sparsity(model, threshold=1e-5):
+    def analyze_model_sparsity(self, threshold=1e-5):
         """
-        Kiểm tra độ thưa (Sparsity) của mạng.
-        Sparsity = (Số lượng phần tử xấp xỉ 0) / (Tổng số phần tử)
+        Hàm phân tích độ thưa (Sparsity) dành riêng cho lớp MinNet.
         """
         print("\n" + "="*50)
         print("📊 PHÂN TÍCH ĐỘ THƯA (SPARSITY REPORT)")
         print("="*50)
 
-        # 1. Kiểm tra Analytic Classifier (RLS weights)
-        if hasattr(model, 'weight'):
-            w_rls = model.weight
-            total_rls = w_rls.numel()
-            zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
-            sparsity_rls = (zero_rls / total_rls) * 100
-            print(f"🔹 Analytic Classifier (W_rls):")
-            print(f"   - Tổng tham số: {total_rls}")
-            print(f"   - Độ thưa: {sparsity_rls:.2f}%")
+        # 1. Kiểm tra Analytic Classifier (Nằm trong _network.weight)
+        # Đây là trọng số RLS sau khi đã gộp (Merge)
+        w_rls = self._network.weight
+        total_rls = w_rls.numel()
+        zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
+        sparsity_rls = (zero_rls / total_rls) * 100
+        print(f"🔹 Analytic Classifier (W_rls):")
+        print(f"   - Tổng tham số: {total_rls}")
+        print(f"   - Độ thưa: {sparsity_rls:.2f}%")
 
-        # 2. Kiểm tra các lớp PiNoise (Noise Generator)
+        # 2. Kiểm tra các lớp PiNoise (Nằm trong _network.backbone.noise_maker)
         print(f"\n🔹 PiNoise Modules (Backbone Layers):")
         total_mu_sparsity = []
         
-        # Truy cập vào noise_maker trong backbone
-        for i, noise_module in enumerate(model.backbone.noise_maker):
+        # Sửa lỗi: Truy cập qua self._network.backbone
+        for i, noise_module in enumerate(self._network.backbone.noise_maker):
             # Kiểm tra mu.weight
             mu_w = noise_module.mu.weight.data
             zero_mu = torch.sum(torch.abs(mu_w) < threshold).item()
             sparsity_mu = (zero_mu / mu_w.numel()) * 100
             total_mu_sparsity.append(sparsity_mu)
             
-            if i % 4 == 0 or i == len(model.backbone.noise_maker) - 1:
+            # In mẫu một vài layer để theo dõi
+            if i % 4 == 0 or i == len(self._network.backbone.noise_maker) - 1:
                 print(f"   - Layer {i:2d} | mu_weight sparsity: {sparsity_mu:.2f}%")
 
         avg_sparsity = np.mean(total_mu_sparsity)
         print("-" * 50)
         print(f"✅ Trung bình Sparsity của Generator: {avg_sparsity:.2f}%")
         
+        # Nhận xét dựa trên kỳ vọng của MagMax
         if avg_sparsity > 50:
-            print("💡 Nhận xét: MagMax đang hoạt động tốt, các task không bị chồng lấn nhiều.")
+            print("💡 Nhận xét: Tuyệt vời! MagMax đang giữ các task khá tách biệt.")
         else:
-            print("💡 Nhận xét: Các trọng số đang khá dày đặc. Có thể cần tăng L1 hoặc giảm k.")
+            print("💡 Nhận xét: Độ thưa hơi thấp. Có thể các task đang 'dẫm chân' nhau một chút.")
         print("="*50 + "\n")
+    def check_rls_quality(self):
+        """
+        Script nhỏ kiểm tra chất lượng và độ thưa của ma trận RLS
+        """
+        # Lấy trọng số RLS
+        rls_weight = model._network.weight.data  # [Buffer_size, Num_Classes]
+        
+        # 1. Tính độ thưa
+        sparsity = (torch.abs(rls_weight) < 1e-6).float().mean().item() * 100
+        
+        # 2. Tính năng lượng (Norm) - Giúp biết trọng số có bị 'nổ' không
+        weight_norm = torch.norm(rls_weight).item()
+        
+        # 3. Kiểm tra độ lệch giữa các class (Bias check)
+        class_means = torch.mean(torch.abs(rls_weight), dim=0)
+        class_std = torch.std(class_means).item()
 
-    # Cách sử dụng: Gọi hàm này sau khi kết thúc model.after_task_magmax_merge()
-    # analyze_model_sparsity(model._network)
+        print(f"--- RLS Quality Check (Task {model.cur_task}) ---")
+        print(f" > Sparsity: {sparsity:.2f}%")
+        print(f" > Weight Norm: {weight_norm:.4f}")
+        print(f" > Class Balance (Std of Means): {class_std:.6f}")
+        
+        if class_std > 0.1:
+            print(" ⚠️ Cảnh báo: Có hiện tượng lệch class (Recency Bias).")
+        else:
+            print(" ✅ RLS ổn định: Trọng số phân bổ đồng đều giữa các lớp.")
+        print("-" * 35)
