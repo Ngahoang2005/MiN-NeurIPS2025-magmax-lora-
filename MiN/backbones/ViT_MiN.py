@@ -88,7 +88,7 @@ class PiNoise(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self):
-    if self.current_task_id == 0:
+    if self.current_task_id <= 0:
         # Giảm std của Kaiming xuống rất nhỏ
         init.normal_(self.mu.weight, std=0.001) 
         init.constant_(self.mu.bias, 0.)
