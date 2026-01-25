@@ -392,7 +392,7 @@ class MinNet(object):
         return prototype
     
 
-    def analyze_model_sparsity(self, threshold=1e-5):
+    def analyze_model_sparsity(self, threshold=0):
         print("\n" + "="*50)
         print("📊 PHÂN TÍCH ĐỘ THƯA (SPARSITY REPORT)")
         print("="*50)
@@ -403,7 +403,7 @@ class MinNet(object):
         
         # FIX: Chỉ tính toán khi ma trận đã có tham số (sau Task 0 hoặc sau khi gọi fit)
         if total_rls > 0:
-            zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
+            zero_rls = torch.sum(torch.abs(w_rls) <= threshold).item()
             sparsity_rls = (zero_rls / total_rls) * 100
             print(f"🔹 Analytic Classifier (W_rls):")
             print(f"   - Tổng tham số: {total_rls}")
