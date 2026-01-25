@@ -393,22 +393,23 @@ class MinNet(object):
     
 
     def analyze_model_sparsity(self, threshold=1e-5):
-        """
-        Hàm phân tích độ thưa (Sparsity) dành riêng cho lớp MinNet.
-        """
         print("\n" + "="*50)
         print("📊 PHÂN TÍCH ĐỘ THƯA (SPARSITY REPORT)")
         print("="*50)
 
-        # 1. Kiểm tra Analytic Classifier (Nằm trong _network.weight)
-        # Đây là trọng số RLS sau khi đã gộp (Merge)
+        # 1. Kiểm tra Analytic Classifier (RLS)
         w_rls = self._network.weight
         total_rls = w_rls.numel()
-        zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
-        sparsity_rls = (zero_rls / total_rls) * 100
-        print(f"🔹 Analytic Classifier (W_rls):")
-        print(f"   - Tổng tham số: {total_rls}")
-        print(f"   - Độ thưa: {sparsity_rls:.2f}%")
+        
+        # FIX: Chỉ tính toán khi ma trận đã có tham số (sau Task 0 hoặc sau khi gọi fit)
+        if total_rls > 0:
+            zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
+            sparsity_rls = (zero_rls / total_rls) * 100
+            print(f"🔹 Analytic Classifier (W_rls):")
+            print(f"   - Tổng tham số: {total_rls}")
+            print(f"   - Độ thưa: {sparsity_rls:.2f}%")
+        else:
+            print(f"🔹 Analytic Classifier (W_rls): Chưa được khởi tạo hoặc đang trống.")
 
         # 2. Kiểm tra các lớp PiNoise (Nằm trong _network.backbone.noise_maker)
         print(f"\n🔹 PiNoise Modules (Backbone Layers):")
