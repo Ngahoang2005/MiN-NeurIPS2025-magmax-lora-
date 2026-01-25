@@ -89,26 +89,42 @@ class PiNoise(nn.Module):
 
     def reset_parameters(self):
         """
-        Warm-start strategy:
-        - Task 0: Kaiming init
-        - Task 1+: Giữ merged weights + exploration noise
+        Khởi tạo an toàn cho Beneficial Noise Generator.
+        
+        Quy tắc vàng:
+        - mu: Có thể khởi tạo mạnh (Kaiming) vì là mean
+        - sigma: PHẢI nhỏ (constant) vì là std deviation
         """
         if self.current_task_id <= 0:
-            init.kaiming_normal_(self.mu.weight, nonlinearity='relu')
+            # ============ TASK 0 ============
+            # mu: Khởi tạo chuẩn với Kaiming
+            init.kaiming_normal_(self.mu.weight, mode='fan_out', nonlinearity='relu')
             init.constant_(self.mu.bias, 0.)
-            init.kaiming_normal_(self.sigma.weight, nonlinearity='relu')
-            init.constant_(self.sigma.bias, 1e-2)
+            
+            # sigma: Bắt đầu từ 0 hoặc RẤT NHỎ
+            init.constant_(self.sigma.weight, 0.)      # Không có linear transform
+            init.constant_(self.sigma.bias, 5e-4)      # Chỉ có bias nhỏ → sigma ≈ 0.0005
+            
+            print(f"🎯 Task 0: Initialized safely")
+            print(f"   mu: Kaiming Normal (std ≈ 0.08)")
+            print(f"   sigma: Constant (value = 0.0005)")
+            
         else:
-            # Warm-start từ merged generator
-            # Weights đã được merge trong after_task_training()
-            # Chỉ thêm noise nhỏ để exploration
+            # ============ TASK N (N > 0) ============
+            # Warm-start: Thêm exploration noise nhỏ
             with torch.no_grad():
+                # mu: Có thể thêm noise lớn hơn
+                mu_noise_scale = 0.01
                 for param in self.mu.parameters():
-                    param.add_(torch.randn_like(param) * 0.01)
+                    param.add_(torch.randn_like(param) * mu_noise_scale)
+                
+                # sigma: Thêm noise RẤT NHỎ (1/10 của mu)
+                sigma_noise_scale = 0.001
                 for param in self.sigma.parameters():
-                    param.add_(torch.randn_like(param) * 0.01)
-            print(f"🔄 Task {self.current_task_id}: Warm-started from Merged")
-
+                    param.add_(torch.randn_like(param) * sigma_noise_scale)
+            
+            print(f"🔄 Task {self.current_task_id}: Warm-started")
+            print(f"   Added exploration noise: mu ± {mu_noise_scale}, sigma ± {sigma_noise_scale}")
     def _get_spectral_mask(self, task_id):
         """
         Chiến lược: Dịch chuyển cửa sổ từ High-freq về Low-freq.
