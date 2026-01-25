@@ -122,6 +122,9 @@ class PiNoise(nn.Module):
             # (Phòng trường hợp mix_weights cũ đang trôi nổi ở device khác)
             current_weights = self.mix_weights.data.to(device)
             self.mix_weights = nn.Parameter(torch.cat([current_weights, new_w]))
+        if self.current_task_id > 0:
+            self.reset_parameters() 
+            print(f"--> [PiNoise] Reset Generator Weights for Task {self.current_task_id} (Independent Expert Training)")
 
     def update_noise(self):
         self.expand_new_task()
