@@ -101,12 +101,12 @@ class PiNoise(nn.Module):
             # Warm-start: Thêm exploration noise nhỏ
             with torch.no_grad():
                 # mu: Có thể thêm noise lớn hơn
-                mu_noise_scale = 0.01
+                mu_noise_scale = 0.001
                 for param in self.mu.parameters():
                     param.add_(torch.randn_like(param) * mu_noise_scale)
                 
                 # sigma: Thêm noise RẤT NHỎ (1/10 của mu)
-                sigma_noise_scale = 0.001
+                sigma_noise_scale = 0.0001
                 for param in self.sigma.parameters():
                     param.add_(torch.randn_like(param) * sigma_noise_scale)
             
@@ -189,71 +189,79 @@ class PiNoise(nn.Module):
 
     # --- FORWARD PASS VỚI SPECTRAL MASKING ---
     def forward(self, x, new_forward=False):
-        if len(self.task_indices) == 0: return x
+        if len(self.task_indices) == 0 or self.current_task_id < 0:
+            return x
         
-        device = x.device # Lấy device một lần
+        device = x.device
         x_freq = torch.fft.rfft(x, dim=-1)
         
         if self.training:
+            # --- TRAINING LOGIC ---
             indices = self.task_indices[self.current_task_id].to(device)
             x_selected = x_freq[..., indices]
-            # Mapping real/imag
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
             
             mu_out = self.mu(x_mlp_in)
             sigma_out = self.sigma(x_mlp_in)
             
-            # Reparameterization
+            # Reparameterization (Có tính ngẫu nhiên để học phân phối)
             epsilon = torch.randn_like(mu_out)
             theta_val = epsilon * sigma_out + mu_out
             
-            # Khôi phục số phức (Tắt autocast để đảm bảo độ chính xác IFFT)
             with torch.amp.autocast('cuda', enabled=False):
-                real_part = theta_val[..., :self.mlp_dim].float()
-                imag_part = theta_val[..., self.mlp_dim:].float()
-                theta_complex = torch.complex(real_part, imag_part)
-                
+                theta_complex = torch.complex(theta_val[..., :self.mlp_dim].float(), 
+                                              theta_val[..., self.mlp_dim:].float())
                 full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-                # index_add_ giúp giữ gradient tốt hơn trong training
                 full_freq_noise.index_add_(-1, indices, theta_complex)
             
             out_noise = torch.fft.irfft(full_freq_noise, n=self.in_dim, dim=-1)
             return x + out_noise
         
         else:
-            # Eval: Kết hợp tất cả tri thức
+            # --- DETERMINISTIC EVAL LOGIC ---
             mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-            
+            # Tensor lưu trữ biên độ lớn nhất để giải quyết Overlap
+            max_mag_map = torch.zeros_like(x_freq.real) 
+
             for task_id in range(len(self.task_indices)):
                 indices = self.task_indices[task_id].to(device)
                 x_selected = x_freq[..., indices]
                 x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
                 
-                # Generator này đã được MagMax Merge
-                mu_out = self.mu(x_mlp_in)
-                sigma_out = self.sigma(x_mlp_in)
-                epsilon = torch.randn_like(mu_out)
-                theta_val = epsilon * sigma_out + mu_out
+                # ✅ Fix 1: Loại bỏ epsilon trong eval để đảm bảo Deterministic
+                # theta_val = mu_out (vì epsilon = 0)
+                theta_val = self.mu(x_mlp_in) 
                 
                 with torch.amp.autocast('cuda', enabled=False):
-                    real_part = theta_val[..., :self.mlp_dim].float()
-                    imag_part = theta_val[..., self.mlp_dim:].float()
-                    theta_complex = torch.complex(real_part, imag_part)
+                    theta_complex = torch.complex(theta_val[..., :self.mlp_dim].float(), 
+                                                  theta_val[..., self.mlp_dim:].float())
                     
-                    # Dùng index_copy_ để ghi đè vùng overlap bằng giá trị của chuyên gia cuối
-                    # Điều này ngăn chặn việc cộng dồn biên độ nhiễu
-                    mixed_freq_noise.index_copy_(-1, indices, theta_complex)
+                    # ✅ Fix 2: Magnitude-based Selection (Spectral MagMax)
+                    # Tính biên độ hiện tại của task này
+                    curr_mag = torch.abs(theta_complex)
+                    
+                    # Lấy biên độ hiện tại trong map tại các vị trí indices
+                    existing_mag = max_mag_map[..., indices]
+                    
+                    # Tạo mask: Vị trí nào nhiễu mới mạnh hơn nhiễu cũ?
+                    better_mask = (curr_mag > existing_mag).to(theta_complex.dtype)
+                    
+                    # Cập nhật nhiễu và map biên độ
+                    # Chỉ cập nhật tại những nơi nhiễu mới "mạnh" hơn
+                    new_noise = theta_complex * better_mask + mixed_freq_noise[..., indices] * (1 - better_mask)
+                    mixed_freq_noise.index_copy_(-1, indices, new_noise)
+                    
+                    new_mag = curr_mag * better_mask.real + existing_mag * (1 - better_mask.real)
+                    max_mag_map.index_copy_(-1, indices, new_mag)
 
             out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-            x_norm = x.norm(dim=-1).mean().item()
-            noise_norm = out_noise.norm(dim=-1).mean().item()
-            ratio = noise_norm / (x_norm + 1e-8)
             
-            if torch.rand(1).item() < 0.01:  # In 1% lần để không spam
-                print(f"[Noise Check] x_norm: {x_norm:.4f} | noise_norm: {noise_norm:.4f} | ratio: {ratio:.4f}")
-    
+            # Monitoring Ratio
+            if torch.rand(1).item() < 0.005:
+                ratio = out_noise.norm() / (x.norm() + 1e-8)
+                print(f"[Eval Ratio] {ratio.item():.4f}")
+
             return x + out_noise
-    
     def unfreeze_noise(self):
         """Mở khóa gradient cho các tham số của Generator (mu và sigma)"""
         for param in self.mu.parameters(): 

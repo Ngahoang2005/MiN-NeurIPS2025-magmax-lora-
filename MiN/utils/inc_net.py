@@ -149,10 +149,6 @@ class MiNbaseNet(nn.Module):
     # --- ĐÂY LÀ HÀM CẦN CHỈNH SỬA DUY NHẤT ---
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        Sửa đổi: Chuyển sang Eval Mode để ép PiNoise dùng Generator đã Merge (Main),
-        tránh việc RLS học nhầm trên Generator tạm thời (Temp).
-        """
         
         try:
             # 2. Feature Extraction (Bật Autocast để nhanh)
