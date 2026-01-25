@@ -135,7 +135,7 @@ class MinNet(object):
         
         self.run(train_loader)
         self._network.after_task_magmax_merge()
-        
+        self.analyze_model_sparsity()
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -194,6 +194,7 @@ class MinNet(object):
 
         self.run(train_loader)
         self._network.after_task_magmax_merge()
+        self.analyze_model_sparsity()
         self._clear_gpu()
 
 
@@ -386,3 +387,51 @@ class MinNet(object):
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
+    
+
+    def analyze_model_sparsity(model, threshold=1e-5):
+        """
+        Kiểm tra độ thưa (Sparsity) của mạng.
+        Sparsity = (Số lượng phần tử xấp xỉ 0) / (Tổng số phần tử)
+        """
+        print("\n" + "="*50)
+        print("📊 PHÂN TÍCH ĐỘ THƯA (SPARSITY REPORT)")
+        print("="*50)
+
+        # 1. Kiểm tra Analytic Classifier (RLS weights)
+        if hasattr(model, 'weight'):
+            w_rls = model.weight
+            total_rls = w_rls.numel()
+            zero_rls = torch.sum(torch.abs(w_rls) < threshold).item()
+            sparsity_rls = (zero_rls / total_rls) * 100
+            print(f"🔹 Analytic Classifier (W_rls):")
+            print(f"   - Tổng tham số: {total_rls}")
+            print(f"   - Độ thưa: {sparsity_rls:.2f}%")
+
+        # 2. Kiểm tra các lớp PiNoise (Noise Generator)
+        print(f"\n🔹 PiNoise Modules (Backbone Layers):")
+        total_mu_sparsity = []
+        
+        # Truy cập vào noise_maker trong backbone
+        for i, noise_module in enumerate(model.backbone.noise_maker):
+            # Kiểm tra mu.weight
+            mu_w = noise_module.mu.weight.data
+            zero_mu = torch.sum(torch.abs(mu_w) < threshold).item()
+            sparsity_mu = (zero_mu / mu_w.numel()) * 100
+            total_mu_sparsity.append(sparsity_mu)
+            
+            if i % 4 == 0 or i == len(model.backbone.noise_maker) - 1:
+                print(f"   - Layer {i:2d} | mu_weight sparsity: {sparsity_mu:.2f}%")
+
+        avg_sparsity = np.mean(total_mu_sparsity)
+        print("-" * 50)
+        print(f"✅ Trung bình Sparsity của Generator: {avg_sparsity:.2f}%")
+        
+        if avg_sparsity > 50:
+            print("💡 Nhận xét: MagMax đang hoạt động tốt, các task không bị chồng lấn nhiều.")
+        else:
+            print("💡 Nhận xét: Các trọng số đang khá dày đặc. Có thể cần tăng L1 hoặc giảm k.")
+        print("="*50 + "\n")
+
+    # Cách sử dụng: Gọi hàm này sau khi kết thúc model.after_task_magmax_merge()
+    # analyze_model_sparsity(model._network)

@@ -229,9 +229,20 @@ class PiNoise(nn.Module):
         # Step 3: IFFT về không gian gốc
         out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
         return x + out_noise
+    # Thêm đoạn này vào bên trong class PiNoise
+    def unfreeze_noise(self):
+        """Mở khóa gradient cho các tham số của Generator (mu và sigma)"""
+        for param in self.mu.parameters(): 
+            param.requires_grad = True
+        for param in self.sigma.parameters(): 
+            param.requires_grad = True
 
-
-
+    def freeze_noise(self):
+        """Đóng băng Generator khi không cần huấn luyện (ví dụ lúc chạy RLS)"""
+        for param in self.mu.parameters(): 
+            param.requires_grad = False
+        for param in self.sigma.parameters(): 
+            param.requires_grad = False
 
 
 class Attention(nn.Module):
