@@ -68,28 +68,24 @@ class PiNoise(nn.Module):
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
         
-        # Ràng buộc: Mỗi task chiếm 10% không gian tần số
+        # 1. Khởi tạo các thông số kích thước
         self.k = int(self.freq_dim * 0.1) 
-        # hidden_dim của MLP giờ đây khớp với 10% tần số được chọn
         self.mlp_dim = self.k 
-        
         self.act = nn.GELU()
         
-        # --- Shared Generator (MLP Full tham số) ---
-        # input_size = k * 2 (do complex: real + imag)
+        # 2. Định nghĩa các Layers
         input_size = self.mlp_dim * 2 
         self.mu = nn.Linear(input_size, input_size)
         self.sigma = nn.Linear(input_size, input_size)
-        
-        self.reset_parameters()
-        
-        # Quản lý Task
+
+        # 🌟 3. PHẢI KHỞI TẠO CÁC BIẾN QUẢN LÝ TRƯỚC KHI RESET
         self.task_indices = [] 
-        self.current_task_id = -1
-        
-        # Lưu trữ lịch sử cho MagMax
+        self.current_task_id = 0 # Khởi tạo là 0 cho task đầu tiên
         self.history_mu = []
         self.history_sigma = []
+        
+        # 4. Bây giờ mới gọi reset_parameters (vì lúc này current_task_id đã tồn tại)
+        self.reset_parameters()
 
     def reset_parameters(self):
         """
