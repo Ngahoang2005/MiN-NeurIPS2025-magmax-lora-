@@ -13,6 +13,11 @@ from torch.nn import functional as F
 import scipy.stats as stats
 import timm
 import random
+# Thêm đoạn này vào đầu file utils/inc_net.py
+try:
+    from torch.amp import autocast
+except ImportError:
+    from torch.cuda.amp import autocast
 
 
 class BaseIncNet(nn.Module):
