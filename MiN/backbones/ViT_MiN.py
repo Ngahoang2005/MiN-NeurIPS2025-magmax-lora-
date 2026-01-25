@@ -258,8 +258,14 @@ class PiNoise(nn.Module):
                     mixed_freq_noise.index_copy_(-1, indices, theta_complex)
 
             out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-            #return x + out_noise
-            return x 
+            x_norm = x.norm(dim=-1).mean().item()
+            noise_norm = out_noise.norm(dim=-1).mean().item()
+            ratio = noise_norm / (x_norm + 1e-8)
+            
+            if torch.rand(1).item() < 0.01:  # In 1% lần để không spam
+                print(f"[Noise Check] x_norm: {x_norm:.4f} | noise_norm: {noise_norm:.4f} | ratio: {ratio:.4f}")
+    
+            return x + out_noise
     
     def unfreeze_noise(self):
         """Mở khóa gradient cho các tham số của Generator (mu và sigma)"""
