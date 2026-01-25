@@ -63,188 +63,166 @@ class Noise_weigh(nn.Module):
 
 import torch
 import torch.nn as nn
-import copy
-
-# [START CHANGE] - Thay thế toàn bộ class PiNoise cũ bằng class này
-import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import math
+from torch.nn import init
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
-        
         self.in_dim = in_dim
-        self.hidden_dim = hidden_dim # Sparsity k
-        
-        # [BiLoRA Logic]: Real FFT
+        self.hidden_dim = hidden_dim # Đây chính là k (số tần số chọn)
         self.freq_dim = in_dim // 2 + 1
         
         self.act = nn.GELU()
-
-        # Generators và Indices
-        self.generators = nn.ModuleList([]) 
-        self.task_indices = []
         
-        # Mix weights
-        self.mix_weights = nn.Parameter(torch.tensor([], dtype=torch.float32))
+        # --- [CHANGE 1]: Dùng 1 bộ Generator duy nhất (Shared) ---
+        # Để tương thích với hàm MagMax code gốc của bạn
+        input_size = self.hidden_dim * 2 # Real + Imag
+        
+        self.mu = nn.Linear(input_size, input_size)
+        self.sigma = nn.Linear(input_size, input_size)
+        
+        # Init về 0
+        init.constant_(self.mu.weight, 0.)
+        init.constant_(self.mu.bias, 0.)
+        init.constant_(self.sigma.weight, 0.)
+        init.constant_(self.sigma.bias, 0.)
+        
+        # Lưu trữ Task Indices (Vẫn phải riêng biệt cho từng task)
+        self.task_indices = [] 
+        
+        # Lưu trữ lịch sử weights cho MagMax (Logic code gốc)
+        self.history_mu = []
+        self.history_sigma = []
         
         self.current_task_id = -1
         
-        # --- [MAGMAX STORAGE] ---
-        # Lưu trữ trọng số gốc của Task 0 (W_0)
-        self.w0 = None 
-        # Lưu trữ Vector tổng hợp có Magnitude lớn nhất (Accumulated Task Vector)
-        self.magmax_vector = None
+        # Trọng số trộn (Nếu code gốc có dùng Mixture thì giữ, ko thì có thể bỏ)
+        # Ở đây tôi giữ lại để hỗ trợ forward
+        self.mix_weights = nn.Parameter(torch.tensor([], dtype=torch.float32))
 
     def _get_random_indices(self, max_idx, num_select):
         indices = torch.randperm(max_idx)[:num_select]
         return indices.sort()[0]
 
     def expand_new_task(self):
-        """Mở rộng cho task mới: Tạo Mask S_t và Generator Theta_t"""
+        """Mở rộng task: Chỉ sinh Index mới, Generator dùng chung (hoặc reset tùy logic)"""
         self.current_task_id += 1
-        device = self.mix_weights.device if self.mix_weights.numel() > 0 else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        # 1. Tạo Mask S_t
+        device = self.mu.weight.device
+        
+        # 1. Tạo Mask S_t (Chọn k tần số mới cho task này)
         new_indices = self._get_random_indices(self.freq_dim, self.hidden_dim).to(device)
         self.task_indices.append(new_indices)
-
-        # 2. Khởi tạo Theta_t
-        input_size = self.hidden_dim * 2
-        new_gen = nn.ModuleDict({
-            'mu': nn.Linear(input_size, input_size),
-            'sigma': nn.Linear(input_size, input_size)
-        }).to(device)
-
-        nn.init.constant_(new_gen['mu'].weight, 0.)
-        nn.init.constant_(new_gen['mu'].bias, 0.)
-        nn.init.constant_(new_gen['sigma'].weight, 0.)
-        nn.init.constant_(new_gen['sigma'].bias, 0.)
-
-        self.generators.append(new_gen)
-
-        # Freeze old tasks
-        for i, gen in enumerate(self.generators):
-            if i < self.current_task_id:
-                for param in gen.parameters(): param.requires_grad = False
-            else:
-                for param in gen.parameters(): param.requires_grad = True
         
-        # Cập nhật Mix weights
+        # 2. Xử lý Mix Weights
         new_w = torch.tensor([1.0], device=device)
         if self.current_task_id == 0:
             self.mix_weights = nn.Parameter(new_w)
         else:
             self.mix_weights = nn.Parameter(torch.cat([self.mix_weights, new_w]))
+            
+        # Lưu ý: Code gốc của bạn có reset mu/sigma trước khi train task mới không?
+        # Nếu MagMax là merge tích lũy, thì ta giữ nguyên weights hiện tại để train tiếp (Fine-tune).
+        # Nếu muốn train from scratch, bạn thêm đoạn reset params ở đây.
+
+    def update_noise(self):
+        self.expand_new_task()
+
+    def unfreeze_noise(self):
+        # Mở khóa bộ shared generator
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
 
     def forward(self, x, new_forward=False):
-        """
-        Quy trình BiLoRA: x -> RFFT -> Chọn k tần số -> MLP sinh nhiễu -> IRFFT -> x + noise
-        """
-        if len(self.generators) == 0: return x
-
-        # Import autocast cục bộ
+        if len(self.task_indices) == 0: return x
+        
+        # Import autocast cục bộ (Giữ cái fix này để ko lỗi Complex)
         try:
             from torch.amp import autocast
         except ImportError:
             from torch.cuda.amp import autocast
 
-        # 1. FFT
-        x_freq = torch.fft.rfft(x, dim=-1) # [B, N, freq_dim] (Complex)
-
+        x_freq = torch.fft.rfft(x, dim=-1) # Complex
         generated_noises_freq = []
-
-        # 2. Sinh nhiễu
-        for task_id, gen in enumerate(self.generators):
+        
+        # --- LOGIC BI-LORA + SHARED GENERATOR ---
+        # Ta dùng self.mu và self.sigma (đã được MagMax merge) cho TẤT CẢ các task
+        # Sự khác biệt nằm ở `indices` (vùng tần số được chọn)
+        
+        for task_id in range(len(self.task_indices)):
             indices = self.task_indices[task_id]
             
+            # 1. Lấy input đặc trưng theo Index của Task đó
             x_selected = x_freq[..., indices]
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
             
-            mu = gen['mu'](x_mlp_in)
-            sigma = gen['sigma'](x_mlp_in)
+            # 2. Đưa qua Shared Generator (Mu/Sigma đã merge)
+            mu_out = self.mu(x_mlp_in)
+            sigma_out = self.sigma(x_mlp_in)
             
-            epsilon = torch.randn_like(mu)
-            theta_val = epsilon * sigma + mu 
+            # 3. Reparameterization
+            epsilon = torch.randn_like(mu_out)
+            theta_val = epsilon * sigma_out + mu_out
             
-            # [FIX]: Xử lý số phức với Autocast tắt + Ép kiểu FP32
+            # 4. Tái tạo số phức & Fix lỗi Type Mismatch
             with autocast('cuda', enabled=False):
                 real_part = theta_val[..., :self.hidden_dim].float()
                 imag_part = theta_val[..., self.hidden_dim:].float()
-                
                 theta_complex = torch.complex(real_part, imag_part)
                 
                 full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
                 full_freq_noise.index_add_(-1, indices, theta_complex)
-                
                 generated_noises_freq.append(full_freq_noise)
 
-        # 3. Trộn nhiễu
+        # Trộn nhiễu
         weights = F.softmax(self.mix_weights, dim=0)
         mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-        
         for i, noise in enumerate(generated_noises_freq):
             mixed_freq_noise += noise * weights[i]
 
-        # 4. iFFT
         out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-        
         return x + out_noise
 
-    # --- [MAGMAX MERGING LOGIC] ---
-    def after_task_training(self, target_weight: torch.Tensor):
+    # --- [MAGMAX LOGIC - CODE GỐC CỦA BẠN] ---
+    # Tôi paste nguyên văn code bạn đưa, chỉ chỉnh indentation cho khớp class
+    def after_task_training(self):
         """
-        Thực hiện MagMax Merging trên trọng số Backbone (target_weight).
-        
-        Định nghĩa MagMax:
-        - Task Vector (t) = W_t - W_0
-        - W_new = W_0 + MaxMagnitude(Task Vectors)
-        
-        Args:
-            target_weight (Tensor): Trọng số của lớp Linear/Attention cần merge (ví dụ: qkv.weight)
+        [Bước 3 & 4]: Lưu Task Vector và thực hiện Parameter-wise MagMax
         """
-        # Nếu là Task 0: Chỉ cần lưu lại W_0 làm mốc (Baseline)
-        if self.current_task_id == 0:
-            print(f"--> [MagMax] Saving Task 0 Baseline (Shape: {target_weight.shape})")
-            self.w0 = target_weight.detach().clone()
-            # Khởi tạo vector tích lũy MagMax ban đầu là 0
-            self.magmax_vector = torch.zeros_like(self.w0)
-            return
+        # 1. Lưu trọng số task vừa học
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        
+        self.history_mu.append(mu_state)
+        self.history_sigma.append(sigma_state)
 
-        # Nếu là Task > 0: Thực hiện MagMax
-        if self.w0 is None:
-            raise ValueError("MagMax Error: W0 chưa được lưu! Hãy chạy Task 0 trước.")
+        # 2. Tính MagMax và Load lại vào mạng (Merge cứng)
+        self._perform_parameter_magmax()
+        print(f"--> [PiNoise] MagMax Merged for Task {self.current_task_id}")
 
-        print(f"--> [MagMax] Merging Task {self.current_task_id} using Task Vector logic...")
+    def _perform_parameter_magmax(self):
+        if not self.history_mu: return
 
-        with torch.no_grad():
-            # 1. Tính Task Vector hiện tại: tau_t = W_t - W_0
-            current_w = target_weight.detach()
-            current_task_vector = current_w - self.w0
+        def merge_state_dicts(history_list):
+            keys = history_list[0].keys()
+            merged_dict = {}
             
-            # 2. So sánh Magnitude với vector tích lũy (Running MagMax)
-            # Tạo mask những vị trí mà vector mới có độ lớn (trị tuyệt đối) lớn hơn vector cũ
-            mask = torch.abs(current_task_vector) > torch.abs(self.magmax_vector)
+            for key in keys:
+                # Stack toàn bộ lịch sử weights
+                stacked_params = torch.stack([d[key] for d in history_list], dim=0)
+                
+                # --- MAGMAX LOGIC TRÊN PARAMETER ---
+                magnitudes = torch.abs(stacked_params)
+                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
+                best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
+                
+                merged_dict[key] = best_param.to(self.mu.weight.device)
             
-            # 3. Cập nhật MagMax Vector: 
-            # Tại vị trí mask=True, lấy giá trị mới. Vị trí False giữ nguyên giá trị cũ.
-            self.magmax_vector = torch.where(mask, current_task_vector, self.magmax_vector)
-            
-            # 4. Merge ngược lại vào Backbone: W_new = W_0 + MagMax_Vector
-            # Điều này đảm bảo Backbone luôn chứa các đặc trưng "mạnh nhất" từ tất cả các task
-            target_weight.copy_(self.w0 + self.magmax_vector)
-            
-        # 
+            return merged_dict
 
-    # Các hàm hỗ trợ
-    def update_noise(self): self.expand_new_task()
-    def unfreeze_noise(self):
-        if self.current_task_id >= 0:
-            # Unfreeze logic
-            for param in self.generators[self.current_task_id].parameters():
-                param.requires_grad = True
+        # Merge xong thì load ngược lại vào self.mu và self.sigma
+        self.mu.load_state_dict(merge_state_dicts(self.history_mu))
+        self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
