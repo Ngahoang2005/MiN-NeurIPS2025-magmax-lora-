@@ -258,7 +258,8 @@ class PiNoise(nn.Module):
                     mixed_freq_noise.index_copy_(-1, indices, theta_complex)
 
             out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
-            return x + out_noise
+            #return x + out_noise
+            return x 
     
     def unfreeze_noise(self):
         """Mở khóa gradient cho các tham số của Generator (mu và sigma)"""
