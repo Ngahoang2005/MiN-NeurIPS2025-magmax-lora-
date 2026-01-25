@@ -7,7 +7,7 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
-import gc  # [ADDED] Để dọn rác bộ nhớ
+import gc 
 import os
 
 from utils.inc_net import MiNbaseNet
@@ -17,7 +17,7 @@ from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# [ADDED] Import Mixed Precision
+# Import Mixed Precision
 from torch.amp import autocast, GradScaler
 
 EPSILON = 1e-8
@@ -55,11 +55,10 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        # [ADDED] Scaler cho Mixed Precision
+        # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
-        # [ADDED] Hàm dọn dẹp GPU
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -91,7 +90,6 @@ class MinNet(object):
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
-        # [MODIFIED] Thêm no_grad và autocast để test nhanh và nhẹ hơn
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(device)
@@ -133,15 +131,12 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # [FIX OOM] Dọn GPU trước và sau khi tính proto
         self._clear_gpu()
-        
         
         self.run(train_loader)
         self._network.after_task_magmax_merge()
         
         self._clear_gpu()
-       
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
@@ -162,7 +157,6 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [ADDED] Clear memory
         del train_set, test_set
         self._clear_gpu()
 
@@ -198,7 +192,6 @@ class MinNet(object):
         
         self._clear_gpu()
 
-        
         self.run(train_loader)
         self._network.after_task_magmax_merge()
         self._clear_gpu()
@@ -233,8 +226,6 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
-                # Logic gốc: Fit Analytical (RLS). 
-                # Không dùng Autocast ở đây vì RLS cần độ chính xác cao (ma trận nghịch đảo)
                 self._network.fit(inputs, targets)
             
             info = "Task {} --> Update Analytical Classifier!".format(
@@ -242,7 +233,6 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
-            # [ADDED] Clear cache sau mỗi epoch fit
             self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
@@ -263,16 +253,14 @@ class MinNet(object):
         self._clear_gpu()
 
     def run(self, train_loader):
-        # [FIX 1]: Import an toàn cho mọi phiên bản PyTorch
         try:
             from torch.amp import autocast, GradScaler
         except ImportError:
             from torch.cuda.amp import autocast, GradScaler
 
-        # [FIX 2]: Khởi tạo Scaler cục bộ (Reset mỗi task cho sạch)
+        # Khởi tạo Scaler cục bộ
         scaler = GradScaler()
 
-        # --- Setup Param như cũ ---
         if self.cur_task == 0:
             epochs = self.init_epochs
             lr = self.init_lr
@@ -282,7 +270,7 @@ class MinNet(object):
             lr = self.lr 
             weight_decay = self.weight_decay
 
-        # Freeze/Unfreeze Logic
+        # Freeze/Unfreeze
         for param in self._network.parameters():
             param.requires_grad = False
         for param in self._network.normal_fc.parameters():
@@ -293,7 +281,6 @@ class MinNet(object):
         else:
             self._network.unfreeze_noise()
             
-        # Optimizer
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
@@ -302,6 +289,9 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
+        # [FIX 3]: L1 Regularization Coefficient
+        l1_lambda = 1e-5 
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -309,114 +299,48 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # [Optimization]: set_to_none nhanh hơn
                 optimizer.zero_grad(set_to_none=True) 
 
-                # [Optimization]: Autocast bao trùm TOÀN BỘ forward pass
                 with autocast('cuda'):
                     if self.cur_task > 0:
-                        # Nhánh 1: Analytic (Frozen) - Chạy FP16 trong context này
+                        # [FIX 2 - QUAN TRỌNG]: Chuyển Eval để lấy Old Knowledge chuẩn từ Main Generator
+                        self._network.eval() 
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
                         
-                        # Nhánh 2: Plastic (Trainable) - Chạy FP16
+                        # Chuyển lại Train để học New Task trên Temp Generator
+                        self._network.train()
+                        
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
                         
-                        # Cộng FP16 + FP16 (Không bị lỗi type mismatch nữa)
+                        # Cộng trực tiếp (Theo yêu cầu giữ nguyên của bạn)
+                        # Giả định shape đã khớp nhờ update_fc/fit_fc chạy trước đó
                         logits_final = logits2 + logits1
+
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits_final = outputs["logits"]
 
                     loss = F.cross_entropy(logits_final, targets.long())
+                    
+                    # [FIX 3]: Thêm L1 Regularization
+                    # Ép trọng số Temp Generator thưa hơn -> Tốt cho MagMax
+                    if self.cur_task > 0:
+                        l1_norm = 0.0
+                        # Duyệt qua các PiNoise module trong backbone
+                        for j in range(self._network.backbone.layer_num):
+                            noise_mod = self._network.backbone.noise_maker[j]
+                            # Chỉ tính L1 trên Temp Generator (đang train)
+                            if hasattr(noise_mod, 'temp_mu'):
+                                l1_norm += noise_mod.temp_mu.weight.abs().sum()
+                                l1_norm += noise_mod.temp_sigma.weight.abs().sum()
+                        
+                        loss = loss + l1_lambda * l1_norm
 
-                # [FIX 3]: Backward chuẩn chỉnh với Scaler & Clipping
                 scaler.scale(loss).backward()
-                
-                # Unscale trước khi clip gradient (BẮT BUỘC)
                 scaler.unscale_(optimizer)
-                
-                # Kẹp gradient để tránh nổ (NaN)
                 torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=1.0)
                 
                 scaler.step(optimizer)
-                scaler.update()
-                
-                # Logging & Cleanup
-                losses += loss.item()
-                _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                
-                del inputs, targets, loss, logits_final
-
-            scheduler.step()
-            train_acc = 100. * correct / total
-
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
-            )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            
-            # Clear cache định kỳ
-            if epoch % 5 == 0:
-                torch.cuda.empty_cache()
-    def eval_task(self, test_loader):
-        model = self._network.eval()
-        pred, label = [], []
-        # [ADDED] no_grad
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                
-                outputs = model(inputs)
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
-                label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
-        class_info = calculate_class_metrics(pred, label)
-        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
-        return {
-            "all_class_accy": class_info['all_accy'],
-            "class_accy": class_info['class_accy'],
-            "class_confusion": class_info['class_confusion_matrices'],
-            "task_accy": task_info['all_accy'],
-            "task_confusion": task_info['task_confusion_matrices'],
-            "all_task_accy": task_info['task_accy'],
-        }
-
-    # =========================================================================
-    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
-    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
-    # =========================================================================
-    def get_task_prototype(self, model, train_loader):
-        model = model.eval()
-        model.to(self.device)
-        features = []
-        
-        # 1. Thu thập features (CHUYỂN VỀ CPU NGAY LẬP TỨC)
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                
-                # Dùng autocast khi extract feature để nhanh hơn
-                with autocast('cuda'):
-                    feature = model.extract_feature(inputs)
-                
-                # .detach().cpu() là chìa khóa để tránh OOM
-                features.append(feature.detach().cpu())
-        
-        # 2. Concat trên CPU (RAM thường lớn hơn VRAM)
-        all_features = torch.cat(features, dim=0)
-        
-        # 3. Tính Mean (Vẫn tính trên CPU hoặc đưa về GPU nếu cần)
-        # Vì chỉ tính mean của 1 tensor lớn, đưa về GPU tính sẽ nhanh, 
-        # nhưng nếu tensor quá lớn > VRAM thì tính trên CPU luôn.
-        # Ở đây tôi để tính trên GPU cho nhanh, nếu vẫn OOM thì xóa .to(self.device)
-        prototype = torch.mean(all_features, dim=0).to(self.device)
-        
-        self._clear_gpu()
-        return prototype
