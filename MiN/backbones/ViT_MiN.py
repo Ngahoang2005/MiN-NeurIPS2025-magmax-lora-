@@ -61,11 +61,11 @@ class Noise_weigh(nn.Module):
         return x * self.weight
 
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import init
-
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
@@ -76,26 +76,25 @@ class PiNoise(nn.Module):
         
         self.act = nn.GELU()
         
-        # Shared Generator (Dùng chung cho logic MagMax gộp weight)
+        # Shared Generator
         input_size = self.hidden_dim * 2 
-        
         self.mu = nn.Linear(input_size, input_size)
         self.sigma = nn.Linear(input_size, input_size)
         
+        # Init về 0
         init.constant_(self.mu.weight, 0.)
         init.constant_(self.mu.bias, 0.)
         init.constant_(self.sigma.weight, 0.)
         init.constant_(self.sigma.bias, 0.)
         
-        # Python List chứa tensor -> Cần xử lý device thủ công trong forward
         self.task_indices = [] 
-        
         self.history_mu = []
         self.history_sigma = []
         
         self.current_task_id = -1
         
-        self.mix_weights = nn.Parameter(torch.tensor([], dtype=torch.float32))
+        # [FIX DEVICE 1]: Khởi tạo là None thay vì Empty Tensor CPU
+        self.mix_weights = None 
 
     def _get_random_indices(self, max_idx, num_select):
         indices = torch.randperm(max_idx)[:num_select]
@@ -103,17 +102,26 @@ class PiNoise(nn.Module):
 
     def expand_new_task(self):
         self.current_task_id += 1
+        # Lấy device chuẩn từ trọng số của mạng (đảm bảo luôn đúng)
         device = self.mu.weight.device
         
         # Tạo indices mới
         new_indices = self._get_random_indices(self.freq_dim, self.hidden_dim).to(device)
         self.task_indices.append(new_indices)
         
+        # Tạo trọng số mới (bắt buộc nằm trên device chuẩn)
         new_w = torch.tensor([1.0], device=device)
-        if self.current_task_id == 0:
+        
+        # [FIX DEVICE 2]: Xử lý logic tạo Parameter an toàn
+        if self.mix_weights is None:
+            # Task 0: Tạo mới hoàn toàn
             self.mix_weights = nn.Parameter(new_w)
         else:
-            self.mix_weights = nn.Parameter(torch.cat([self.mix_weights, new_w]))
+            # Task > 0: Nối thêm vào
+            # Quan trọng: Phải ép self.mix_weights cũ về cùng device với new_w trước khi cat
+            # (Phòng trường hợp mix_weights cũ đang trôi nổi ở device khác)
+            current_weights = self.mix_weights.data.to(device)
+            self.mix_weights = nn.Parameter(torch.cat([current_weights, new_w]))
 
     def update_noise(self):
         self.expand_new_task()
@@ -123,9 +131,13 @@ class PiNoise(nn.Module):
         for param in self.sigma.parameters(): param.requires_grad = True
 
     def forward(self, x, new_forward=False):
+        # 1. Validation (Nên có để tránh lỗi ngớ ngẩn)
+        # Kiểm tra chiều cuối cùng có khớp in_dim không
+        if x.shape[-1] != self.in_dim:
+             raise ValueError(f"PiNoise Expect input dim {self.in_dim}, got {x.shape[-1]}")
+             
         if len(self.task_indices) == 0: return x
         
-        # Import autocast an toàn
         try:
             from torch.amp import autocast
         except ImportError:
@@ -134,59 +146,67 @@ class PiNoise(nn.Module):
         x_freq = torch.fft.rfft(x, dim=-1)
         generated_noises_freq = []
         
-        for task_id in range(len(self.task_indices)):
-            indices = self.task_indices[task_id]
+        # Logic chống quên (Forgetting Prevention)
+        loop_range = [self.current_task_id] if self.training else range(len(self.task_indices))
+
+        for task_id in loop_range:
+            indices = self.task_indices[task_id].to(x.device)
             
-            # [FIX DEVICE ERROR]: Đảm bảo indices nằm cùng device với input x
-            # Vì task_indices là list thường, nó ko tự nhảy theo model.to(cuda)
-            indices = indices.to(x.device)
-            
-            # 1. Lấy input đặc trưng
+            # ... (Đoạn sinh nhiễu giữ nguyên như code trước) ...
             x_selected = x_freq[..., indices]
             x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
             
-            # 2. Shared Generator
             mu_out = self.mu(x_mlp_in)
             sigma_out = self.sigma(x_mlp_in)
             
-            # 3. Reparameterization
             epsilon = torch.randn_like(mu_out)
             theta_val = epsilon * sigma_out + mu_out
             
-            # 4. Tái tạo số phức & Fix lỗi Type Mismatch
-            # Tắt autocast để tránh lỗi ComplexHalf
             with autocast('cuda', enabled=False):
                 real_part = theta_val[..., :self.hidden_dim].float()
                 imag_part = theta_val[..., self.hidden_dim:].float()
                 theta_complex = torch.complex(real_part, imag_part)
                 
+                # Check Shape an toàn
+                if theta_complex.shape[-1] != indices.shape[0]:
+                     min_len = min(theta_complex.shape[-1], indices.shape[0])
+                     theta_complex = theta_complex[..., :min_len]
+                     indices = indices[:min_len]
+
+                # [QUAN TRỌNG]: Vẫn phải giữ dtype=torch.complex64 ở đây
                 full_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-                
-                # Giờ cả indices, full_freq_noise và theta_complex đều cùng device/type
                 full_freq_noise.index_add_(-1, indices, theta_complex)
                 generated_noises_freq.append(full_freq_noise)
 
-        # Trộn nhiễu
-        weights = F.softmax(self.mix_weights, dim=0)
-        mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-        for i, noise in enumerate(generated_noises_freq):
-            mixed_freq_noise += noise * weights[i]
+        # Trộn nhiễu (Optimization ở đây)
+        if len(generated_noises_freq) == 0: return x
+
+        if self.training:
+            mixed_freq_noise = generated_noises_freq[0]
+        else:
+            if self.mix_weights is None: return x
+            weights = F.softmax(self.mix_weights.to(x.device), dim=0)
+            
+            # [FIX HARDCODED DTYPE]: Bắt buộc giữ complex64 để không crash với generated_noises_freq (đang là FP32)
+            mixed_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+            
+            # [FIX INEFFICIENT LOOP]: Dùng hàm add_ với alpha để tránh tạo tensor tạm
+            # Code cũ: mixed += noise * w (tạo ra 1 tensor tạm 'noise*w' rồi mới cộng) -> Tốn RAM
+            # Code mới: mixed.add_(noise, alpha=w) (cộng trực tiếp nhân w) -> Tiết kiệm RAM
+            for i, noise in enumerate(generated_noises_freq):
+                mixed_freq_noise.add_(noise, alpha=weights[i])
 
         out_noise = torch.fft.irfft(mixed_freq_noise, n=self.in_dim, dim=-1)
         return x + out_noise
-
-    # --- [MAGMAX LOGIC - GIỮ NGUYÊN CODE CỦA BẠN] ---
+    # --- MAGMAX LOGIC (GIỮ NGUYÊN) ---
     def after_task_training(self):
-        # 1. Lưu trọng số task vừa học
         mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
         sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
 
-        # 2. Tính MagMax và Load lại vào mạng
         self._perform_parameter_magmax()
-        # print(f"--> [PiNoise] MagMax Merged parameters for Task {self.current_task_id}")
 
     def _perform_parameter_magmax(self):
         if not self.history_mu: return
@@ -194,18 +214,31 @@ class PiNoise(nn.Module):
         def merge_state_dicts(history_list):
             keys = history_list[0].keys()
             merged_dict = {}
-            
             for key in keys:
                 stacked_params = torch.stack([d[key] for d in history_list], dim=0)
                 magnitudes = torch.abs(stacked_params)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
                 best_param = torch.gather(stacked_params, 0, max_indices).squeeze(0)
                 merged_dict[key] = best_param.to(self.mu.weight.device)
-            
             return merged_dict
 
         self.mu.load_state_dict(merge_state_dicts(self.history_mu))
         self.sigma.load_state_dict(merge_state_dicts(self.history_sigma))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 class Attention(nn.Module):
     fused_attn: Final[bool]

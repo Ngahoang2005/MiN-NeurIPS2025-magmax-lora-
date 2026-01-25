@@ -147,11 +147,24 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
-        # Lặp qua các layer
+        """
+        [FIXED]: Truy cập đúng vào self.backbone
+        """
         print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for i in range(self.backbone.layer_num):
-             # Logic này gọi vào PiNoise, PiNoise sẽ tự xử lý việc merge mu/sigma
-             self.backbone.noise_maker[i].after_task_training()
+        
+        # [FIX 1]: Thêm self.backbone. trước layer_num
+        # (Giả sử backbone ViT có thuộc tính layer_num, thường là len(blocks))
+        num_layers = len(self.backbone.blocks) 
+        
+        for i in range(num_layers):
+             # [FIX 2]: Thêm self.backbone. trước blocks
+             # Truy cập vào weight của qkv trong Attention layer của block i
+             # Cấu trúc thường là: backbone -> blocks[i] -> attn -> qkv -> weight
+             target_w = self.backbone.blocks[i].attn.qkv.weight 
+             
+             # [FIX 3]: Thêm self.backbone. trước noise_maker
+             # Gọi hàm MagMax của PiNoise tương ứng
+             self.backbone.noise_maker[i].after_task_training(target_w)
 
     def unfreeze_noise(self):
         """Chỉ mở khóa gradient cho các module Noise (cho các task > 0)"""

@@ -263,6 +263,16 @@ class MinNet(object):
         self._clear_gpu()
 
     def run(self, train_loader):
+        # [FIX 1]: Import an toàn cho mọi phiên bản PyTorch
+        try:
+            from torch.amp import autocast, GradScaler
+        except ImportError:
+            from torch.cuda.amp import autocast, GradScaler
+
+        # [FIX 2]: Khởi tạo Scaler cục bộ (Reset mỗi task cho sạch)
+        scaler = GradScaler()
+
+        # --- Setup Param như cũ ---
         if self.cur_task == 0:
             epochs = self.init_epochs
             lr = self.init_lr
@@ -272,6 +282,7 @@ class MinNet(object):
             lr = self.lr 
             weight_decay = self.weight_decay
 
+        # Freeze/Unfreeze Logic
         for param in self._network.parameters():
             param.requires_grad = False
         for param in self._network.normal_fc.parameters():
@@ -282,6 +293,7 @@ class MinNet(object):
         else:
             self._network.unfreeze_noise()
             
+        # Optimizer
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
@@ -289,6 +301,7 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -296,57 +309,61 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # [ADDED] set_to_none=True tiết kiệm RAM hơn
+                # [Optimization]: set_to_none nhanh hơn
                 optimizer.zero_grad(set_to_none=True) 
 
-                # [ADDED] Autocast để giảm 50% VRAM khi train
+                # [Optimization]: Autocast bao trùm TOÀN BỘ forward pass
                 with autocast('cuda'):
                     if self.cur_task > 0:
+                        # Nhánh 1: Analytic (Frozen) - Chạy FP16 trong context này
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
+                        
+                        # Nhánh 2: Plastic (Trainable) - Chạy FP16
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
+                        
+                        # Cộng FP16 + FP16 (Không bị lỗi type mismatch nữa)
+                        logits_final = logits2 + logits1
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
+                        logits_final = outputs["logits"]
 
-                # [ADDED] Backward với Scaler
-                self.scaler.scale(loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                    loss = F.cross_entropy(logits_final, targets.long())
+
+                # [FIX 3]: Backward chuẩn chỉnh với Scaler & Clipping
+                scaler.scale(loss).backward()
                 
+                # Unscale trước khi clip gradient (BẮT BUỘC)
+                scaler.unscale_(optimizer)
+                
+                # Kẹp gradient để tránh nổ (NaN)
+                torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # Logging & Cleanup
                 losses += loss.item()
-
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # [ADDED] Xóa biến tạm
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
 
             info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task,
-                epoch + 1,
-                epochs,
-                losses / len(train_loader),
-                train_acc,
+                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
-            # [ADDED] Clear cache sau mỗi epoch
+            # Clear cache định kỳ
             if epoch % 5 == 0:
-                self._clear_gpu()
-
+                torch.cuda.empty_cache()
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
