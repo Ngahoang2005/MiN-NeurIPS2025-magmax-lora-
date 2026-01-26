@@ -445,7 +445,7 @@ class PiNoise(nn.Module):
 
     def __init__(
         self,
-        in_dim: int,
+        in_dim: int = 768,
         task_id: int,
         k: int = 16,
         hidden_dim: int = 128,
@@ -1035,7 +1035,7 @@ class VisionTransformer(nn.Module):
         # 2. Khởi tạo PiNoise với embed_dim động (thay vì số cứng 768)
         self.noise_maker = nn.ModuleList([
     PiNoise(
-        embed_dim=768,
+        in_dim=768,
         k=16,
         task_id=0,   # task hiện tại
         total_tasks=10,
