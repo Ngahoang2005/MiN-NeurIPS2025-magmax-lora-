@@ -311,28 +311,24 @@ class MinNet(object):
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
                         
-                        # B2: Lấy Logits2 (Kiến thức mới) từ TEMP Generator (đang train)
-                        self._network.train()
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
-                        
-                        # B3: Cộng lại (Giữ nguyên logic cộng đơn giản của bạn)
-                        logits_final = logits2 + logits1
+                        logits2 = logits2 + logits1
+                        loss = F.cross_entropy(logits2, targets.long())
+                        logits_final = logits2
 
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits_final = outputs["logits"]
-
-                    loss = F.cross_entropy(logits_final, targets.long())
+                        logits = outputs["logits"]
+                        loss = F.cross_entropy(logits, targets.long())
+                        logits_final = logits
                     
                     # [ĐÃ XÓA]: loss = loss + l1_lambda * l1_norm
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=1.0)
+                self.scaler.scale(loss).backward()
+                self.scaler.step(optimizer)
+                self.scaler.update()
                 
-                scaler.step(optimizer)
-                scaler.update()
                 
                 losses += loss.item()
                 _, preds = torch.max(logits_final, dim=1)
