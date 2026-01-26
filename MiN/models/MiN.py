@@ -12,7 +12,14 @@ class MinNet(object):
 
         self.device = args["device"]
         self.backbone_name = args["backbone_type"]
-        self.backbone = args["backbone"]          # timm model (built outside)
+        import timm
+
+        self.backbone = timm.create_model(
+            args["backbone_type"],   # ví dụ: "vit_base_patch16_224"
+            pretrained=args["pretrained"],
+            num_classes=0            # IMPORTANT: feature extractor
+        )
+
         self.k = args["k"]                         # freq per task
         self.hidden_dim = args.get("hidden_dim", 128)
         self.loger = loger
