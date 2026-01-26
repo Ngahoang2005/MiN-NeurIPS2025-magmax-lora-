@@ -172,9 +172,14 @@ class PiNoise(nn.Module):
         return new_merged
 
     def forward(self, x):
+    # [FIX QUAN TRỌNG NHẤT]: Ép về float32 trước khi FFT
+    # Từ complex128 (16 bytes) -> complex64 (8 bytes) => Giảm 50% RAM tức thì
+        
         if len(self.task_indices) == 0: return torch.zeros_like(x)
-        device = x.device
-        x_freq = torch.fft.rfft(x, dim=-1)
+        device = x.
+        x_float = x.float() 
+        x_freq = torch.fft.rfft(x_float, dim=-1)
+        
         total_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
 
         if self.training:
