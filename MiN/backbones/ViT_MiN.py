@@ -176,7 +176,7 @@ class PiNoise(nn.Module):
     # Từ complex128 (16 bytes) -> complex64 (8 bytes) => Giảm 50% RAM tức thì
         
         if len(self.task_indices) == 0: return torch.zeros_like(x)
-        device = x.
+        device = x.device
         x_float = x.float() 
         x_freq = torch.fft.rfft(x_float, dim=-1)
         
