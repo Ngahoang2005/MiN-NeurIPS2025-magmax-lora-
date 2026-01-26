@@ -313,21 +313,16 @@ class MinNet(object):
                         
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        l1_lambda = 1e-5 # Hệ số rất nhỏ để không làm triệt tiêu hết nhiễu
-                        l1_norm = sum(p.abs().sum() for p in self._network.backbone.noise_maker[self.cur_task].parameters())
-
-                        loss = F.cross_entropy(logits2, targets.long()) + l1_lambda * l1_norm
+                        # logits2 = logits2 + logits1
+                    
+                        loss = F.cross_entropy(logits2, targets.long())
                         
                         logits_final = logits2
 
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits = outputs["logits"]
-                        l1_lambda = 1e-5 # Hệ số rất nhỏ để không làm triệt tiêu hết nhiễu
-                        l1_norm = sum(p.abs().sum() for p in self._network.backbone.noise_maker[self.cur_task].parameters())
-
-                        loss = F.cross_entropy(logits, targets.long()) + l1_lambda * l1_norm
+                        loss = F.cross_entropy(logits, targets.long()) 
                         logits_final = logits
                     
                     # [ĐÃ XÓA]: loss = loss + l1_lambda * l1_norm

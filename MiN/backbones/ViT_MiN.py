@@ -442,8 +442,8 @@ class PiNoise(nn.Module):
         self.mlp_dim = self.k * 2
 
         # ===== Generator =====
-        self.mu = nn.Linear(self.mlp_dim, self.mlp_dim)
-        self.sigma = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.mu = nn.Linear(self.mlp_dim, self.k)
+        self.sigma = nn.Linear(self.mlp_dim, self.k)
 
         # ===== Task management =====
         self.current_task_id = -1
@@ -457,22 +457,14 @@ class PiNoise(nn.Module):
 
     # ------------------------------------------------------------------
     def reset_parameters(self, first_init=False):
-        if first_init:
-            nn.init.normal_(self.mu.weight, std=1e-3)
-            nn.init.constant_(self.mu.bias, 0.)
-            nn.init.constant_(self.sigma.weight, 1e-4)
-            nn.init.constant_(self.sigma.bias, 1e-4)
-        else:
-            # warm-start nhẹ
-            with torch.no_grad():
-                for p in self.mu.parameters():
-                    p.add_(torch.randn_like(p) * 1e-3)
-                for p in self.sigma.parameters():
-                    p.add_(torch.randn_like(p) * 1e-4)
+        nn.inn.init.constant_(self.mu.weight, 0.)
+        nn.init.constant_(self.mu.bias, 0.)
+        nn.init.constant_(self.sigma.weight, 1e-6) # Rất nhỏ
+        nn.init.constant_(self.sigma.bias, 1e-6)
 
     # ------------------------------------------------------------------
     def _get_spectral_mask(self, task_id):
-        anchor = int(self.freq_dim * 0.10)
+        anchor = int(self.freq_dim * 0.05)
         max_tasks = 10
         available = torch.arange(anchor, self.freq_dim)
 
@@ -490,10 +482,10 @@ class PiNoise(nn.Module):
     def expand_new_task(self):
         self.current_task_id += 1
         indices = self._get_spectral_mask(self.current_task_id)
-        self.task_indices.append(indices)
+        self.task_indices.append(indices.cpu())
 
         if self.current_task_id > 0:
-            self.reset_parameters(first_init=False)
+            self.reset_parameters()
 
         print(f"[PiNoise] Task {self.current_task_id}, mask={indices[0]}→{indices[-1]}")
     def update_noise(self):
@@ -503,7 +495,7 @@ class PiNoise(nn.Module):
     def after_task_training(self):
         self.history_mu.append({k: v.detach().cpu() for k, v in self.mu.state_dict().items()})
         self.history_sigma.append({k: v.detach().cpu() for k, v in self.sigma.state_dict().items()})
-        self._magmax_merge()
+       
 
     # ------------------------------------------------------------------
     def _magmax_merge(self):
@@ -516,9 +508,9 @@ class PiNoise(nn.Module):
                 merged[k] = base[k] + torch.gather(stack, 0, idx).squeeze(0)
             return merged
 
-        print(f"[MagMax] merging {len(self.history_mu)} tasks")
-        self.mu.load_state_dict(magmax(self.history_mu))
-        self.sigma.load_state_dict(magmax(self.history_sigma))
+        # print(f"[MagMax] merging {len(self.history_mu)} tasks")
+        # self.mu.load_state_dict(magmax(self.history_mu))
+        # self.sigma.load_state_dict(magmax(self.history_sigma))
 
     # ------------------------------------------------------------------
     def forward(self, x):
@@ -528,41 +520,31 @@ class PiNoise(nn.Module):
 
         # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
         x_f = torch.fft.rfft(x.float(), dim=-1)
-        total_noise = torch.zeros_like(x_f, dtype=torch.complex64)
         device = x.device
+        total_noise = torch.zeros_like(x_f, device = device)
+        
 
         if self.training:
-            idx = self.task_indices[self.current_task_id].to(device)
+            task_list = [self.current_task_id]
+        else:
+            task_list = range(self.current_task_id + 1)
+        for t_id in task_list:
+            idx = self.task_indices[t_id].to(device)
             sel = x_f[..., idx]
             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
             # Các lớp Linear có thể trả về Half nếu đang dùng autocast
-            mu = self.mu(mlp_in)
-            sigma = self.sigma(mlp_in)
-            eps = torch.randn_like(mu)
+            real_part = self.mu(mlp_in)
+            
+            # Sigma sinh ra Phần Ảo
+            imag_part = self.sigma(mlp_in)
 
-            z_val = eps * sigma + mu
-            
-            z_val_f32 = z_val.to(torch.float32) 
-            z = torch.complex(z_val_f32[..., :self.k], z_val_f32[..., self.k:])
-            
+            # Tạo số phức Z = Mu + i * Sigma
+            # Lưu ý: Không dùng epsilon ngẫu nhiên ở đây
+            z = torch.complex(real_part, imag_part)
             # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
             total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
 
-        else:
-            for idx in self.task_indices:
-                idx = idx.to(device)
-                sel = x_f[..., idx]
-                mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
-                
-                mu = self.mu(mlp_in)
-                z = torch.complex(mu[..., :self.k], mu[..., self.k:])
-
-                curr = total_noise[..., idx]
-                # --- FIX: Đảm bảo so sánh và copy cùng kiểu ---
-                z_float = z.to(torch.complex64)
-                mask = z_float.abs() > curr.abs()
-                total_noise.index_copy_(-1, idx, torch.where(mask, z_float, curr))
 
         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
         return x + noise.to(x.dtype)
