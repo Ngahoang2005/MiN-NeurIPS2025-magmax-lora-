@@ -496,6 +496,8 @@ class PiNoise(nn.Module):
             self.reset_parameters(first_init=False)
 
         print(f"[PiNoise] Task {self.current_task_id}, mask={indices[0]}→{indices[-1]}")
+    def update_noise(self):
+        self.expand_new_task()
 
     # ------------------------------------------------------------------
     def after_task_training(self):
