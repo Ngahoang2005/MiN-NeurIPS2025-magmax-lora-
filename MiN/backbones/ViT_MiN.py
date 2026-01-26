@@ -457,7 +457,7 @@ class PiNoise(nn.Module):
 
     # ------------------------------------------------------------------
     def reset_parameters(self, first_init=False):
-        nn.inn.init.constant_(self.mu.weight, 0.)
+        nn.init.constant_(self.mu.weight, 0.)
         nn.init.constant_(self.mu.bias, 0.)
         nn.init.constant_(self.sigma.weight, 1e-6) # Rất nhỏ
         nn.init.constant_(self.sigma.bias, 1e-6)
