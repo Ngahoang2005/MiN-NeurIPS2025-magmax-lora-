@@ -251,17 +251,14 @@ import gc
 
 #     def freeze_noise(self):
 #         for param in self.parameters(): param.requires_grad = False
-
-
 import torch
 import torch.nn as nn
-import torch.nn.init as init
 import torch.nn.functional as F
-
+from torch.nn import init
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim=None, hidden_dim=None):
-        super(PiNoise, self).__init__()
+        super().__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
 
@@ -270,23 +267,20 @@ class PiNoise(nn.Module):
         # ===============================
         self.k = 16
         self.mlp_dim = self.k * 2
-        self.act = nn.GELU()
 
         # ===============================
         # 2. Noise generator (μ, σ)
         # ===============================
-        input_size = self.mlp_dim
-        self.mu = nn.Linear(input_size, input_size)
-        self.sigma = nn.Linear(input_size, input_size)
+        self.mu = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.sigma = nn.Linear(self.mlp_dim, self.mlp_dim)
 
         # ===============================
-        # 3. LOW-RANK BOTTLENECK  ⭐ NEW
+        # 3. Low-rank hyper feature
         # ===============================
         self.rank = 16
         self.w_down = nn.Linear(self.in_dim, self.rank, bias=False)
         self.w_up   = nn.Linear(self.rank, self.in_dim, bias=False)
 
-        # RẤT QUAN TRỌNG: init = 0 (anchor task cũ)
         nn.init.zeros_(self.w_down.weight)
         nn.init.zeros_(self.w_up.weight)
 
@@ -295,156 +289,143 @@ class PiNoise(nn.Module):
         # ===============================
         self.task_indices = []
         self.current_task_id = -1
+
         self.history_mu = []
         self.history_sigma = []
-
-        self.reset_parameters()
 
     # -------------------------------------------------
     # INIT
     # -------------------------------------------------
     def reset_parameters(self):
-        if self.current_task_id <= 0:
-            init.normal_(self.mu.weight, std=0.001)
-            init.constant_(self.mu.bias, 0.)
-            init.constant_(self.sigma.weight, 1e-4)
-            init.constant_(self.sigma.bias, 1e-4)
+        if self.current_task_id == 0:
+            # Task 0: clean anchor
+            init.zeros_(self.mu.weight)
+            init.zeros_(self.mu.bias)
+            init.zeros_(self.sigma.weight)
+            init.zeros_(self.sigma.bias)
         else:
-            print(f"🔄 Task {self.current_task_id}: Warm-started from merged generator")
+            # Task > 0: warm start
             with torch.no_grad():
                 for p in self.mu.parameters():
-                    p.add_(torch.randn_like(p) * 0.001)
+                    p.add_(torch.randn_like(p) * 1e-3)
                 for p in self.sigma.parameters():
-                    p.add_(torch.randn_like(p) * 0.0001)
+                    p.add_(torch.randn_like(p) * 1e-4)
 
     # -------------------------------------------------
-    # SPECTRAL MASK
+    # Spectral mask
     # -------------------------------------------------
     def _get_spectral_mask(self, task_id):
-        anchor_idx = int(self.freq_dim * 0.10)
+        anchor = int(self.freq_dim * 0.10)
         max_tasks = 10
-        available = torch.arange(anchor_idx, self.freq_dim)
+        avail = torch.arange(anchor, self.freq_dim)
+        idx = avail[task_id % max_tasks :: max_tasks]
 
-        indices = available[task_id % max_tasks :: max_tasks]
-
-        if len(indices) > self.k:
-            indices = indices[:self.k]
-        elif len(indices) < self.k:
-            pad = self.k - len(indices)
-            indices = torch.cat([indices, indices[:pad]])
-
-        return indices.long()
+        if len(idx) >= self.k:
+            return idx[:self.k]
+        else:
+            pad = self.k - len(idx)
+            return torch.cat([idx, idx[:pad]])
 
     # -------------------------------------------------
-    # TASK UPDATE
+    # Task update
     # -------------------------------------------------
     def expand_new_task(self):
         self.current_task_id += 1
-        device = self.mu.weight.device
-        new_indices = self._get_spectral_mask(self.current_task_id).to(device)
-        self.task_indices.append(new_indices)
+        indices = self._get_spectral_mask(self.current_task_id)
+        self.task_indices.append(indices.to(self.mu.weight.device))
+        self.reset_parameters()
 
-        if self.current_task_id > 0:
-            self.reset_parameters()
-
-        print(f"--> [PiNoise] Task {self.current_task_id}: freq idx {new_indices[0]}-{new_indices[-1]}")
+        print(f"[PiNoise] Task {self.current_task_id}, freq {indices[0]}-{indices[-1]}")
 
     def update_noise(self):
         self.expand_new_task()
 
     # -------------------------------------------------
-    # MAGMAX MERGE (GIỮ NGUYÊN)
+    # MAGMAX MERGE — LOGIC BẢN 1
     # -------------------------------------------------
     def after_task_training(self):
         mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
-        self._perform_parameter_magmax()
+        sg_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
 
-    def _perform_parameter_magmax(self):
-        if not self.history_mu:
+        self.history_mu.append(mu_state)
+        self.history_sigma.append(sg_state)
+
+        if len(self.history_mu) < 2:
             return
 
-        def merge(history):
-            base = history[0]
-            merged = {}
-            for k in base.keys():
-                deltas = torch.stack([h[k] - base[k] for h in history])
-                idx = torch.argmax(torch.abs(deltas), dim=0)
-                best = torch.gather(deltas, 0, idx.unsqueeze(0)).squeeze(0)
-                merged[k] = base[k] + best
-            return merged
+        prev_mu = self.history_mu[-2]
+        new_mu  = self.history_mu[-1]
+        prev_sg = self.history_sigma[-2]
+        new_sg  = self.history_sigma[-1]
 
-        print(f"🔄 [MagMax] merging {len(self.history_mu)} tasks")
-        self.mu.load_state_dict(merge(self.history_mu))
-        self.sigma.load_state_dict(merge(self.history_sigma))
-        print("✅ [MagMax] done")
+        merged_mu, merged_sg = {}, {}
+
+        for k in prev_mu:
+            mask = new_mu[k].abs() > prev_mu[k].abs()
+            merged_mu[k] = torch.where(mask, new_mu[k], prev_mu[k])
+
+        for k in prev_sg:
+            mask = new_sg[k].abs() > prev_sg[k].abs()
+            merged_sg[k] = torch.where(mask, new_sg[k], prev_sg[k])
+
+        self.mu.load_state_dict(merged_mu)
+        self.sigma.load_state_dict(merged_sg)
+
+        self.history_mu[-1] = merged_mu
+        self.history_sigma[-1] = merged_sg
 
     # -------------------------------------------------
-    # FORWARD (⭐ FIX CHÍNH)
+    # FORWARD
     # -------------------------------------------------
-    def forward(self, x, new_forward=False):
-        if self.current_task_id < 0:
+    def forward(self, x):
+        # Task 0: absolutely clean
+        if self.current_task_id <= 0:
             return x
 
-        with torch.amp.autocast('cuda', enabled=False):
-            x_float = x.float()
-            x_freq = torch.fft.rfft(x_float, dim=-1)
-            total_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+        with torch.amp.autocast("cuda", enabled=False):
+            x_f = x.float()
+            x_freq = torch.fft.rfft(x_f, dim=-1)
+            noise_freq = torch.zeros_like(x_freq, dtype=torch.complex64)
 
-            device = x.device
+            idx = self.task_indices[self.current_task_id]
 
             if self.training:
-                indices = self.task_indices[self.current_task_id].to(device)
-                x_sel = x_freq[..., indices]
-                mlp_in = torch.cat([x_sel.real, x_sel.imag], dim=-1)
+                xs = x_freq[..., idx]
+                mlp_in = torch.cat([xs.real, xs.imag], dim=-1)
 
                 mu = self.mu(mlp_in)
-                sigma = F.softplus(self.sigma(mlp_in))   # 🔧 FIX σ
-
+                sigma = F.softplus(self.sigma(mlp_in))
                 eps = torch.randn_like(mu)
+
                 theta = mu + eps * sigma
                 z = torch.complex(theta[..., :self.k], theta[..., self.k:])
-
-                total_freq_noise.index_add_(-1, indices, z)
+                noise_freq.index_add_(-1, idx, z)
 
             else:
-                for indices in self.task_indices:
-                    indices = indices.to(device)
-                    x_sel = x_freq[..., indices]
-                    mlp_in = torch.cat([x_sel.real, x_sel.imag], dim=-1)
+                for idx in self.task_indices:
+                    xs = x_freq[..., idx]
+                    mlp_in = torch.cat([xs.real, xs.imag], dim=-1)
                     mu = self.mu(mlp_in)
                     z = torch.complex(mu[..., :self.k], mu[..., self.k:])
-
-                    cur = total_freq_noise[..., indices]
+                    cur = noise_freq[..., idx]
                     mask = z.abs() > cur.abs()
-                    total_freq_noise[..., indices] = torch.where(mask, z, cur)
+                    noise_freq[..., idx] = torch.where(mask, z, cur)
 
-            # IFFT → spatial noise
-            noise_spatial = torch.fft.irfft(
-                total_freq_noise, n=self.in_dim, dim=-1
-            )
+            noise_spatial = torch.fft.irfft(noise_freq, n=self.in_dim, dim=-1)
 
-        # ===============================
-        # ⭐ KEY FIX: LOW-RANK + ANCHOR
-        # ===============================
-        x1 = x                                  # residual anchor
-        noise_lr = self.w_up(self.w_down(noise_spatial))
-        return x1 + noise_lr + x                # hyper-feature anchor
+        hyper = self.w_up(self.w_down(noise_spatial))
+        return x + hyper
 
     # -------------------------------------------------
-    # FREEZE CONTROL
+    # Freeze / unfreeze
     # -------------------------------------------------
-    def unfreeze_noise(self):
-        for p in self.parameters():
-            p.requires_grad = True
-
     def freeze_noise(self):
         for p in self.parameters():
             p.requires_grad = False
 
-
+    def unfreeze_noise(self):
+        for p in self.parameters():
+            p.requires_grad = True
 
 
 
