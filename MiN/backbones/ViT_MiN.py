@@ -443,7 +443,7 @@ class PiNoise(nn.Module):
 
     def __init__(
         self,
-        in_dim: int,
+        in_dim: int = 768,
         k: int = 16,
         max_tasks: int = 10,
         rank: int = 16,
