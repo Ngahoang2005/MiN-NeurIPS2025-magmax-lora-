@@ -317,7 +317,7 @@ class MinNet(object):
                         l1_lambda = 1e-5 # Hệ số rất nhỏ để không làm triệt tiêu hết nhiễu
                         l1_norm = sum(p.abs().sum() for p in self._network.backbone.noise_maker[self.cur_task].parameters())
 
-                        loss = F.cross_entropy(logits_final, targets.long()) + l1_lambda * l1_norm
+                        loss = F.cross_entropy(logits2, targets.long()) + l1_lambda * l1_norm
                         
                         logits_final = logits2
 

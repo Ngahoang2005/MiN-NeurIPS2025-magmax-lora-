@@ -522,6 +522,7 @@ class PiNoise(nn.Module):
 
     # ------------------------------------------------------------------
     def forward(self, x):
+        # cộng hyper feature vào kết quả cuối cùng nữa
         if self.current_task_id < 0:
             return x
 
