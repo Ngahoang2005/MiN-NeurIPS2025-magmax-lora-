@@ -432,7 +432,6 @@ import torch
 import torch.nn as nn
 import math
 
-
 class PiNoise(nn.Module):
     """
     PiNoise for MiN (BiLoRA-style)
@@ -440,7 +439,7 @@ class PiNoise(nn.Module):
     - 1 PiNoise = 1 task
     - frequency bands are DISJOINT across tasks
     - old PiNoise modules are frozen by trainer
-    - NO internal multi-task logic (MiN handles that)
+    - NO internal multi-task logic
     """
 
     def __init__(
@@ -454,9 +453,8 @@ class PiNoise(nn.Module):
         super().__init__()
 
         self.in_dim = in_dim              # e.g. 768
-        self.task_id = task_id
+        self.task_id = task_id            # PROVIDED by MiN / trainer
         self.k = k
-        self.device = device
 
         # only half spectrum is independent
         self.n_freq = in_dim // 2
@@ -483,42 +481,29 @@ class PiNoise(nn.Module):
             nn.Linear(k, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, k),
-            nn.Softplus()   # sigma >= 0
+            nn.Softplus()
         )
 
-        # ---- up projection (shared dim) ----
+        # ---- up projection ----
         self.w_up = nn.Parameter(
             torch.randn(in_dim, in_dim) * 0.02
         )
 
-        self.to(device)
-
     # --------------------------------------------------
-    # MiN REQUIRED API
+    # MiN REQUIRED API (DO NOT REMOVE)
     # --------------------------------------------------
 
     def update_noise(self):
-        """
-        Called by MiN at task boundary.
-        Nothing to expand here because:
-        - 1 PiNoise = 1 task
-        - trainer handles adding new PiNoise
-        """
+        """MiN compatibility hook (no-op)."""
         pass
 
     def unfreeze_noise(self):
-        """
-        MiN compatibility.
-        This module is always trainable when created.
-        """
+        """Called by MiN when this task is active."""
         for p in self.parameters():
             p.requires_grad = True
 
     def init_weight_noise(self, prototypes=None):
-        """
-        Optional hook (MiN calls it sometimes).
-        Safe no-op.
-        """
+        """Optional MiN hook."""
         pass
 
     # --------------------------------------------------
@@ -531,9 +516,6 @@ class PiNoise(nn.Module):
         """
         B, D = x.shape
         assert D == self.in_dim
-
-        # ---- base signal ----
-        out = x
 
         # ---- frequency noise (half spectrum) ----
         freq_noise = torch.zeros(
@@ -554,10 +536,11 @@ class PiNoise(nn.Module):
 
         noise = full_noise @ self.w_up
 
+        out = x + noise
         if hyper_features is not None:
-            return out + noise + hyper_features
-        else:
-            return out + noise
+            out = out + hyper_features
+
+        return out
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
