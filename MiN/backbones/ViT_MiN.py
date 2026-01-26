@@ -541,7 +541,9 @@ class PiNoise(nn.Module):
             eps = torch.randn_like(mu)
 
             z_val = eps * sigma + mu
-            z = torch.complex(z_val[..., :self.k], z_val[..., self.k:])
+            
+            z_val_f32 = z_val.to(torch.float32) 
+            z = torch.complex(z_val_f32[..., :self.k], z_val_f32[..., self.k:])
             
             # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
             total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
