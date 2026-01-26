@@ -169,84 +169,47 @@ class MiNbaseNet(nn.Module):
     # ✅ FIX 2: FIT FUNCTION VỚI EVAL MODE & MEMORY SAFE
     # -------------------------------------------------
     @torch.no_grad()
+
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Huấn luyện Analytic Classifier (RLS).
-        Bắt buộc chuyển sang EVAL mode để PiNoise dùng Merged Weights.
+        Thuật toán Recursive Least Squares (RLS).
+        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
         """
-        # Lưu trạng thái cũ
-        old_training_state = self.training
-        self.eval() 
-        
-        try:
-            # 1. Feature Extraction (Dùng Autocast cho nhanh)
-            with autocast('cuda', enabled=True): 
-                # backbone() sẽ gọi PiNoise.forward()
-                # Ở eval mode, PiNoise sẽ kích hoạt logic Merged + Deterministic
-                X_feat = self.backbone(X)
+        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
+        with autocast(enabled=False):
+            # 1. Feature Extraction & Expansion
+            X = self.backbone(X).float() # ViT Features
+            X = self.buffer(X)           # Random Expansion -> float32
             
-            # 2. RLS Calculation (Dùng FP32 chuẩn xác)
-            with autocast('cuda', enabled=False):
-                X_feat = X_feat.detach().float()
-                
-                # Qua Random Buffer
-                X_feat = self.buffer(X_feat).float()
-                
-                device = self.weight.device
-                X_feat = X_feat.to(device)
-                Y = Y.to(device).float()
+            # Đưa về cùng device
+            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-                # Tự động mở rộng Classifier (Weight matrix)
-                num_targets = Y.shape[1]
-                if num_targets > self.weight.shape[1]:
-                    increment_size = num_targets - self.weight.shape[1]
-                    tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                    self.weight = torch.cat((self.weight, tail), dim=1)
-                elif num_targets < self.weight.shape[1]:
-                    increment_size = self.weight.shape[1] - num_targets
-                    tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                    Y = torch.cat((Y, tail), dim=1)
-                # --- RLS CORE ---
-                # P = R * X^T
-                P = self.R @ X_feat.T
-                
-                # Term = X * P = X * R * X^T
-                term = X_feat @ P
-                # Regularization (Dampening factor)
-                term.diagonal().add_(1.0) 
-                # Symmetrization (giữ tính đối xứng)
-                term = 0.5 * (term + term.T)
-                
-                # Invert (K = term^-1)
-                try:
-                    K = torch.linalg.inv(term)
-                except RuntimeError:
-                    # ✅ Fallback CPU nếu OOM
-                    print("⚠️ GPU OOM during RLS inversion, switching to CPU...")
-                    K = torch.linalg.inv(term.cpu()).to(device)
-                
-                del term # Giải phóng bộ nhớ ngay
-                
-                # Update R
-                # R_new = R - P * K * P^T
-                P_K = P @ K # [Buffer, Batch] * [Batch, Batch]
-                self.R -= P_K @ P.T
-                
-                del P # Giải phóng
-                
-                # Update Weights
-                # W_new = W_old + P * K * (Y - X * W_old)
-                # residual = Y - Prediction
-                residual = Y - (X_feat @ self.weight)
-                self.weight += P_K @ residual
-                
-                # Dọn dẹp cuối cùng
-                del X_feat, Y, K, P_K, residual
-                torch.cuda.empty_cache()
-        
-        finally:
-            # ✅ QUAN TRỌNG: Trả lại trạng thái cũ
-            self.train(old_training_state)
+            # 2. Mở rộng chiều của classifier nếu có lớp mới
+            num_targets = Y.shape[1]
+            if num_targets > self.weight.shape[1]:
+                increment_size = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+            elif num_targets < self.weight.shape[1]:
+                increment_size = self.weight.shape[1] - num_targets
+                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                Y = torch.cat((Y, tail), dim=1)
+
+            # 3. Công thức cập nhật RLS
+            I = torch.eye(X.shape[0]).to(X)
+            term = I + X @ self.R @ X.T
+            
+            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
+            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            
+            # Nghịch đảo ma trận
+            K = torch.inverse(term + jitter)
+            
+            # Cập nhật R (Covariance Matrix)
+            self.R -= self.R @ X.T @ K @ X @ self.R
+            
+            # Cập nhật Trọng số Classifier
+            self.weight += self.R @ X.T @ (Y - X @ self.weight)
 
     def forward(self, x, new_forward: bool = False):
         # Hàm forward tổng quát cho Inference
