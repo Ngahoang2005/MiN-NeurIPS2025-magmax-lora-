@@ -214,8 +214,8 @@ class MiNbaseNet(nn.Module):
         # Hàm forward tổng quát cho Inference
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
-
-        hyper_features = self.backbone(x)
+        else:
+            hyper_features = self.backbone(x)
         hyper_features = hyper_features.to(self.weight.dtype)
         
         # Qua buffer rồi nhân với RLS Weights
