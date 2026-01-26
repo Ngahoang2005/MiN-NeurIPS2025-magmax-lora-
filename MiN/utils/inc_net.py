@@ -266,7 +266,7 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
             
-        self.update_noise()
+        
 
     def update_noise(self):
         if hasattr(self.backbone, 'noise_maker'):
