@@ -77,78 +77,59 @@ import copy
 import gc
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=64):
+    def __init__(self, in_dim, sparsity_ratio=0.10, hidden_dim=None):
         """
-        Phiên bản Fix OOM:
-        1. Ép kiểu Float32 ở đầu vào (Tránh Complex128).
-        2. Hidden Dim cố định nhỏ (64).
-        3. Warm-start không tạo biến tạm.
+        PiNoise "Siêu Tối Giản":
+        1. Dùng 1 Linear Layer cho Mu/Sigma (Không Hidden, Không GELU, Không Norm).
+        2. Ép kiểu Float32 đầu vào (Chống OOM do số phức 128-bit).
         """
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
         
-        # 1. Config kích thước
+        # 1. Config
         self.k = max(1, int(self.freq_dim * sparsity_ratio))
         
-        # Input MLP = Real + Imag
-        self.mlp_in_dim = self.k * 2 
+        # Input/Output dim = k * 2 (Real + Imag)
+        self.mlp_dim = self.k * 2 
         
-        # [FIX 2]: Cố định hidden nhỏ, không dùng công thức nhân đôi
-        self.hidden_dim = hidden_dim 
-        
-        # 2. Generator
-        self.mu_net = nn.Sequential(
-            nn.Linear(self.mlp_in_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.mlp_in_dim)
-        )
-        self.sigma_net = nn.Sequential(
-            nn.Linear(self.mlp_in_dim, self.hidden_dim),
-            nn.LayerNorm(self.hidden_dim),
-            nn.GELU(),
-            nn.Linear(self.hidden_dim, self.mlp_in_dim)
-        )
+        # 2. Generator: Chỉ dùng 1 lớp Linear duy nhất
+        # Input [B, k*2] -> Output [B, k*2]
+        self.mu = nn.Linear(self.mlp_dim, self.mlp_dim)
+        self.sigma = nn.Linear(self.mlp_dim, self.mlp_dim)
 
         # 3. Quản lý Task
         self.task_indices = []       
         self.current_task_id = -1 
-        
-        # Running MagMax (Chỉ lưu 1 bản gộp trên CPU)
         self.merged_mu_state = None    
         self.merged_sigma_state = None 
         
         self.register_buffer('dummy_buffer', torch.zeros(1))
 
     def reset_parameters(self):
-        """Khởi tạo không tốn RAM tạm"""
+        """Khởi tạo Linear đơn giản"""
         if self.current_task_id <= 0:
-            # Task 0: Zero Init
-            for name, m in self.named_modules():
-                if isinstance(m, nn.Linear):
-                    is_last = ("mu_net" in name and str(len(self.mu_net)-1) in name) or \
-                              ("sigma_net" in name and str(len(self.sigma_net)-1) in name)
-                    if is_last:
-                        init.constant_(m.weight, 0)
-                        if m.bias is not None: init.constant_(m.bias, 0)
-                    else:
-                        init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                        if m.bias is not None: init.constant_(m.bias, 0)
+            # Task 0: Zero Init (Noise = 0)
+            nn.init.constant_(self.mu.weight, 0)
+            nn.init.constant_(self.mu.bias, 0)
+            
+            # Sigma nhỏ để bắt đầu deterministic
+            nn.init.constant_(self.sigma.weight, 0)
+            nn.init.constant_(self.sigma.bias, -5.0) # Bias âm để sau này sigmoid/exp ra số nhỏ (nếu cần)
         else:
             # Task > 0: Warm-start In-place
-            print(f"🔄 [PiNoise] Task {self.current_task_id}: Warm-starting (In-place).")
+            print(f"🔄 [PiNoise] Task {self.current_task_id}: Linear Warm-start.")
             with torch.no_grad():
-                for param in self.parameters():
-                    # [FIX 3]: Cộng trực tiếp, không tạo biến noise = ...
-                    param.add_(torch.randn(param.size(), device=param.device) * 0.001)
+                # Cộng nhiễu trực tiếp vào weights
+                self.mu.weight.add_(torch.randn_like(self.mu.weight) * 0.001)
+                self.sigma.weight.add_(torch.randn_like(self.sigma.weight) * 0.001)
 
     def _get_spectral_mask(self, task_id):
+        # ... (Logic tạo mask giữ nguyên như cũ) ...
         start_freq = 1 
         available = torch.arange(start_freq, self.freq_dim)
         max_supported_tasks = 20 
         indices = available[task_id % max_supported_tasks :: max_supported_tasks]
-        
         if len(indices) >= self.k:
             indices = indices[:self.k]
         else:
@@ -166,15 +147,15 @@ class PiNoise(nn.Module):
         self.reset_parameters()
 
     def after_task_training(self):
-        # Merge logic trên CPU
-        current_mu = {k: v.detach().cpu().clone() for k, v in self.mu_net.state_dict().items()}
-        current_sigma = {k: v.detach().cpu().clone() for k, v in self.sigma_net.state_dict().items()}
+        # Snapshot ra CPU
+        current_mu = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        current_sigma = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
         
         self.merged_mu_state = self._update_running_magmax(self.merged_mu_state, current_mu)
         self.merged_sigma_state = self._update_running_magmax(self.merged_sigma_state, current_sigma)
         
-        self.mu_net.load_state_dict(self.merged_mu_state)
-        self.sigma_net.load_state_dict(self.merged_sigma_state)
+        self.mu.load_state_dict(self.merged_mu_state)
+        self.sigma.load_state_dict(self.merged_sigma_state)
         
         del current_mu, current_sigma
         gc.collect()
@@ -190,13 +171,12 @@ class PiNoise(nn.Module):
     def forward(self, x):
         if len(self.task_indices) == 0: return torch.zeros_like(x)
         
-        # [FIX 1 - QUAN TRỌNG NHẤT]: Ép kiểu Float32 trước khi FFT
-        # Input x đang là Double (từ RandomBuffer) -> Nếu không ép kiểu -> FFT ra Complex128 (Siêu Nặng)
+        # [QUAN TRỌNG]: Vẫn phải ép Float32 ở đây. 
+        # Nếu bỏ dòng này là lại OOM 17GB vì Complex128.
         x_float = x.float() 
         
         device = x.device
-        x_freq = torch.fft.rfft(x_float, dim=-1) # Ra Complex64 (Nhẹ)
-        
+        x_freq = torch.fft.rfft(x_float, dim=-1)
         total_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
 
         if self.training:
@@ -204,10 +184,12 @@ class PiNoise(nn.Module):
             x_sel = x_freq[..., indices]
             mlp_in = torch.cat([x_sel.real, x_sel.imag], dim=-1)
             
-            mu = self.mu_net(mlp_in)
-            sigma = self.sigma_net(mlp_in)
-            z = mu + torch.randn_like(mu) * sigma
+            # --- Linear Forward ---
+            mu = self.mu(mlp_in)
+            sigma = self.sigma(mlp_in)
             
+            # Reparameterization
+            z = mu + torch.randn_like(mu) * sigma
             z_c = torch.complex(z[..., :self.k], z[..., self.k:])
             total_noise.index_add_(-1, indices, z_c)
         else:
@@ -215,7 +197,9 @@ class PiNoise(nn.Module):
                 indices = indices.to(device)
                 x_sel = x_freq[..., indices]
                 mlp_in = torch.cat([x_sel.real, x_sel.imag], dim=-1)
-                mu_out = self.mu_net(mlp_in)
+                
+                # --- Linear Forward (Chỉ lấy Mu) ---
+                mu_out = self.mu(mlp_in)
                 z_c = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
                 
                 curr_vals = total_noise[..., indices]
@@ -223,9 +207,7 @@ class PiNoise(nn.Module):
                 total_noise.index_copy_(-1, indices, torch.where(mask, z_c, curr_vals))
 
         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
-        
-        # Trả về đúng kiểu dữ liệu (Double) để khớp với mạng chính
-        return noise.to(x.dtype)
+        return noise.to(x.dtype) # Trả về đúng type của input (Double/Float)
 
     def unfreeze_noise(self):
         for param in self.parameters(): param.requires_grad = True
