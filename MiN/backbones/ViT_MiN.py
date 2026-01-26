@@ -563,40 +563,78 @@ class PiNoise(nn.Module):
         # self.sigma.load_state_dict(magmax(self.history_sigma))
 
     # ------------------------------------------------------------------
+    # def forward(self, x):
+    #     # cộng hyper feature vào kết quả cuối cùng nữa
+    #     if self.current_task_id < 0:
+    #         return x
+
+    #     # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
+    #     x_f = torch.fft.rfft(x.float(), dim=-1)
+    #     device = x.device
+    #     total_noise = torch.zeros_like(x_f, device = device)
+        
+
+    #     if self.training:
+    #         task_list = [self.current_task_id]
+    #     else:
+    #         task_list = range(self.current_task_id + 1)
+    #     for t_id in task_list:
+    #         idx = self.task_indices[t_id].to(device)
+    #         sel = x_f[..., idx]
+    #         mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
+
+    #         # Các lớp Linear có thể trả về Half nếu đang dùng autocast
+    #         real_part = self.mu(mlp_in)
+            
+    #         # Sigma sinh ra Phần Ảo
+    #         imag_part = self.sigma(mlp_in)
+
+    #         # Tạo số phức Z = Mu + i * Sigma
+    #         # Lưu ý: Không dùng epsilon ngẫu nhiên ở đây
+    #         z = torch.complex(real_part, imag_part)
+    #         # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
+    #         total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
+
+
+    #     noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
+    #     return x + noise.to(x.dtype)
     def forward(self, x):
-        # cộng hyper feature vào kết quả cuối cùng nữa
-        if self.current_task_id < 0:
+        if self.current_task_id < 0: 
             return x
 
-        # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
-        x_f = torch.fft.rfft(x.float(), dim=-1)
+        # [FIX 1] Thêm norm='ortho' để giữ biên độ ổn định
+        x_f = torch.fft.rfft(x.float(), dim=-1, norm='ortho')
         device = x.device
-        total_noise = torch.zeros_like(x_f, device = device)
         
+        total_noise = torch.zeros_like(x_f, device=device)
 
         if self.training:
             task_list = [self.current_task_id]
         else:
-            task_list = range(self.current_task_id + 1)
+            task_list = range(len(self.task_indices))
+
         for t_id in task_list:
             idx = self.task_indices[t_id].to(device)
             sel = x_f[..., idx]
             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
-            # Các lớp Linear có thể trả về Half nếu đang dùng autocast
+            # Mu -> Real, Sigma -> Imag
             real_part = self.mu(mlp_in)
-            
-            # Sigma sinh ra Phần Ảo
             imag_part = self.sigma(mlp_in)
-
-            # Tạo số phức Z = Mu + i * Sigma
-            # Lưu ý: Không dùng epsilon ngẫu nhiên ở đây
+            
             z = torch.complex(real_part, imag_part)
-            # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
-            total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
 
+            total_noise.index_add_(-1, idx, z.to(torch.complex64))
 
-        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
+        # [FIX 2] Thêm norm='ortho' ở chiều nghịch đảo
+        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1, norm='ortho')
+        
+        # [DEBUG QUAN TRỌNG]
+        # Hãy in dòng này ra 1 lần để xem tỷ lệ giữa Feature và Noise
+        # Nếu noise lớn hơn x quá nhiều -> Model hỏng.
+        # if self.training and random.random() < 0.01:
+        #    print(f"DEBUG SCALE: x_mean={x.abs().mean():.4f} | noise_mean={noise.abs().mean():.4f}")
+
         return x + noise.to(x.dtype)
     def freeze_noise(self):
         for p in self.parameters():
