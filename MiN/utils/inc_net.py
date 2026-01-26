@@ -304,8 +304,6 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
             
-        # Tự động gọi update_noise đúng với cur_task hiện tại
-        self.update_noise()
 
     def update_noise(self):
         if hasattr(self.backbone, 'noise_maker'):
