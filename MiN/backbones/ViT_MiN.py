@@ -525,33 +525,41 @@ class PiNoise(nn.Module):
         if self.current_task_id < 0:
             return x
 
+        # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
         x_f = torch.fft.rfft(x.float(), dim=-1)
         total_noise = torch.zeros_like(x_f, dtype=torch.complex64)
+        device = x.device
 
         if self.training:
-            idx = self.task_indices[self.current_task_id].to(x.device)
+            idx = self.task_indices[self.current_task_id].to(device)
             sel = x_f[..., idx]
             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
+            # Các lớp Linear có thể trả về Half nếu đang dùng autocast
             mu = self.mu(mlp_in)
             sigma = self.sigma(mlp_in)
             eps = torch.randn_like(mu)
 
-            z = eps * sigma + mu
-            z = torch.complex(z[..., :self.k], z[..., self.k:])
-            total_noise.index_add_(-1, idx, z)
+            z_val = eps * sigma + mu
+            z = torch.complex(z_val[..., :self.k], z_val[..., self.k:])
+            
+            # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
+            total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
 
         else:
             for idx in self.task_indices:
-                idx = idx.to(x.device)
+                idx = idx.to(device)
                 sel = x_f[..., idx]
                 mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
+                
                 mu = self.mu(mlp_in)
                 z = torch.complex(mu[..., :self.k], mu[..., self.k:])
 
                 curr = total_noise[..., idx]
-                mask = z.abs() > curr.abs()
-                total_noise.index_copy_(-1, idx, torch.where(mask, z, curr))
+                # --- FIX: Đảm bảo so sánh và copy cùng kiểu ---
+                z_float = z.to(torch.complex64)
+                mask = z_float.abs() > curr.abs()
+                total_noise.index_copy_(-1, idx, torch.where(mask, z_float, curr))
 
         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
         return x + noise.to(x.dtype)
