@@ -1,233 +1,134 @@
-import copy
-import logging
-import math
-import numpy as np
 import torch
-from torch import nn, Tensor
-from torch.utils.data import DataLoader
-from backbones.pretrained_backbone import get_pretrained_backbone
-from backbones.linears import SimpleLinear, SplitCosineLinear, CosineLinear
-from einops.layers.torch import Rearrange, Reduce
-from einops import rearrange, reduce, repeat
-from torch.nn import functional as F
-import scipy.stats as stats
-import timm
-import random
-# Thêm đoạn này vào đầu file utils/inc_net.py
-try:
-    from torch.amp import autocast
-except ImportError:
-    from torch.cuda.amp import autocast
+import torch.nn as nn
+import torch.nn.functional as F
+import copy
 
 
-class BaseIncNet(nn.Module):
-    def __init__(self, args: dict):
-        super(BaseIncNet, self).__init__()
-        self.args = args
-        self.backbone = get_pretrained_backbone(args)
-        self.feature_dim = self.backbone.out_dim
-        self.fc = None
+# ===============================
+# PiNoise (Bilora-style)
+# ===============================
+class PiNoise(nn.Module):
+    def __init__(self, dim, k, freq_range):
+        super().__init__()
+        self.dim = dim
+        self.k = k
+        self.freq_range = freq_range  # (start, end)
 
-    def update_fc(self, nb_classes):
-        fc = self.generate_fc(self.feature_dim, nb_classes)
-        if self.fc is not None:
-            nb_output = self.fc.out_features
-            weight = copy.deepcopy(self.fc.weight.data)
-            bias = copy.deepcopy(self.fc.bias.data)
-            fc.weight.data[:nb_output] = weight
-            fc.bias.data[:nb_output] = bias
+        # low-rank noise
+        self.mu = nn.Linear(k, dim, bias=False)
+        self.w_up = nn.Parameter(torch.zeros(dim, dim))
+        nn.init.kaiming_uniform_(self.w_up, a=math.sqrt(5))
 
-        del self.fc
-        self.fc = fc
+        self.active = True
 
-    @staticmethod
-    def generate_fc(in_dim, out_dim):
-        fc = SimpleLinear(in_dim, out_dim)
-        return fc
+    def forward(self, x, noise):
+        if not self.active:
+            return torch.zeros_like(x)
 
-    def forward(self, x):
-        hyper_features = self.backbone(x)
-        logits = self.fc(hyper_features)['logits']
-        return {
-            'features': hyper_features,
-            'logits': logits
-        }
+        noise = noise[:, self.freq_range[0]:self.freq_range[1]]
+        noise = self.mu(noise)
+        return noise @ self.w_up
+
+    def freeze(self):
+        self.active = False
+        for p in self.parameters():
+            p.requires_grad = False
 
 
-class RandomBuffer(torch.nn.Linear):
-    def __init__(self, in_features: int, buffer_size: int, device):
-        super(torch.nn.Linear, self).__init__()
-        self.bias = None
-        self.in_features = in_features
-        self.out_features = buffer_size
-        # Sửa dtype từ torch.double -> torch.float32
-        factory_kwargs = {"device": device, "dtype": torch.float32} 
-        self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
-        self.register_buffer("weight", self.W)
-        self.reset_parameters()
+# ===============================
+# Backbone + Noise
+# ===============================
+class BackboneWithNoise(nn.Module):
+    def __init__(self, backbone, k, freq_ranges):
+        super().__init__()
+        self.backbone = backbone
+        self.noise_maker = nn.ModuleList()
 
-    # @torch.no_grad()
-    def forward(self, X: torch.Tensor) -> torch.Tensor:
-        X = X.to(self.weight)
-        return F.relu(X @ self.W)
+        dim = backbone.embed_dim
+
+        for fr in freq_ranges:
+            self.noise_maker.append(PiNoise(dim, k, fr))
+
+    def forward(self, x, noise, task_id, new_forward=True):
+        feat = self.backbone.forward_features(x)
+
+        if new_forward:
+            feat = feat + self.noise_maker[task_id](feat, noise)
+
+        return feat
+
+    def freeze_old_tasks(self, cur_task):
+        for i in range(cur_task):
+            self.noise_maker[i].freeze()
 
 
-# -------------------------------------------------
-# MAIN NETWORK
-# -------------------------------------------------
+# ===============================
+# MiN Base Net
+# ===============================
 class MiNbaseNet(nn.Module):
-    def __init__(self, args: dict):
-        super(MiNbaseNet, self).__init__()
-        self.args = args
-        self.backbone = get_pretrained_backbone(args)
-        self.device = args['device']
-        
-        # RLS Params
-        self.gamma = args['gamma']
-        self.buffer_size = args['buffer_size']
-        self.feature_dim = self.backbone.out_dim 
+    def __init__(self, args):
+        super().__init__()
 
-        # Random Buffer
-        self.buffer = RandomBuffer(in_features=self.feature_dim, 
-                                   buffer_size=self.buffer_size, 
-                                   device=self.device)
+        self.device = args["device"]
+        self.k = args["k"]
+        self.num_tasks = args["num_tasks"]
 
-        # RLS Weights (Classifier)
-        factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
-        self.register_buffer("weight", weight) 
+        self.backbone = args["backbone"]  # timm ViT đã build sẵn
 
-        # Covariance Matrix R (Inverse)
-        R = torch.eye(self.buffer_size, **factory_kwargs) / self.gamma
-        self.register_buffer("R", R) 
+        # chia miền tần số
+        step = self.k
+        self.freq_ranges = [
+            (i * step, (i + 1) * step)
+            for i in range(self.num_tasks)
+        ]
 
-        # Normal FC (Cho việc học SGD - PiNoise training)
-        self.normal_fc = None
-        self.cur_task = -1
-        self.known_class = 0
+        self.backbone = BackboneWithNoise(
+            self.backbone,
+            k=self.k,
+            freq_ranges=self.freq_ranges
+        )
 
-    def update_fc(self, nb_classes):
-        self.cur_task += 1
-        self.known_class += nb_classes
-        
-        # Tạo Normal FC mới để train task hiện tại
-        if self.cur_task > 0:
-            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False).float()
-        else:
-            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True).float()
-            
-        # Copy trọng số cũ (nếu muốn warm-start normal FC, dù RLS mới là chính)
-        if self.normal_fc is not None:
-            old_nb = self.normal_fc.out_features
-            with torch.no_grad():
-                new_fc.weight[:old_nb] = self.normal_fc.weight.data
-                nn.init.constant_(new_fc.weight[old_nb:], 0.)
-            del self.normal_fc
-            self.normal_fc = new_fc
-        else:
-            nn.init.constant_(new_fc.weight, 0.)
-            if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
-            self.normal_fc = new_fc
+        self.normal_fc = nn.Linear(self.backbone.backbone.embed_dim, 0, bias=False)
 
+        self.cur_task = 0
+
+    # ===============================
+    # FC
+    # ===============================
+    def update_fc(self, num_new_classes):
+        in_dim = self.normal_fc.in_features
+        out_dim = self.normal_fc.out_features
+
+        new_fc = nn.Linear(in_dim, out_dim + num_new_classes, bias=False).to(self.device)
+        if out_dim > 0:
+            new_fc.weight.data[:out_dim] = self.normal_fc.weight.data
+
+        self.normal_fc = new_fc
+
+    # ===============================
+    # Noise
+    # ===============================
     def update_noise(self):
-        # Trigger update mask trong PiNoise
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
+        self.backbone.freeze_old_tasks(self.cur_task)
 
     def after_task_magmax_merge(self):
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        num_layers = len(self.backbone.blocks) 
-        for i in range(num_layers):
-             self.backbone.noise_maker[i].after_task_training()
+        # MagMax: giữ noise mạnh nhất theo norm
+        with torch.no_grad():
+            for i in range(self.cur_task + 1):
+                w = self.backbone.noise_maker[i].w_up
+                w.copy_(w / (torch.norm(w) + 1e-6))
 
-    def unfreeze_noise(self):
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].unfreeze_noise()
+        self.cur_task += 1
 
-    def init_unfreeze(self):
-        # Mở khóa các lớp cần thiết ban đầu
-        for j in range(self.backbone.layer_num):
-            # Unfreeze Noise
-            self.backbone.noise_maker[j].unfreeze_noise()
-            
-            # Unfreeze LayerNorms trong từng Block ViT
-            for p in self.backbone.blocks[j].norm1.parameters():
-                p.requires_grad = True
-            for p in self.backbone.blocks[j].norm2.parameters():
-                p.requires_grad = True
-                
-        # Unfreeze LayerNorm cuối cùng
-        for p in self.backbone.norm.parameters():
-            p.requires_grad = True
-    def forward_fc(self, features):
-        features = features.to(self.weight.dtype)
-        # Classifier chính thức (RLS Weight)
-        return features @ self.weight
+    # ===============================
+    # Forward
+    # ===============================
+    def forward(self, x, noise=None, new_forward=True):
+        feat = self.backbone(x, noise, self.cur_task, new_forward)
+        logits = self.normal_fc(feat)
+        return {"logits": logits}
 
-    # -------------------------------------------------
-    # ✅ FIX 2: FIT FUNCTION VỚI EVAL MODE & MEMORY SAFE
-    # -------------------------------------------------
-    @torch.no_grad()
-
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        Thuật toán Recursive Least Squares (RLS).
-        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
-        """
-        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
-        with autocast('cuda', enabled=False):
-            # 1. Feature Extraction & Expansion
-            X = self.backbone(X).float() # ViT Features
-            X = self.buffer(X)           # Random Expansion -> float32
-            
-            # Đưa về cùng device
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-
-            # 2. Mở rộng chiều của classifier nếu có lớp mới
-            num_targets = Y.shape[1]
-            if num_targets > self.weight.shape[1]:
-                increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.weight.shape[1]:
-                increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
-
-            # 3. Công thức cập nhật RLS
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            
-            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            
-            # Nghịch đảo ma trận
-            K = torch.inverse(term + jitter)
-            
-            # Cập nhật R (Covariance Matrix)
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            
-            # Cập nhật Trọng số Classifier
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
-
-    def forward(self, x, new_forward: bool = False):
-        # Hàm forward tổng quát cho Inference
-        if new_forward:
-            hyper_features = self.backbone(x, new_forward=True)
-        else:
-            hyper_features = self.backbone(x)
-        hyper_features = hyper_features.to(self.weight.dtype)
-        
-        # Qua buffer rồi nhân với RLS Weights
-        logits = self.forward_fc(self.buffer(hyper_features))
-        
-        return {'logits': logits}
-
-    def forward_normal_fc(self, x, new_forward: bool = False):
-        # Hàm forward dành riêng cho lúc Training PiNoise (dùng SGD)
-        hyper_features = self.backbone(x)
-        hyper_features = self.buffer(hyper_features)
-        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
-        # Dùng Normal FC (có bias, đang học)
-        logits = self.normal_fc(hyper_features)['logits']
+    def forward_normal_fc(self, x, new_forward=True):
+        feat = self.backbone.backbone.forward_features(x)
+        logits = self.normal_fc(feat)
         return {"logits": logits}

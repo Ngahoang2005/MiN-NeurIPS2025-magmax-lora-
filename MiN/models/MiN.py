@@ -257,11 +257,6 @@ class MinNet(object):
         self._clear_gpu()
 
     def run(self, train_loader):
-        try:
-            from torch.amp import autocast, GradScaler
-        except ImportError:
-            from torch.cuda.amp import autocast, GradScaler
-
         scaler = GradScaler()
 
         if self.cur_task == 0:
@@ -270,85 +265,76 @@ class MinNet(object):
             weight_decay = self.init_weight_decay
         else:
             epochs = self.epochs
-            lr = self.lr 
+            lr = self.lr
             weight_decay = self.weight_decay
 
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
-            
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
-            
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
-        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+        # Freeze toàn bộ
+        for p in self._network.parameters():
+            p.requires_grad = False
 
-        prog_bar = tqdm(range(epochs))
-        self._network.train()
-        self._network.to(self.device)
+        # Chỉ train noise của task hiện tại + fc
+        self._network.normal_fc.requires_grad_(True)
+        for p in self._network.backbone.noise_maker[self.cur_task].parameters():
+            p.requires_grad = True
 
-        # [ĐÃ BỎ L1 REGULARIZATION THEO YÊU CẦU]
+        optimizer = get_optimizer(
+            self.args["optimizer_type"],
+            filter(lambda p: p.requires_grad, self._network.parameters()),
+            lr,
+            weight_decay,
+        )
 
-        for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            correct, total = 0, 0
+        scheduler = get_scheduler(self.args["scheduler_type"], optimizer, epochs)
 
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device).float(), targets.to(self.device)
-                
-                optimizer.zero_grad(set_to_none=True) 
+        self._network.train().to(self.device)
 
-                with autocast('cuda'):
+        for epoch in range(epochs):
+            total_loss, correct, total = 0, 0, 0
+
+            for _, inputs, targets in train_loader:
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+
+                noise = torch.randn(inputs.size(0), self.args["k"], device=self.device)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                with autocast("cuda"):
                     if self.cur_task > 0:
-                        # [FIX LOGIC NOISE]:
-                        # B1: Lấy Logits1 (Kiến thức cũ) từ MAIN Generator (đã merge)
-                        #self._network.eval() 
+                        # ======= CRITICAL FIX =======
                         with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
+                            out_old = self._network(
+                                inputs, noise=noise, new_forward=False
+                            )["logits"]
 
+                        out_new = self._network(
+                            inputs, noise=noise, new_forward=True
+                        )["logits"]
+
+                        logits = out_old + out_new
                     else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
-                    
-                    # [ĐÃ XÓA]: loss = loss + l1_lambda * l1_norm
+                        logits = self._network(
+                            inputs, noise=noise, new_forward=True
+                        )["logits"]
 
-                self.scaler.scale(loss).backward()
-                self.scaler.step(optimizer)
-                self.scaler.update()
-                
-                
-                losses += loss.item()
-                _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                
-                del inputs, targets, loss, logits_final
+                    loss = F.cross_entropy(logits, targets)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+
+                total_loss += loss.item()
+                pred = logits.argmax(dim=1)
+                correct += pred.eq(targets).sum().item()
+                total += targets.size(0)
 
             scheduler.step()
-            train_acc = 100. * correct / total
 
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
+            acc = 100. * correct / total
+            self.logger.info(
+                f"[Task {self.cur_task}] Epoch {epoch+1}/{epochs} "
+                f"Loss {total_loss/len(train_loader):.4f} Acc {acc:.2f}"
             )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            
-            if epoch % 5 == 0:
-                torch.cuda.empty_cache()
-
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
