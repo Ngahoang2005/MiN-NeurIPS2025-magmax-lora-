@@ -205,41 +205,44 @@ class PiNoise(nn.Module):
     def forward(self, x, new_forward=False):
         if len(self.task_indices) == 0 or self.current_task_id < 0:
             return x
+        with torch.amp.autocast('cuda', enabled=False):
 
-        device = x.device
-        x_freq = torch.fft.rfft(x, dim=-1)
-        total_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
-        if self.training:
-            # Training: Stochastic (Có epsilon)
-            indices = self.task_indices[self.current_task_id].to(device)
-            x_selected = x_freq[..., indices]
-            x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
+            x_float = x.float() 
             
-            mu_out = self.mu(x_mlp_in)
-            sigma_out = self.sigma(x_mlp_in)
-            epsilon = torch.randn_like(mu_out)
-            theta_val = epsilon * sigma_out + mu_out
-            z_complex = torch.complex(theta_val[..., :self.k], theta_val[..., self.k:])
-            
-            # Cộng nhiễu vào đúng vị trí tần số đã chọn (Orthogonality)
-            total_freq_noise.index_add_(-1, indices, z_complex)
-        
-        else:
-        # Eval: Duyệt qua tất cả các task (MagMax logic trong miền tần số)
-            for indices in self.task_indices:
-                indices = indices.to(device)
+            device = x.device
+            x_freq = torch.fft.rfft(x_float, dim=-1)
+            total_freq_noise = torch.zeros_like(x_freq, dtype=torch.complex64)
+            if self.training:
+                # Training: Stochastic (Có epsilon)
+                indices = self.task_indices[self.current_task_id].to(device)
                 x_selected = x_freq[..., indices]
-                mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
+                x_mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
                 
-                # Chỉ dùng Mu (Deterministic)
-                mu_out = self.mu(mlp_in)
-                z_complex = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
+                mu_out = self.mu(x_mlp_in)
+                sigma_out = self.sigma(x_mlp_in)
+                epsilon = torch.randn_like(mu_out)
+                theta_val = epsilon * sigma_out + mu_out
+                z_complex = torch.complex(theta_val[..., :self.k], theta_val[..., self.k:])
                 
-                # Logic chọn nhiễu lớn nhất
-                curr_vals = total_freq_noise[..., indices]
-                mask = z_complex.abs() > curr_vals.abs()
-                updated_vals = torch.where(mask, z_complex, curr_vals)
-                total_freq_noise.index_copy_(-1, indices, updated_vals)
+                # Cộng nhiễu vào đúng vị trí tần số đã chọn (Orthogonality)
+                total_freq_noise.index_add_(-1, indices, z_complex)
+            
+            else:
+            # Eval: Duyệt qua tất cả các task (MagMax logic trong miền tần số)
+                for indices in self.task_indices:
+                    indices = indices.to(device)
+                    x_selected = x_freq[..., indices]
+                    mlp_in = torch.cat([x_selected.real, x_selected.imag], dim=-1)
+                    
+                    # Chỉ dùng Mu (Deterministic)
+                    mu_out = self.mu(mlp_in)
+                    z_complex = torch.complex(mu_out[..., :self.k], mu_out[..., self.k:])
+                    
+                    # Logic chọn nhiễu lớn nhất
+                    curr_vals = total_freq_noise[..., indices]
+                    mask = z_complex.abs() > curr_vals.abs()
+                    updated_vals = torch.where(mask, z_complex, curr_vals)
+                    total_freq_noise.index_copy_(-1, indices, updated_vals)
 
         # 4. [Sửa Domain]: IFFT về không gian thực
         noise_spatial = torch.fft.irfft(total_freq_noise, n=self.in_dim, dim=-1)
