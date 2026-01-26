@@ -438,7 +438,7 @@ class PiNoise(nn.Module):
         self.freq_dim = in_dim // 2 + 1
 
         # ===== Hyper =====
-        self.k = 16
+        self.k = 32
         self.mlp_dim = self.k * 2
 
         # ===== Generator =====
