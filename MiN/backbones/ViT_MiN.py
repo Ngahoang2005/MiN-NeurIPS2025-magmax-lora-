@@ -555,6 +555,14 @@ class PiNoise(nn.Module):
 
         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
         return x + noise.to(x.dtype)
+    def freeze_noise(self):
+        for p in self.parameters():
+            p.requires_grad = False
+
+    def unfreeze_noise(self):
+        for p in self.parameters():
+            p.requires_grad = True
+
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
