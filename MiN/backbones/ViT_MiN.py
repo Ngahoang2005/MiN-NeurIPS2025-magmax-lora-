@@ -538,8 +538,9 @@ class PiNoise(nn.Module):
             # [TRAIN MODE]
             # Lấy bản sao của Buffer
             full_freqs = self.freq_buffer.clone()
+            indices = self.current_indices.to(device)
             # Gán đè giá trị đang train (có gradient) vào đúng vị trí
-            full_freqs.index_copy_(0, self.current_indices, self.current_coef)
+            full_freqs.index_copy_(0, indices, self.current_coef)
         else:
             # [INFERENCE MODE]
             # Dùng trực tiếp Buffer (chứa tinh hoa của tất cả các task)
