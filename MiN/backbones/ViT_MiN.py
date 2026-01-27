@@ -438,7 +438,7 @@ class PiNoise(nn.Module):
         self.freq_dim = in_dim // 2 + 1
 
         # ===== Hyper =====
-        self.k = 32
+        self.k = 16
         self.mlp_dim = self.k * 2
 
         # ===== Generator =====
@@ -463,71 +463,21 @@ class PiNoise(nn.Module):
         nn.init.constant_(self.sigma.bias, 1e-6)
 
     # ------------------------------------------------------------------
-    # def _get_spectral_mask(self, task_id):
-    #     anchor = int(self.freq_dim * 0.05)
-    #     max_tasks = 10
-    #     available = torch.arange(anchor, self.freq_dim)
-
-    #     indices = available[task_id % max_tasks :: max_tasks]
-
-    #     if len(indices) >= self.k:
-    #         indices = indices[:self.k]
-    #     else:
-    #         pad = indices[: self.k - len(indices)]
-    #         indices = torch.cat([indices, pad])
-
-    #     return indices.long()
-
     def _get_spectral_mask(self, task_id):
-        """
-        Chiến thuật Hybrid:
-        - Giữ lại n_shared_low tần số đầu tiên cho TẤT CẢ các task (để RLS ổn định).
-        - Các tần số còn lại chia đều cho các task (để tạo sự khác biệt).
-        """
-        # --- CẤU HÌNH ---
-        # 4 tần số đầu tiên (0, 1, 2, 3) chứa thông tin cấu trúc, ai cũng cần.
-        n_shared_low = 4  
-        
-        # Chu kỳ lặp lại cho vùng cao (Task 0 chung với Task 10, Task 20...)
-        max_tasks = 10    
+        anchor = int(self.freq_dim * 0.05)
+        max_tasks = 10
+        available = torch.arange(anchor, self.freq_dim)
 
-        # --- BƯỚC 1: LẤY VÙNG TẦN SỐ THẤP (SHARED) ---
-        # Đảm bảo không vượt quá kích thước thật
-        safe_n_shared = min(n_shared_low, self.freq_dim)
-        low_indices = torch.arange(0, safe_n_shared)
+        indices = available[task_id % max_tasks :: max_tasks]
 
-        # --- BƯỚC 2: LẤY VÙNG TẦN SỐ CAO (DISTRIBUTED) ---
-        if self.freq_dim > safe_n_shared:
-            available_high = torch.arange(safe_n_shared, self.freq_dim)
-            # Chia bài kiểu bước nhảy (Stride slicing)
-            # Ví dụ: Task 0 lấy index 4, 14, 24...
-            #        Task 1 lấy index 5, 15, 25...
-            high_indices = available_high[task_id % max_tasks :: max_tasks]
-        else:
-            high_indices = torch.tensor([], dtype=torch.long)
-
-        # --- BƯỚC 3: GỘP LẠI ---
-        indices = torch.cat([low_indices, high_indices])
-
-        # --- BƯỚC 4: CẮT HOẶC PAD CHO ĐỦ k ---
         if len(indices) >= self.k:
-            # Nếu dư: Cắt bớt phần đuôi (giữ phần đầu quan trọng hơn)
             indices = indices[:self.k]
         else:
-            # Nếu thiếu: Padding
-            # Logic Pad: Lặp lại chính các index High Freq để tăng cường độ cho nó.
-            # (Tránh pad thêm Low Freq vì Low Freq đã đủ mạnh rồi)
-            
-            pad_source = high_indices if len(high_indices) > 0 else low_indices
-            
-            # Vòng lặp để pad cho đến khi đủ độ dài self.k
-            while len(indices) < self.k:
-                needed = self.k - len(indices)
-                take = min(needed, len(pad_source))
-                # Nối thêm phần còn thiếu
-                indices = torch.cat([indices, pad_source[:take]])
+            pad = indices[: self.k - len(indices)]
+            indices = torch.cat([indices, pad])
 
         return indices.long()
+
     # ------------------------------------------------------------------
     def expand_new_task(self):
         self.current_task_id += 1
@@ -563,78 +513,40 @@ class PiNoise(nn.Module):
         # self.sigma.load_state_dict(magmax(self.history_sigma))
 
     # ------------------------------------------------------------------
-    # def forward(self, x):
-    #     # cộng hyper feature vào kết quả cuối cùng nữa
-    #     if self.current_task_id < 0:
-    #         return x
-
-    #     # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
-    #     x_f = torch.fft.rfft(x.float(), dim=-1)
-    #     device = x.device
-    #     total_noise = torch.zeros_like(x_f, device = device)
-        
-
-    #     if self.training:
-    #         task_list = [self.current_task_id]
-    #     else:
-    #         task_list = range(self.current_task_id + 1)
-    #     for t_id in task_list:
-    #         idx = self.task_indices[t_id].to(device)
-    #         sel = x_f[..., idx]
-    #         mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
-
-    #         # Các lớp Linear có thể trả về Half nếu đang dùng autocast
-    #         real_part = self.mu(mlp_in)
-            
-    #         # Sigma sinh ra Phần Ảo
-    #         imag_part = self.sigma(mlp_in)
-
-    #         # Tạo số phức Z = Mu + i * Sigma
-    #         # Lưu ý: Không dùng epsilon ngẫu nhiên ở đây
-    #         z = torch.complex(real_part, imag_part)
-    #         # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
-    #         total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
-
-
-    #     noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
-    #     return x + noise.to(x.dtype)
     def forward(self, x):
-        if self.current_task_id < 0: 
+        # cộng hyper feature vào kết quả cuối cùng nữa
+        if self.current_task_id < 0:
             return x
 
-        # [FIX 1] Thêm norm='ortho' để giữ biên độ ổn định
-        x_f = torch.fft.rfft(x.float(), dim=-1, norm='ortho')
+        # Đảm bảo đầu vào là float32 để FFT ra ComplexFloat
+        x_f = torch.fft.rfft(x.float(), dim=-1)
         device = x.device
+        total_noise = torch.zeros_like(x_f, device = device)
         
-        total_noise = torch.zeros_like(x_f, device=device)
 
         if self.training:
             task_list = [self.current_task_id]
         else:
-            task_list = range(len(self.task_indices))
-
+            task_list = range(self.current_task_id + 1)
         for t_id in task_list:
             idx = self.task_indices[t_id].to(device)
             sel = x_f[..., idx]
             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
-            # Mu -> Real, Sigma -> Imag
+            # Các lớp Linear có thể trả về Half nếu đang dùng autocast
             real_part = self.mu(mlp_in)
-            imag_part = self.sigma(mlp_in)
             
+            # Sigma sinh ra Phần Ảo
+            imag_part = self.sigma(mlp_in)
+
+            # Tạo số phức Z = Mu + i * Sigma
+            # Lưu ý: Không dùng epsilon ngẫu nhiên ở đây
             z = torch.complex(real_part, imag_part)
+            # --- FIX: Ép kiểu z về ComplexFloat trước khi add ---
+            total_noise.index_add_(-1, idx, z.to(torch.complex64)) 
 
-            total_noise.index_add_(-1, idx, z.to(torch.complex64))
 
-        # [FIX 2] Thêm norm='ortho' ở chiều nghịch đảo
-        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1, norm='ortho')
-        
-        # [DEBUG QUAN TRỌNG]
-        # Hãy in dòng này ra 1 lần để xem tỷ lệ giữa Feature và Noise
-        # Nếu noise lớn hơn x quá nhiều -> Model hỏng.
-        # if self.training and random.random() < 0.01:
-        #    print(f"DEBUG SCALE: x_mean={x.abs().mean():.4f} | noise_mean={noise.abs().mean():.4f}")
-
+        noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
         return x + noise.to(x.dtype)
     def freeze_noise(self):
         for p in self.parameters():
