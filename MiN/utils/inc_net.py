@@ -131,7 +131,7 @@ class MiNbaseNet(nn.Module):
 
     def update_noise(self):
         # Trigger update mask trong PiNoise
-        for j in range(self.backbone.layer_num):
+        for m in self.backbone.noise_maker:
             if hasattr(m, 'update_noise'):
                 # PiNoise cần nhận tham số task_id
                 m.update_noise(task_id=self.cur_task)

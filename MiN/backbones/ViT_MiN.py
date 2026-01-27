@@ -76,86 +76,234 @@ from torch.nn import init
 import torch
 import torch.nn as nn
 import math
+# class PiNoise(nn.Module):
+#     def __init__(self, in_dim):
+#         super().__init__()
+#         self.in_dim = in_dim
+#         self.freq_dim = in_dim // 2 + 1
+
+#         # ===== Hyper =====
+#         self.k = 16
+#         self.mlp_dim = self.k * 2
+
+#         # ===== Generator =====
+#         self.mu = nn.Linear(self.mlp_dim, self.k)
+#         self.sigma = nn.Linear(self.mlp_dim, self.k)
+#         self.global_mu = None
+#         self.global_sigma = None
+#         # ===== Task management =====
+#         self.current_task_id = -1
+#         self.task_indices = []
+
+#         # ===== History for MagMax =====
+#         self.history_mu = []
+#         self.history_sigma = []
+
+#         self.reset_parameters()
+
+#     # ------------------------------------------------------------------
+#     def reset_parameters(self, first_init=False):
+#         nn.init.constant_(self.mu.weight, 0.)
+#         nn.init.constant_(self.mu.bias, 0.)
+#         nn.init.constant_(self.sigma.weight, 1e-6) # Rất nhỏ
+#         nn.init.constant_(self.sigma.bias, 1e-6)
+
+#     # ------------------------------------------------------------------
+#     def _get_spectral_mask(self, task_id):
+#         anchor = int(self.freq_dim * 0.05)
+#         max_tasks = 10
+#         available = torch.arange(anchor, self.freq_dim)
+
+#         indices = available[task_id % max_tasks :: max_tasks]
+
+#         if len(indices) >= self.k:
+#             indices = indices[:self.k]
+#         else:
+#             pad = indices[: self.k - len(indices)]
+#             indices = torch.cat([indices, pad])
+
+#         return indices.long()
+
+#     # ------------------------------------------------------------------
+#     def expand_new_task(self):
+#         self.current_task_id += 1
+#         indices = self._get_spectral_mask(self.current_task_id)
+#         self.task_indices.append(indices.cpu())
+
+#         if self.current_task_id > 0:
+#             self.reset_parameters()
+
+#         print(f"[PiNoise] Task {self.current_task_id}, mask={indices[0]}→{indices[-1]}")
+#     def update_noise(self, task_id=None):
+#         if task_id is not None:
+#             self.current_task_id = task_id
+#             if len(self.task_indices) <= self.current_task_id:
+#                 indices = self._get_spectral_mask(self.current_task_id)
+#                 self.task_indices.append(indices.cpu())
+            
+#             # Reset params cho task mới
+#             if self.current_task_id > 0:
+#                 self.reset_parameters()
+#         else:
+#             self.expand_new_task()
+#     def after_task_training(self):
+#         # 1. Gộp trọng số
+#         self._magmax_update()
+        
+#         # 2. Load lại trọng số tổng hợp để sẵn sàng Inference
+#         self.mu.load_state_dict(self.global_mu)
+#         self.sigma.load_state_dict(self.global_sigma)
+#     # ------------------------------------------------------------------
+#     def _magmax_update(self):
+#         print(f"[PiNoise] MagMax Merging Task {self.current_task_id}...")
+        
+#         curr_mu = self.mu.state_dict()
+#         curr_sigma = self.sigma.state_dict()
+
+#         if self.global_mu is None:
+#             self.global_mu = copy.deepcopy(curr_mu)
+#             self.global_sigma = copy.deepcopy(curr_sigma)
+#             return
+
+#         def merge_state(global_dict, curr_dict):
+#             merged = {}
+#             for k in global_dict:
+#                 g_tensor = global_dict[k]
+#                 c_tensor = curr_dict[k]
+                
+#                 # Logic: Giữ lại cái nào có trị tuyệt đối lớn hơn
+#                 mask = (c_tensor.abs() > g_tensor.abs()).float()
+#                 merged[k] = mask * c_tensor + (1 - mask) * g_tensor
+#             return merged
+
+#         self.global_mu = merge_state(self.global_mu, curr_mu)
+#         self.global_sigma = merge_state(self.global_sigma, curr_sigma)
+
+#     # ------------------------------------------------------------------
+#     def forward(self, x):
+#         if self.current_task_id < 0: return x
+
+#         # Bỏ norm='ortho' -> Giữ nguyên biên độ mặc định (nhỏ)
+#         x_f = torch.fft.rfft(x.float(), dim=-1)
+#         device = x.device
+#         total_noise = torch.zeros_like(x_f, device=device)
+
+#         if self.training:
+#             task_list = [self.current_task_id]
+#         else:
+#             task_list = range(len(self.task_indices))
+
+#         for t_id in task_list:
+#             idx = self.task_indices[t_id].to(device)
+#             sel = x_f[..., idx]
+#             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
+
+#             # self.mu lúc này là Current (khi train) hoặc Global (khi eval)
+#             real_part = self.mu(mlp_in)
+#             imag_part = self.sigma(mlp_in)
+            
+#             z = torch.complex(real_part, imag_part)
+#             total_noise.index_add_(-1, idx, z.to(torch.complex64))
+
+#         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
+        
+#         # [ĐÃ BỎ ALPHA] Cộng trực tiếp noise vào x
+#         # Vì init rất nhỏ (1e-5) nên noise ban đầu gần như bằng 0
+#         return x + noise.to(x.dtype)
+        
+#     def freeze_noise(self):
+#         for p in self.parameters(): p.requires_grad = False
+#     def unfreeze_noise(self):
+#         for p in self.parameters(): p.requires_grad = True
+import torch
+import torch.nn as nn
+import copy
+
 class PiNoise(nn.Module):
-    def __init__(self, in_dim):
+    def __init__(self, in_dim, layer_id=0):
         super().__init__()
         self.in_dim = in_dim
         self.freq_dim = in_dim // 2 + 1
-
-        # ===== Hyper =====
-        self.k = 16
+        self.layer_id = layer_id  # [MỚI] Dùng để làm lệch pha giữa các layer
+        
+        # k=32
+        self.k = 32
         self.mlp_dim = self.k * 2
 
-        # ===== Generator =====
+        # Generator (Current Weights)
         self.mu = nn.Linear(self.mlp_dim, self.k)
         self.sigma = nn.Linear(self.mlp_dim, self.k)
+
+        # [KHÔNG DÙNG ALPHA] - Theo yêu cầu
+        # [KHÔNG DÙNG WARM-UP/CLIP] - Theo yêu cầu
+
+        # MagMax Storage (Global Weights)
         self.global_mu = None
         self.global_sigma = None
-        # ===== Task management =====
+
         self.current_task_id = -1
         self.task_indices = []
 
-        # ===== History for MagMax =====
-        self.history_mu = []
-        self.history_sigma = []
-
         self.reset_parameters()
 
-    # ------------------------------------------------------------------
-    def reset_parameters(self, first_init=False):
-        nn.init.constant_(self.mu.weight, 0.)
+    def reset_parameters(self):
+        # Init weight cực nhỏ (1e-5) vì không có Alpha kìm hãm.
+        # Giúp Accuracy Task đầu tiên không bị tụt quá sâu.
+        nn.init.normal_(self.mu.weight, std=1e-5)
         nn.init.constant_(self.mu.bias, 0.)
-        nn.init.constant_(self.sigma.weight, 1e-6) # Rất nhỏ
-        nn.init.constant_(self.sigma.bias, 1e-6)
+        nn.init.normal_(self.sigma.weight, std=1e-5)
+        nn.init.constant_(self.sigma.bias, 0.)
 
-    # ------------------------------------------------------------------
     def _get_spectral_mask(self, task_id):
+        # 1. Vùng an toàn (Anchor) - Bỏ 5% tần số đầu
         anchor = int(self.freq_dim * 0.05)
-        max_tasks = 10
         available = torch.arange(anchor, self.freq_dim)
+        
+        # 2. Chiến thuật "Bước nhảy kép" (Double Stride)
+        # Đảm bảo Task khác nhau không trùng nhau.
+        # Đảm bảo Layer khác nhau cũng không trùng nhau.
+        max_tasks = 10
+        magic_shift = 3  # Số lẻ để xáo trộn
+        
+        # Công thức lệch pha:
+        start_index = (task_id + self.layer_id * magic_shift) % max_tasks
+        
+        if len(available) > 0:
+            indices = available[start_index :: max_tasks]
+        else:
+            indices = torch.tensor([], dtype=torch.long)
 
-        indices = available[task_id % max_tasks :: max_tasks]
-
+        # 3. Cắt gọt / Padding cho đủ k
         if len(indices) >= self.k:
             indices = indices[:self.k]
         else:
-            pad = indices[: self.k - len(indices)]
-            indices = torch.cat([indices, pad])
-
+            pad_len = self.k - len(indices)
+            if len(indices) > 0:
+                pad = indices[-1].repeat(pad_len)
+                indices = torch.cat([indices, pad])
+            else:
+                indices = torch.zeros(self.k, dtype=torch.long)
         return indices.long()
 
-    # ------------------------------------------------------------------
-    def expand_new_task(self):
-        self.current_task_id += 1
-        indices = self._get_spectral_mask(self.current_task_id)
-        self.task_indices.append(indices.cpu())
-
-        if self.current_task_id > 0:
-            self.reset_parameters()
-
-        print(f"[PiNoise] Task {self.current_task_id}, mask={indices[0]}→{indices[-1]}")
     def update_noise(self, task_id=None):
         if task_id is not None:
             self.current_task_id = task_id
             if len(self.task_indices) <= self.current_task_id:
                 indices = self._get_spectral_mask(self.current_task_id)
                 self.task_indices.append(indices.cpu())
-            
-            # Reset params cho task mới
             if self.current_task_id > 0:
                 self.reset_parameters()
         else:
-            self.expand_new_task()
+            # Fallback
+            self.current_task_id += 1
+            indices = self._get_spectral_mask(self.current_task_id)
+            self.task_indices.append(indices.cpu())
+            if self.current_task_id > 0:
+                self.reset_parameters()
+
     def after_task_training(self):
-        # 1. Gộp trọng số
-        self._magmax_update()
-        
-        # 2. Load lại trọng số tổng hợp để sẵn sàng Inference
-        self.mu.load_state_dict(self.global_mu)
-        self.sigma.load_state_dict(self.global_sigma)
-    # ------------------------------------------------------------------
-    def _magmax_update(self):
-        print(f"[PiNoise] MagMax Merging Task {self.current_task_id}...")
+        # MagMax Merge Logic
+        # print(f"[PiNoise] MagMax Merging Task {self.current_task_id}...")
         
         curr_mu = self.mu.state_dict()
         curr_sigma = self.sigma.state_dict()
@@ -163,27 +311,28 @@ class PiNoise(nn.Module):
         if self.global_mu is None:
             self.global_mu = copy.deepcopy(curr_mu)
             self.global_sigma = copy.deepcopy(curr_sigma)
-            return
+        else:
+            def merge_state(global_dict, curr_dict):
+                merged = {}
+                for k in global_dict:
+                    g = global_dict[k]
+                    c = curr_dict[k]
+                    # Winner takes all: Ai có biên độ lớn hơn thì giữ
+                    mask = (c.abs() > g.abs()).float()
+                    merged[k] = mask * c + (1 - mask) * g
+                return merged
 
-        def merge_state(global_dict, curr_dict):
-            merged = {}
-            for k in global_dict:
-                g_tensor = global_dict[k]
-                c_tensor = curr_dict[k]
-                
-                # Logic: Giữ lại cái nào có trị tuyệt đối lớn hơn
-                mask = (c_tensor.abs() > g_tensor.abs()).float()
-                merged[k] = mask * c_tensor + (1 - mask) * g_tensor
-            return merged
+            self.global_mu = merge_state(self.global_mu, curr_mu)
+            self.global_sigma = merge_state(self.global_sigma, curr_sigma)
 
-        self.global_mu = merge_state(self.global_mu, curr_mu)
-        self.global_sigma = merge_state(self.global_sigma, curr_sigma)
+        # Load Global back to Current for Eval
+        self.mu.load_state_dict(self.global_mu)
+        self.sigma.load_state_dict(self.global_sigma)
 
-    # ------------------------------------------------------------------
     def forward(self, x):
         if self.current_task_id < 0: return x
 
-        # Bỏ norm='ortho' -> Giữ nguyên biên độ mặc định (nhỏ)
+        # RFFT (Không dùng norm='ortho' để noise nhỏ)
         x_f = torch.fft.rfft(x.float(), dim=-1)
         device = x.device
         total_noise = torch.zeros_like(x_f, device=device)
@@ -198,7 +347,7 @@ class PiNoise(nn.Module):
             sel = x_f[..., idx]
             mlp_in = torch.cat([sel.real, sel.imag], dim=-1)
 
-            # self.mu lúc này là Current (khi train) hoặc Global (khi eval)
+            # Tính toán Noise
             real_part = self.mu(mlp_in)
             imag_part = self.sigma(mlp_in)
             
@@ -207,15 +356,13 @@ class PiNoise(nn.Module):
 
         noise = torch.fft.irfft(total_noise, n=self.in_dim, dim=-1)
         
-        # [ĐÃ BỎ ALPHA] Cộng trực tiếp noise vào x
-        # Vì init rất nhỏ (1e-5) nên noise ban đầu gần như bằng 0
+        # Cộng trực tiếp (Vì đã bỏ Alpha)
         return x + noise.to(x.dtype)
         
     def freeze_noise(self):
         for p in self.parameters(): p.requires_grad = False
     def unfreeze_noise(self):
         for p in self.parameters(): p.requires_grad = True
-
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
