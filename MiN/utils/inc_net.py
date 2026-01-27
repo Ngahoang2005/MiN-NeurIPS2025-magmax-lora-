@@ -98,7 +98,7 @@ class MiNbaseNet(nn.Module):
         self.register_buffer("weight", weight) 
 
         # Covariance Matrix R (Inverse)
-        R = torch.eye(self.buffer_size, **factory_kwargs) / self.gamma
+        R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R) 
 
         # Normal FC (Cho việc học SGD - PiNoise training)
@@ -112,9 +112,9 @@ class MiNbaseNet(nn.Module):
         
         # Tạo Normal FC mới để train task hiện tại
         if self.cur_task > 0:
-            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False).float()
+            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
-            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True).float()
+            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
         # Copy trọng số cũ (nếu muốn warm-start normal FC, dù RLS mới là chính)
         if self.normal_fc is not None:
@@ -126,7 +126,8 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = new_fc
         else:
             nn.init.constant_(new_fc.weight, 0.)
-            if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
+            if new_fc.bias is not None: 
+                nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
 
     def update_noise(self):
@@ -164,12 +165,8 @@ class MiNbaseNet(nn.Module):
         features = features.to(self.weight.dtype)
         # Classifier chính thức (RLS Weight)
         return features @ self.weight
-
-    # -------------------------------------------------
-    # ✅ FIX 2: FIT FUNCTION VỚI EVAL MODE & MEMORY SAFE
-    # -------------------------------------------------
+        
     @torch.no_grad()
-
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
         Thuật toán Recursive Least Squares (RLS).
@@ -223,11 +220,16 @@ class MiNbaseNet(nn.Module):
         logits = self.forward_fc(self.buffer(hyper_features))
         
         return {'logits': logits}
+    def extract_feature(self, x):
+        """Chỉ trích xuất đặc trưng từ Backbone"""
+        return self.backbone(x)
 
     def forward_normal_fc(self, x, new_forward: bool = False):
-        # Hàm forward dành riêng cho lúc Training PiNoise (dùng SGD)
-        hyper_features = self.backbone(x)
-        hyper_features = self.buffer(hyper_features)
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         # Dùng Normal FC (có bias, đang học)
         logits = self.normal_fc(hyper_features)['logits']
