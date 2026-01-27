@@ -229,7 +229,9 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
+        hyper_features = self.buffer(hyper_features) # [B, 768] -> [B, 16384]
         
+        # Ép kiểu
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         # Dùng Normal FC (có bias, đang học)
         logits = self.normal_fc(hyper_features)['logits']
