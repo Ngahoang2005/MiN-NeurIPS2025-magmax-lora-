@@ -121,9 +121,6 @@ class PiNoise(nn.Module):
 
         # 3. CURRENT TASK PARAMETERS
         self.current_values = nn.Parameter(torch.zeros(k))
-        
-        self.current_u = None
-        self.current_v = None
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
         self.current_task_id = -1
@@ -165,19 +162,8 @@ class PiNoise(nn.Module):
         # 2. Smart Init
         with torch.no_grad():
             # Dựng ma trận tạm
-            temp_global = self._make_temp_dense_global()
-            
-            # Lấy giá trị cũ tại vị trí u, v (lấy từ buffer)
-            old_vals = temp_global[self.current_u, self.current_v]
+            old_vals = self.global_B[self.current_u, self.current_v]
             self.current_values.data.copy_(old_vals)
-
-            mask_zero = (old_vals == 0)
-            if mask_zero.any():
-                self.current_values.data[mask_zero] += (
-                    torch.randn(mask_zero.sum(), device=device) * 0.02
-                )
-            
-            del temp_global
 
         self.unfreeze_noise()
         print(f"[PiNoise] Task {self.current_task_id}: Ready. Indices registered in Buffer.")
