@@ -77,17 +77,11 @@ from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 class PiNoise(nn.Module):
-    """
-    PiNoise – 1D Feature Vector Version (Input [B, D])
-    -------------------------------------------------------
-    - Dành cho input (Batch, Dim).
-    - Path 1: Sparse Noise (MagMax protected).
-    - Path 2: Dense MLP (Zero-Init).
-    - Fix OOM & Mixed Precision.
-    """
-
     def __init__(
         self,
         in_dim: int = 768,
@@ -118,33 +112,24 @@ class PiNoise(nn.Module):
         self.current_values = nn.Parameter(torch.zeros(k))
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
-        
         self.current_task_id = -1
 
-        # 4. MLP BRANCH (Input D -> Output D)
+        # 4. MLP BRANCH
         self.MLP = nn.Linear(in_dim, in_dim)
-        # Zero-Init
         torch.nn.init.constant_(self.MLP.weight, 0)
         torch.nn.init.constant_(self.MLP.bias, 0)
 
-    # ======================================================
-    # HELPER METHODS
-    # ======================================================
     def freeze_noise(self):
         self.current_values.requires_grad_(False)
-        for param in self.MLP.parameters():
-            param.requires_grad_(False)
+        for param in self.MLP.parameters(): param.requires_grad_(False)
 
     def unfreeze_noise(self):
         self.current_values.requires_grad_(True)
-        for param in self.MLP.parameters():
-            param.requires_grad_(True)
+        for param in self.MLP.parameters(): param.requires_grad_(True)
         
     def _sample_unique_indices(self):
         flat = torch.randperm(self.total_points)[: self.k]
-        u = flat // self.d
-        v = flat % self.d
-        return u, v
+        return flat // self.d, flat % self.d
     
     def _make_temp_dense(self):
         dev = self.global_vals.device
@@ -155,130 +140,55 @@ class PiNoise(nn.Module):
 
     def _save_dense_to_sparse(self, dense):
         indices = torch.nonzero(dense, as_tuple=True)
-        self.global_u = indices[0]
-        self.global_v = indices[1]
+        self.global_u, self.global_v = indices[0], indices[1]
         self.global_vals = dense[indices]
 
-    # ======================================================
-    # TASK LIFECYCLE
-    # ======================================================
     def update_noise(self, task_id: int):
         self.current_task_id = task_id
-        
-        # --- Update Noise Path ---
         u, v = self._sample_unique_indices()
         dev = self.current_u.device
-        self.current_u.data.copy_(u.to(dev))
-        self.current_v.data.copy_(v.to(dev))
-
+        self.current_u.data.copy_(u.to(dev)); self.current_v.data.copy_(v.to(dev))
         with torch.no_grad():
             temp_B = self._make_temp_dense()
             old_vals = temp_B[self.current_u, self.current_v]
             self.current_values.data.copy_(old_vals)
-
             mask_zero = (old_vals == 0)
             if mask_zero.any():
-                self.current_values.data[mask_zero] += (
-                    torch.randn(mask_zero.sum(), device=dev) * 0.02
-                )
-            del temp_B
-
-        # --- Update MLP Path (Continual Learning) ---
+                self.current_values.data[mask_zero] += torch.randn(mask_zero.sum(), device=dev) * 0.02
         self.unfreeze_noise()
-        print(f"[PiNoise-2D] Task {self.current_task_id}: Ready.")
 
     def after_task_training(self):
-        if self.current_task_id == -1: return
+        if self.current_task_id < 0: return
         dev = self.global_vals.device
-        u = self.current_u.to(dev)
-        v = self.current_v.to(dev)
-
         with torch.no_grad():
             temp_B = self._make_temp_dense()
-            new_vals = self.current_values.data
-            old_vals = temp_B[u, v]
-
-            mask = new_vals.abs() > old_vals.abs()
-            merged = torch.where(mask, new_vals, old_vals)
-            temp_B[u, v] = merged
-            
+            new_vals, old_vals = self.current_values.data, temp_B[self.current_u, self.current_v]
+            merged = torch.where(new_vals.abs() > old_vals.abs(), new_vals, old_vals)
+            temp_B[self.current_u, self.current_v] = merged
             self._save_dense_to_sparse(temp_B)
-            del temp_B
-
         self.freeze_noise()
-        print(f"[PiNoise-2D] Task {self.current_task_id} merged.")
 
-    # ======================================================
-    # CORE CALCULATION (Adapted for [B, D])
-    # ======================================================
     def _forward_compute_noise(self, x, current_values):
-        """
-        Input x: [B, D]
-        """
-        # 1. Project: [B, D] @ [D, D] -> [B, D]
         h = torch.matmul(x, self.F.to(dtype=x.dtype))
         h_mixed = torch.zeros_like(h)
-
-        # A. Background Replay
+        # Replay
         if len(self.global_u) > 0:
-            u_old = self.global_u
-            v_old = self.global_v
-            
-            # Reshape [K] -> [1, K] để broadcast với [B, K]
-            vals_old = self.global_vals.view(1, -1) 
-            
-            if x.device != u_old.device:
-                u_old = u_old.to(x.device)
-                v_old = v_old.to(x.device)
-                vals_old = vals_old.to(x.device)
-            
-            vals_old = vals_old.to(dtype=x.dtype)
-            
-            # h[:, u_old] -> Lấy cột, shape [B, K]
-            # vals_old    -> Shape [1, K]
-            # Kết quả     -> [B, K]
-            source = h[:, u_old] * vals_old.detach()
-            source = source.to(dtype=h_mixed.dtype)
-            
-            # Cộng vào h_mixed tại các cột v_old
-            h_mixed.index_add_(-1, v_old, source)
+            vals_old = self.global_vals.view(1, -1).to(dtype=x.dtype, device=x.device)
+            source = h[:, self.global_u] * vals_old
+            h_mixed.index_add_(-1, self.global_v.to(x.device), source)
+        # Current
+        vals = current_values.to(dtype=x.dtype, device=x.device).view(1, -1)
+        source = h[:, self.current_u] * vals
+        h_mixed.index_add_(-1, self.current_v, source)
+        return torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
 
-        # B. Current Task
-        u = self.current_u.to(x.device)
-        v = self.current_v.to(x.device)
-        
-        # Reshape [K] -> [1, K]
-        vals = current_values.to(device=x.device, dtype=x.dtype).view(1, -1)
-        
-        source = h[:, u] * vals
-        source = source.to(dtype=h_mixed.dtype)
-        h_mixed.index_add_(-1, v, source)
-
-        # 3. Back-Project
-        noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
-        return noise
-
-    # ======================================================
-    # FORWARD PASS
-    # ======================================================
-    def forward(self, hyper_features):
-        """
-        x: [Batch, Dim] (Ví dụ [64, 768])
-        """
-        if self.current_task_id < 0:
-            return hyper_features
-
-        # 1. Nhánh PiNoise
-        if self.training and hyper_features.requires_grad:
-            noise = checkpoint(self._forward_compute_noise, hyper_features, self.current_values, use_reentrant=False)
+    def forward(self, x):
+        if self.current_task_id < 0: return x
+        if self.training and x.requires_grad:
+            noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
         else:
-            noise = self._forward_compute_noise(hyper_features, self.current_values)
-
-        # 2. Nhánh MLP
-        # Linear([B, D]) -> [B, D]
-        mlp_out = self.MLP(hyper_features)
-        # 3. Tổng hợp
-        return hyper_features + noise + mlp_out
+            noise = self._forward_compute_noise(x, self.current_values)
+        return x + self.alpha * noise + self.MLP(x)
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
