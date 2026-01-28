@@ -124,9 +124,11 @@ class PiNoise(nn.Module):
         
         self.current_u = None
         self.current_v = None
+        self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
+        self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
         self.current_task_id = -1
 
-    # ... [Giữ nguyên các hàm helper: freeze, unfreeze, sample_indices, rebuild] ...
+   
     
     def freeze_noise(self):
         self.current_values.requires_grad_(False)
@@ -150,24 +152,35 @@ class PiNoise(nn.Module):
 
     def update_noise(self, task_id: int):
         self.current_task_id = task_id
-        u, v = self._sample_unique_indices()
-        self.current_u = u
-        self.current_v = v
 
+        # 1. Sample vị trí mới (Tạm thời là biến local)
+        u, v = self._sample_unique_indices()
+        
+        # [FIX] Cập nhật vào Buffer (để đảm bảo tính nhất quán)
+        # Lưu ý: Cần đưa về cùng device với model trước khi gán
+        device = self.current_u.device
+        self.current_u.data.copy_(u.to(device))
+        self.current_v.data.copy_(v.to(device))
+
+        # 2. Smart Init
         with torch.no_grad():
-            dev = self.global_B.device
-            u, v = u.to(dev), v.to(dev)
-            old_vals = self.global_B[u, v]
+            # Dựng ma trận tạm
+            temp_global = self._make_temp_dense_global()
+            
+            # Lấy giá trị cũ tại vị trí u, v (lấy từ buffer)
+            old_vals = temp_global[self.current_u, self.current_v]
             self.current_values.data.copy_(old_vals)
 
             mask_zero = (old_vals == 0)
             if mask_zero.any():
                 self.current_values.data[mask_zero] += (
-                    torch.randn(mask_zero.sum(), device=dev) * 0.02
+                    torch.randn(mask_zero.sum(), device=device) * 0.02
                 )
+            
+            del temp_global
 
         self.unfreeze_noise()
-        print(f"[PiNoise] Task {self.current_task_id}: Allocated {self.k} params.")
+        print(f"[PiNoise] Task {self.current_task_id}: Ready. Indices registered in Buffer.")
 
     def after_task_training(self):
         if self.current_u is None: return
@@ -259,6 +272,9 @@ class PiNoise(nn.Module):
         noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
 
         return x + self.alpha * noise
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
