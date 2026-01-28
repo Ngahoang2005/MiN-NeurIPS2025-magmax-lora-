@@ -135,7 +135,7 @@ class MiNbaseNet(nn.Module):
         for m in self.backbone.noise_maker:
             if hasattr(m, 'update_noise'):
                 # PiNoise cần nhận tham số task_id
-                m.update_noise(task_id=self.cur_task)
+                m.update_noise()
     def after_task_magmax_merge(self):
         print(f"--> [IncNet] Task {self.cur_task}: Triggering MagMax Merging...")
         for m in self.backbone.noise_maker:
