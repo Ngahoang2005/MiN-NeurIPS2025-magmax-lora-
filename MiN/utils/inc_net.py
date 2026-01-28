@@ -232,7 +232,6 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        hyper_features = hyper_features.to(self.weight.dtype)
         
         # Qua buffer rồi nhân với RLS Weights
         logits = self.forward_fc(self.buffer(hyper_features))

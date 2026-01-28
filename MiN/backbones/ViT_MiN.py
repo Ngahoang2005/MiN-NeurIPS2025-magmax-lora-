@@ -261,25 +261,24 @@ class PiNoise(nn.Module):
     # ======================================================
     # FORWARD PASS
     # ======================================================
-    def forward(self, x):
+    def forward(self, hyper_features):
         """
         x: [Batch, Dim] (Ví dụ [64, 768])
         """
         if self.current_task_id < 0:
-            return x
+            return hyper_features
 
         # 1. Nhánh PiNoise
-        if self.training and x.requires_grad:
-            noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
+        if self.training and hyper_features.requires_grad:
+            noise = checkpoint(self._forward_compute_noise, hyper_features, self.current_values, use_reentrant=False)
         else:
-            noise = self._forward_compute_noise(x, self.current_values)
+            noise = self._forward_compute_noise(hyper_features, self.current_values)
 
         # 2. Nhánh MLP
         # Linear([B, D]) -> [B, D]
-        mlp_out = self.MLP(x)
-
+        mlp_out = self.MLP(hyper_features)
         # 3. Tổng hợp
-        return x + noise + mlp_out
+        return hyper_features + noise + mlp_out
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
