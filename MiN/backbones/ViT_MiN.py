@@ -186,30 +186,31 @@ class PiNoise(torch.nn.Linear):
     # ======================================================
     def _forward_compute_noise(self, x, current_values):
         # 1. Down: [B, N, D] @ [D, R] -> [B, N, R]
-        h = x @ self.w_down
+        # Ép kiểu trọng số về cùng kiểu với x (có thể là Half)
+        h = x @ self.w_down.to(x.dtype)
         
         # 2. Rotate: [B, N, R] @ [R, R] -> [B, N, R]
-        h_rot = h @ self.F
+        h_rot = h @ self.F.to(x.dtype)
         
         # 3. Sparse Multiply
         h_mixed = torch.zeros_like(h_rot)
         
-        # Xử lý đa chiều tự động (Broadcast cho cả 2D và 3D)
-        # Nếu x là [B, 197, 768] -> view_shape là (1, 1, -1)
-        # Nếu x là [B, 768]      -> view_shape là (1, -1)
         view_shape = (1,) * (x.dim() - 1) + (-1,)
 
         if len(self.global_u) > 0:
             v_old = self.global_vals.view(*view_shape).to(x.dtype)
-            # Dùng Ellipsis (...) để lấy đúng chiều cuối (R)
-            h_mixed.index_add_(-1, self.global_v, h_rot[..., self.global_u] * v_old)
+            # Tính toán source và ép kiểu về dtype của h_mixed (Half/Float)
+            source_old = (h_rot[..., self.global_u] * v_old).to(h_mixed.dtype)
+            h_mixed.index_add_(-1, self.global_v, source_old)
             
         v_curr = current_values.view(*view_shape).to(x.dtype)
-        h_mixed.index_add_(-1, self.current_v, h_rot[..., self.current_u] * v_curr)
+        # ÉP KIỂU TẠI ĐÂY: Đảm bảo source cùng type với h_mixed
+        source_curr = (h_rot[..., self.current_u] * v_curr).to(h_mixed.dtype)
+        h_mixed.index_add_(-1, self.current_v, source_curr)
 
         # 4. Back-rotate & Up-project
-        h_out = h_mixed @ self.F.t()
-        return h_out @ self.w_up
+        h_out = h_mixed @ self.F.t().to(x.dtype)
+        return h_out @ self.w_up.to(x.dtype)
 
     def forward(self, hyper_features):
         if self.current_task_id < 0:

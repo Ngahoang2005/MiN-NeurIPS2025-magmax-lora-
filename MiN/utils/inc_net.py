@@ -187,7 +187,7 @@ class MiNbaseNet(nn.Module):
     def forward_fc(self, features):
         """Forward qua Analytic Classifier"""
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
-        features = features.to(self.weight) 
+        features = features.to(self.weight.dtype) 
         return features @ self.weight
 
     @torch.no_grad()
@@ -237,44 +237,34 @@ class MiNbaseNet(nn.Module):
     # =========================================================================
 
     def forward(self, x, new_forward: bool = False):
-        """
-        Dùng cho Inference/Testing.
-        Chạy qua backbone (đã merge noise) -> Buffer -> Analytic Classifier.
-        """
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
         
-        # Ép kiểu về float32 cho Buffer và Classifier
+        # [SỬA]: Đảm bảo đặc trưng đồng nhất kiểu dữ liệu trước khi vào Buffer
         hyper_features = hyper_features.to(self.weight.dtype)
+        
+        # Buffer trả về ReLU(X @ W), forward_fc thực hiện X @ Weight
         logits = self.forward_fc(self.buffer(hyper_features))
         
-        return {
-            'logits': logits
-        }
-
+        return {'logits': logits}
     def extract_feature(self, x):
         """Chỉ trích xuất đặc trưng từ Backbone"""
         return self.backbone(x)
 
     def forward_normal_fc(self, x, new_forward: bool = False):
-        """
-        Dùng cho Training (Gradient Descent).
-        Chạy qua backbone -> Buffer -> Normal FC (trainable).
-        """
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
         
-        hyper_features = self.buffer(hyper_features)
+        # [SỬA]: Buffer thường chứa trọng số FP32, ép hyper_features lên FP32 
+        # để phép nhân trong Buffer diễn ra chính xác trước khi đưa vào Classifier
+        hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
         
-        # Ép kiểu để khớp với Normal FC (có thể là FP16 nếu autocast bật bên ngoài)
+        # Sau đó ép về kiểu của normal_fc (thường là Half nếu dùng autocast)
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         
         logits = self.normal_fc(hyper_features)['logits']
-        
-        return {
-            "logits": logits
-        }
+        return {"logits": logits}
