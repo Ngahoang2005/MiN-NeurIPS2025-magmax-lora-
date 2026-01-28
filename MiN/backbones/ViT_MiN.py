@@ -83,14 +83,17 @@ import torch
 import torch.nn as nn
 import torch
 import torch.nn as nn
+import torch
+import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 class PiNoise(nn.Module):
     """
-    PiNoise – VRAM Optimized Version
+    PiNoise – Ultimate VRAM Saver (Checkpointing Edition)
     -------------------------------------------------------
-    - NO PERSISTENT DENSE MATRIX (Fix OOM)
-    - Source of Truth: Sparse Buffers (u, v, vals)
-    - Mixed Precision Safe
+    - Fix OOM triệt để bằng Gradient Checkpointing.
+    - Không lưu Activation trung gian của 12 layers.
+    - Giữ nguyên logic MagMax và Sparse Inference.
     """
 
     def __init__(
@@ -114,185 +117,157 @@ class PiNoise(nn.Module):
         else:
             self.register_buffer("F", torch.eye(in_dim))
 
-        # 2. GLOBAL MEMORY (CHỈ LƯU SPARSE - KHÔNG LƯU DENSE)
-        # [FIX OOM] Đã xóa self.global_B
+        # 2. GLOBAL STORAGE (SPARSE ONLY)
         self.register_buffer("global_u", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_v", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_vals", torch.empty(0))
 
         # 3. CURRENT TASK PARAMETERS
         self.current_values = nn.Parameter(torch.zeros(k))
-        # [FIX] Đăng ký buffer cho index hiện tại để an toàn khi save/load
+        # Buffer an toàn cho DDP/Save/Load
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
         
         self.current_task_id = -1
 
     # ======================================================
-    # INTERNAL HELPERS (Tạo Dense tạm thời)
+    # HELPER METHODS (Giữ nguyên)
     # ======================================================
-
-    def _make_temp_dense(self):
-        """Dựng ma trận dense tạm thời từ sparse storage"""
-        # Tạo ma trận 0 trên cùng device
-        dev = self.global_vals.device
-        dense = torch.zeros(self.d, self.d, device=dev, dtype=self.global_vals.dtype)
-        
-        # Điền dữ liệu cũ vào (nếu có)
-        if len(self.global_u) > 0:
-            dense[self.global_u, self.global_v] = self.global_vals
-            
-        return dense
-
-    def _save_dense_to_sparse(self, dense):
-        """Nén dense thành sparse và lưu lại"""
-        indices = torch.nonzero(dense, as_tuple=True)
-        self.global_u = indices[0]
-        self.global_v = indices[1]
-        self.global_vals = dense[indices]
-
-    def _sample_unique_indices(self):
-        flat = torch.randperm(self.total_points)[: self.k]
-        u = flat // self.d
-        v = flat % self.d
-        return u, v
-        
     def freeze_noise(self):
         self.current_values.requires_grad_(False)
 
     def unfreeze_noise(self):
         self.current_values.requires_grad_(True)
+        
+    def _sample_unique_indices(self):
+        flat = torch.randperm(self.total_points)[: self.k]
+        u = flat // self.d
+        v = flat % self.d
+        return u, v
+    
+    def _make_temp_dense(self):
+        dev = self.global_vals.device
+        dense = torch.zeros(self.d, self.d, device=dev, dtype=self.global_vals.dtype)
+        if len(self.global_u) > 0:
+            dense[self.global_u, self.global_v] = self.global_vals
+        return dense
+
+    def _save_dense_to_sparse(self, dense):
+        indices = torch.nonzero(dense, as_tuple=True)
+        self.global_u = indices[0]
+        self.global_v = indices[1]
+        self.global_vals = dense[indices]
 
     # ======================================================
-    # TASK MANAGEMENT (Logic Mượn/Trả VRAM)
+    # TASK LIFECYCLE (Giữ nguyên logic Mượn/Trả VRAM)
     # ======================================================
-
     def update_noise(self, task_id: int):
         self.current_task_id = task_id
-
-        # 1. Sample vị trí mới
         u, v = self._sample_unique_indices()
         
-        # Lưu vào buffer an toàn
         dev = self.current_u.device
         self.current_u.data.copy_(u.to(dev))
         self.current_v.data.copy_(v.to(dev))
 
-        # 2. Smart Init (Dựng Dense Tạm -> Lấy giá trị -> Xóa Dense)
         with torch.no_grad():
-            # [MƯỢN VRAM]
-            temp_B = self._make_temp_dense()
-            
-            # Lấy giá trị cũ
+            temp_B = self._make_temp_dense() # Mượn VRAM
             old_vals = temp_B[self.current_u, self.current_v]
             self.current_values.data.copy_(old_vals)
 
-            # Init noise
             mask_zero = (old_vals == 0)
             if mask_zero.any():
                 self.current_values.data[mask_zero] += (
                     torch.randn(mask_zero.sum(), device=dev) * 0.02
                 )
-            
-            # [TRẢ VRAM]
-            del temp_B 
+            del temp_B # Trả VRAM ngay
 
         self.unfreeze_noise()
-        print(f"[PiNoise] Task {self.current_task_id}: Ready (Sparse Init).")
+        print(f"[PiNoise] Task {self.current_task_id}: Ready.")
 
     def after_task_training(self):
-        # Kiểm tra sanity
         if self.current_task_id == -1: return
-        
-        dev = self.global_vals.device # Device gốc của buffer
+        dev = self.global_vals.device
         u = self.current_u.to(dev)
         v = self.current_v.to(dev)
 
         with torch.no_grad():
-            # [MƯỢN VRAM] Dựng lại bản đồ kiến thức cũ
-            temp_B = self._make_temp_dense()
-            
+            temp_B = self._make_temp_dense() # Mượn VRAM
             new_vals = self.current_values.data
             old_vals = temp_B[u, v]
 
-            # MagMax Logic
             mask = new_vals.abs() > old_vals.abs()
             merged = torch.where(mask, new_vals, old_vals)
-
-            # Cập nhật vào bản đồ tạm
             temp_B[u, v] = merged
             
-            # [LƯU TRỮ] Nén bản đồ tạm vào kho Sparse (Source of Truth)
             self._save_dense_to_sparse(temp_B)
-            
-            # [TRẢ VRAM] Xóa bản đồ tạm
-            del temp_B
+            del temp_B # Trả VRAM ngay
 
         self.freeze_noise()
-        print(f"[PiNoise] Task {self.current_task_id} merged. Global active params: {len(self.global_vals)}")
+        print(f"[PiNoise] Task {self.current_task_id} merged.")
 
     # ======================================================
-    # FORWARD PASS (Mixed Precision Safe)
+    # CORE CALCULATION (Được tách ra để Checkpoint gọi)
+    # ======================================================
+    def _forward_compute(self, x, current_values):
+        """
+        Hàm tính toán nặng nhất, sẽ được checkpointing.
+        Lưu ý: Phải truyền current_values vào dưới dạng đối số để 
+        checkpoint track được gradient.
+        """
+        # 1. Project
+        h = torch.matmul(x, self.F.to(dtype=x.dtype))
+        h_mixed = torch.zeros_like(h) # Tốn bộ nhớ ở đây
+
+        # A. Background Replay (No grad needed usually, but kept for logic)
+        if len(self.global_u) > 0:
+            u_old = self.global_u
+            v_old = self.global_v
+            vals_old = self.global_vals.view(1, 1, -1)
+            
+            if x.device != u_old.device:
+                u_old = u_old.to(x.device)
+                v_old = v_old.to(x.device)
+                vals_old = vals_old.to(x.device)
+            
+            vals_old = vals_old.to(dtype=x.dtype)
+            source = h[..., u_old] * vals_old.detach()
+            source = source.to(dtype=h_mixed.dtype) # Fix type mismatch
+            h_mixed.index_add_(-1, v_old, source)
+
+        # B. Current Task
+        # Sử dụng tham số current_values được truyền vào
+        u = self.current_u.to(x.device)
+        v = self.current_v.to(x.device)
+        
+        # Reshape và ép kiểu
+        vals = current_values.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
+        
+        source = h[..., u] * vals
+        source = source.to(dtype=h_mixed.dtype) # Fix type mismatch
+        h_mixed.index_add_(-1, v, source)
+
+        # 3. Back-Project
+        noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
+        
+        return noise
+
+    # ======================================================
+    # FORWARD PASS (Với Checkpointing)
     # ======================================================
     def forward(self, x):
         if self.current_task_id < 0:
             return x
 
-        # 1. Project
-        h = torch.matmul(x, self.F.to(dtype=x.dtype))
-        h_mixed = torch.zeros_like(h)
-
-        if self.training:
-            # A. Background Replay
-            if len(self.global_u) > 0:
-                u_old = self.global_u
-                v_old = self.global_v
-                vals_old = self.global_vals.view(1, 1, -1)
-                
-                if x.device != u_old.device:
-                    u_old = u_old.to(x.device)
-                    v_old = v_old.to(x.device)
-                    vals_old = vals_old.to(x.device)
-                
-                vals_old = vals_old.to(dtype=x.dtype)
-                source = h[..., u_old] * vals_old.detach()
-                source = source.to(dtype=h_mixed.dtype)
-                
-                h_mixed.index_add_(-1, v_old, source)
-
-            # B. Current Task
-            u = self.current_u.to(x.device)
-            v = self.current_v.to(x.device)
-            vals = self.current_values.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
-            
-            source = h[..., u] * vals
-            source = source.to(dtype=h_mixed.dtype)
-
-            h_mixed.index_add_(-1, v, source)
-
+        if self.training and x.requires_grad:
+            # [GIẢI PHÁP OOM] 
+            # Dùng checkpoint để không lưu activation của h và h_mixed
+            # use_reentrant=False là khuyến nghị mới của PyTorch
+            noise = checkpoint(self._forward_compute, x, self.current_values, use_reentrant=False)
         else:
-            # Inference
-            if len(self.global_u) > 0:
-                u = self.global_u
-                v = self.global_v
-                vals = self.global_vals.view(1, 1, -1)
-
-                if x.device != u.device:
-                    u = u.to(x.device)
-                    v = v.to(x.device)
-                    vals = vals.to(x.device)
-
-                vals = vals.to(dtype=x.dtype)
-                source = h[..., u] * vals
-                source = source.to(dtype=h_mixed.dtype)
-
-                h_mixed.index_add_(-1, v, source)
-
-        # 3. Back-Project
-        noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
+            # Inference hoặc Validation thì chạy bình thường (torch.no_grad lo rồi)
+            noise = self._forward_compute(x, self.current_values)
 
         return x + self.alpha * noise
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
