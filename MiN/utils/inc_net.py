@@ -144,7 +144,7 @@ class MiNbaseNet(nn.Module):
         Kích hoạt chế độ Sequential Initialization trong PiNoise.
         """
         for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
+            self.backbone.noise_maker[j].update_noise(task_id=self.cur_task)
 
     def after_task_magmax_merge(self):
         """
