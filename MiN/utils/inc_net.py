@@ -160,20 +160,25 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].unfreeze_noise()
 
     def init_unfreeze(self):
-        # Mở khóa các lớp cần thiết ban đầu
-        for j in range(self.backbone.layer_num):
-            # Unfreeze Noise
+        # [SỬA 1] Tương tự, dùng len(noise_maker)
+        num_layers = len(self.backbone.noise_maker)
+        
+        for j in range(num_layers):
+            # Unfreeze PiNoise (Noise + MLP)
             self.backbone.noise_maker[j].unfreeze_noise()
             
-            # Unfreeze LayerNorms trong từng Block ViT
-            for p in self.backbone.blocks[j].norm1.parameters():
-                p.requires_grad = True
-            for p in self.backbone.blocks[j].norm2.parameters():
-                p.requires_grad = True
+            # Unfreeze LayerNorms trong từng Block ViT (Cần thiết cho Task 0)
+            if hasattr(self.backbone.blocks[j], 'norm1'):
+                for p in self.backbone.blocks[j].norm1.parameters():
+                    p.requires_grad = True
+            if hasattr(self.backbone.blocks[j], 'norm2'):
+                for p in self.backbone.blocks[j].norm2.parameters():
+                    p.requires_grad = True
                 
         # Unfreeze LayerNorm cuối cùng
-        for p in self.backbone.norm.parameters():
-            p.requires_grad = True
+        if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
+            for p in self.backbone.norm.parameters():
+                p.requires_grad = True
     def forward_fc(self, features):
         features = features.to(self.weight.dtype)
         # Classifier chính thức (RLS Weight)

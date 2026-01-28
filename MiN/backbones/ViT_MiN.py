@@ -73,27 +73,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import torch
-import torch.nn as nn
-import torch
-import torch.nn as nn
-import torch
-import torch.nn as nn
-import torch
-import torch.nn as nn
-import torch
-import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 class PiNoise(nn.Module):
     """
-    PiNoise – Ultimate VRAM Saver (Checkpointing Edition)
+    PiNoise – 1D Feature Vector Version (Input [B, D])
     -------------------------------------------------------
-    - Fix OOM triệt để bằng Gradient Checkpointing.
-    - Không lưu Activation trung gian của 12 layers.
-    - Giữ nguyên logic MagMax và Sparse Inference.
+    - Dành cho input (Batch, Dim).
+    - Path 1: Sparse Noise (MagMax protected).
+    - Path 2: Dense MLP (Zero-Init).
+    - Fix OOM & Mixed Precision.
     """
 
     def __init__(
@@ -117,27 +109,36 @@ class PiNoise(nn.Module):
         else:
             self.register_buffer("F", torch.eye(in_dim))
 
-        # 2. GLOBAL STORAGE (SPARSE ONLY)
+        # 2. GLOBAL STORAGE (SPARSE)
         self.register_buffer("global_u", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_v", torch.empty(0, dtype=torch.long))
         self.register_buffer("global_vals", torch.empty(0))
 
         # 3. CURRENT TASK PARAMETERS
         self.current_values = nn.Parameter(torch.zeros(k))
-        # Buffer an toàn cho DDP/Save/Load
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long))
         
         self.current_task_id = -1
 
+        # 4. MLP BRANCH (Input D -> Output D)
+        self.MLP = nn.Linear(in_dim, in_dim)
+        # Zero-Init
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
+
     # ======================================================
-    # HELPER METHODS (Giữ nguyên)
+    # HELPER METHODS
     # ======================================================
     def freeze_noise(self):
         self.current_values.requires_grad_(False)
+        for param in self.MLP.parameters():
+            param.requires_grad_(False)
 
     def unfreeze_noise(self):
         self.current_values.requires_grad_(True)
+        for param in self.MLP.parameters():
+            param.requires_grad_(True)
         
     def _sample_unique_indices(self):
         flat = torch.randperm(self.total_points)[: self.k]
@@ -159,18 +160,19 @@ class PiNoise(nn.Module):
         self.global_vals = dense[indices]
 
     # ======================================================
-    # TASK LIFECYCLE (Giữ nguyên logic Mượn/Trả VRAM)
+    # TASK LIFECYCLE
     # ======================================================
     def update_noise(self, task_id: int):
         self.current_task_id = task_id
-        u, v = self._sample_unique_indices()
         
+        # --- Update Noise Path ---
+        u, v = self._sample_unique_indices()
         dev = self.current_u.device
         self.current_u.data.copy_(u.to(dev))
         self.current_v.data.copy_(v.to(dev))
 
         with torch.no_grad():
-            temp_B = self._make_temp_dense() # Mượn VRAM
+            temp_B = self._make_temp_dense()
             old_vals = temp_B[self.current_u, self.current_v]
             self.current_values.data.copy_(old_vals)
 
@@ -179,10 +181,11 @@ class PiNoise(nn.Module):
                 self.current_values.data[mask_zero] += (
                     torch.randn(mask_zero.sum(), device=dev) * 0.02
                 )
-            del temp_B # Trả VRAM ngay
+            del temp_B
 
+        # --- Update MLP Path (Continual Learning) ---
         self.unfreeze_noise()
-        print(f"[PiNoise] Task {self.current_task_id}: Ready.")
+        print(f"[PiNoise-2D] Task {self.current_task_id}: Ready.")
 
     def after_task_training(self):
         if self.current_task_id == -1: return
@@ -191,7 +194,7 @@ class PiNoise(nn.Module):
         v = self.current_v.to(dev)
 
         with torch.no_grad():
-            temp_B = self._make_temp_dense() # Mượn VRAM
+            temp_B = self._make_temp_dense()
             new_vals = self.current_values.data
             old_vals = temp_B[u, v]
 
@@ -200,29 +203,29 @@ class PiNoise(nn.Module):
             temp_B[u, v] = merged
             
             self._save_dense_to_sparse(temp_B)
-            del temp_B # Trả VRAM ngay
+            del temp_B
 
         self.freeze_noise()
-        print(f"[PiNoise] Task {self.current_task_id} merged.")
+        print(f"[PiNoise-2D] Task {self.current_task_id} merged.")
 
     # ======================================================
-    # CORE CALCULATION (Được tách ra để Checkpoint gọi)
+    # CORE CALCULATION (Adapted for [B, D])
     # ======================================================
-    def _forward_compute(self, x, current_values):
+    def _forward_compute_noise(self, x, current_values):
         """
-        Hàm tính toán nặng nhất, sẽ được checkpointing.
-        Lưu ý: Phải truyền current_values vào dưới dạng đối số để 
-        checkpoint track được gradient.
+        Input x: [B, D]
         """
-        # 1. Project
+        # 1. Project: [B, D] @ [D, D] -> [B, D]
         h = torch.matmul(x, self.F.to(dtype=x.dtype))
-        h_mixed = torch.zeros_like(h) # Tốn bộ nhớ ở đây
+        h_mixed = torch.zeros_like(h)
 
-        # A. Background Replay (No grad needed usually, but kept for logic)
+        # A. Background Replay
         if len(self.global_u) > 0:
             u_old = self.global_u
             v_old = self.global_v
-            vals_old = self.global_vals.view(1, 1, -1)
+            
+            # Reshape [K] -> [1, K] để broadcast với [B, K]
+            vals_old = self.global_vals.view(1, -1) 
             
             if x.device != u_old.device:
                 u_old = u_old.to(x.device)
@@ -230,44 +233,53 @@ class PiNoise(nn.Module):
                 vals_old = vals_old.to(x.device)
             
             vals_old = vals_old.to(dtype=x.dtype)
-            source = h[..., u_old] * vals_old.detach()
-            source = source.to(dtype=h_mixed.dtype) # Fix type mismatch
+            
+            # h[:, u_old] -> Lấy cột, shape [B, K]
+            # vals_old    -> Shape [1, K]
+            # Kết quả     -> [B, K]
+            source = h[:, u_old] * vals_old.detach()
+            source = source.to(dtype=h_mixed.dtype)
+            
+            # Cộng vào h_mixed tại các cột v_old
             h_mixed.index_add_(-1, v_old, source)
 
         # B. Current Task
-        # Sử dụng tham số current_values được truyền vào
         u = self.current_u.to(x.device)
         v = self.current_v.to(x.device)
         
-        # Reshape và ép kiểu
-        vals = current_values.to(device=x.device, dtype=x.dtype).view(1, 1, -1)
+        # Reshape [K] -> [1, K]
+        vals = current_values.to(device=x.device, dtype=x.dtype).view(1, -1)
         
-        source = h[..., u] * vals
-        source = source.to(dtype=h_mixed.dtype) # Fix type mismatch
+        source = h[:, u] * vals
+        source = source.to(dtype=h_mixed.dtype)
         h_mixed.index_add_(-1, v, source)
 
         # 3. Back-Project
         noise = torch.matmul(h_mixed, self.F.t().to(dtype=x.dtype))
-        
         return noise
 
     # ======================================================
-    # FORWARD PASS (Với Checkpointing)
+    # FORWARD PASS
     # ======================================================
     def forward(self, x):
+        """
+        x: [Batch, Dim] (Ví dụ [64, 768])
+        """
         if self.current_task_id < 0:
             return x
 
+        # 1. Nhánh PiNoise
         if self.training and x.requires_grad:
-            # [GIẢI PHÁP OOM] 
-            # Dùng checkpoint để không lưu activation của h và h_mixed
-            # use_reentrant=False là khuyến nghị mới của PyTorch
-            noise = checkpoint(self._forward_compute, x, self.current_values, use_reentrant=False)
+            noise = checkpoint(self._forward_compute_noise, x, self.current_values, use_reentrant=False)
         else:
-            # Inference hoặc Validation thì chạy bình thường (torch.no_grad lo rồi)
-            noise = self._forward_compute(x, self.current_values)
+            noise = self._forward_compute_noise(x, self.current_values)
 
-        return x + self.alpha * noise
+        # 2. Nhánh MLP
+        # Linear([B, D]) -> [B, D]
+        mlp_out = self.MLP(x)
+
+        # 3. Tổng hợp
+        return x + noise + mlp_out
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
