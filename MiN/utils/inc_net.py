@@ -182,50 +182,61 @@ class MiNbaseNet(nn.Module):
         # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight.dtype) 
         return features @ self.weight
-
+# Trong class MiNbaseNet
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Thuật toán Recursive Least Squares (RLS).
-        Cập nhật self.weight và self.R trực tiếp bằng công thức toán học.
+        Phiên bản RLS tối ưu bộ nhớ (Memory-Efficient RLS)
         """
-        # [QUAN TRỌNG] Tắt Autocast để tính toán chính xác cao (FP32)
-        with autocast(enabled=False):
+        # Tắt Autocast để tính toán chính xác FP32 (tránh lỗi Singular Matrix)
+        try:
+            from torch.amp import autocast
+        except ImportError:
+            from torch.cuda.amp import autocast
+
+        with autocast('cuda', enabled=False):
             # 1. Feature Extraction & Expansion
-            X = self.backbone(X).float() # ViT Features
-            X = self.buffer(X)           # Random Expansion -> float32
+            X = self.backbone(X).float() 
+            X = self.buffer(X) 
             
-            # Đưa về cùng device
+            # Đảm bảo cùng device
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
             # 2. Mở rộng chiều của classifier nếu có lớp mới
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.weight.shape[1]:
+                # Trường hợp hiếm: Padding Y cho khớp weight cũ
                 increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. Công thức cập nhật RLS
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
+            # 3. RLS Update (Tối ưu OOM)
+            # Công thức: P = (I + X R X^T)^-1
+            # term kích thước [Batch x Batch]. Nếu Batch lớn (Buffer), cái này rất nặng.
             
-            # Thêm jitter để tránh lỗi ma trận suy biến (Singular Matrix)
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             
-            # Nghịch đảo ma trận
-            K = torch.inverse(term + jitter)
-            
-            # Cập nhật R (Covariance Matrix)
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            
-            # Cập nhật Trọng số Classifier
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+            # Dùng linalg.solve nhanh và ổn định hơn torch.inverse
+            try:
+                # K = (X R X^T + I)^-1 @ (X R)
+                # Kích thước [Batch x Buffer Dim]
+                K = torch.linalg.solve(term + jitter, X @ self.R)
+                K = K.T # Transpose về [Buffer Dim x Batch]
+            except:
+                # Fallback nếu lỗi
+                K = self.R @ X.T @ torch.inverse(term + jitter)
 
-    # =========================================================================
+            # Cập nhật R và Weight
+            self.R -= K @ X @ self.R
+            self.weight += K @ (Y - X @ self.weight)
+            
+            # [QUAN TRỌNG] Xóa ngay lập tức để giải phóng VRAM cho batch sau
+            del term, jitter, K, X, Y    # =========================================================================
     # [FORWARD PASSES]
     # =========================================================================
 
