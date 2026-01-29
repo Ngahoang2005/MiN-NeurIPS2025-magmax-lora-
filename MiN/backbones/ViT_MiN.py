@@ -390,61 +390,67 @@ import torch
 import torch.nn as nn
 import torch.fft
 import math
+import torch
+import torch.nn as nn
+import torch.fft
+import math
 
 class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=3000, alpha=1.0, max_tasks=None):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=2000, alpha=1.0, max_tasks=None):
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.hidden_dim = hidden_dim
         
-        # k chẵn để đảm bảo đối xứng
+        # k chẵn để đối xứng Hermitian
         self.k = (k // 2) * 2 
         self.half_k = self.k // 2
         
         self.alpha = nn.Parameter(torch.tensor(alpha, dtype=torch.float32))
         
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        
-        # 1. MLP (Trainable)
+        # --- 1. MLP (Trainable) ---
         self.MLP = nn.Linear(in_dim, out_dim)
-        nn.init.constant_(self.MLP.weight, 0)
+        nn.init.constant_(self.MLP.weight, 0) 
         nn.init.constant_(self.MLP.bias, 0)
 
-        # 2. Projections
-        self.register_buffer("w_down", torch.empty((in_dim, hidden_dim), device=device))
-        self.register_buffer("w_up", torch.empty((hidden_dim, out_dim), device=device))
+        # --- 2. Projections (Fixed) ---
+        self.register_buffer("w_down", torch.empty((in_dim, hidden_dim)))
+        self.register_buffer("w_up", torch.empty((hidden_dim, out_dim)))
         nn.init.xavier_uniform_(self.w_down)
         nn.init.zeros_(self.w_up)
 
-        # 3. Global Storage (CPU)
-        # Khởi tạo trực tiếp trên CPU
-        self.register_buffer("global_u", torch.empty(0, dtype=torch.long, device='cpu'))
-        self.register_buffer("global_v", torch.empty(0, dtype=torch.long, device='cpu'))
-        self.register_buffer("global_vals", torch.empty(0, 2, dtype=torch.float32, device='cpu'))
+        # --- 3. Global Storage (TUYỆT ĐỐI Ở CPU) ---
+        # Không dùng register_buffer để tránh bị model.to('cuda') kéo đi
+        # Ta dùng self.register_buffer nhưng sẽ override trong _apply
+        self.register_buffer("global_u", torch.empty(0, dtype=torch.long))
+        self.register_buffer("global_v", torch.empty(0, dtype=torch.long))
+        self.register_buffer("global_vals", torch.empty(0, 2, dtype=torch.float32))
 
-        # 4. Current Task (GPU)
-        self.current_vals_real = nn.Parameter(torch.randn(self.half_k, 2, dtype=torch.float32, device=device) * 0.01)
-        self.register_buffer("current_u", torch.zeros(self.k, dtype=torch.long, device=device))
-        self.register_buffer("current_v", torch.zeros(self.k, dtype=torch.long, device=device))
+        # --- 4. Current Task (Trainable - GPU) ---
+        self.current_vals_real = nn.Parameter(torch.randn(self.half_k, 2) * 0.01)
+        self.register_buffer("current_u", torch.zeros(self.k, dtype=torch.long))
+        self.register_buffer("current_v", torch.zeros(self.k, dtype=torch.long))
         
         self.current_task_id = -1
 
+    # [CỰC KỲ QUAN TRỌNG] Ghi đè để khóa Global ở CPU
     def _apply(self, fn):
-        """Khóa cứng Global Storage ở CPU"""
         super()._apply(fn)
-        self.global_u = self.global_u.to('cpu')
-        self.global_v = self.global_v.to('cpu')
-        self.global_vals = self.global_vals.to('cpu')
+        # Ép Global về CPU bất chấp lệnh .cuda() bên ngoài
+        self.global_u = self.global_u.cpu()
+        self.global_v = self.global_v.cpu()
+        self.global_vals = self.global_vals.cpu()
         return self
 
     def update_noise(self, task_id: int):
         self.current_task_id = task_id
         dev = self.current_vals_real.device
         
+        # Tạo index ngẫu nhiên
         u_half = torch.randint(0, self.hidden_dim, (self.half_k,), device=dev)
         v_half = torch.randint(0, self.hidden_dim, (self.half_k,), device=dev)
         
+        # Đối xứng
         u_sym = (self.hidden_dim - u_half) % self.hidden_dim
         v_sym = (self.hidden_dim - v_half) % self.hidden_dim
         
@@ -454,79 +460,97 @@ class PiNoise(nn.Module):
         with torch.no_grad():
             self.current_vals_real.data.normal_(0, 0.02)
         
-        self.unfreeze_incremental() 
-
-    def _get_symmetric_current_vals(self):
-        vals_half = self.current_vals_real
-        vals_sym = torch.stack([vals_half[:, 0], -vals_half[:, 1]], dim=1)
-        return torch.cat([vals_half, vals_sym], dim=0)
+        self.unfreeze_incremental()
 
     def after_task_training(self):
         if self.current_task_id < 0: return
-        
         with torch.no_grad():
-            full_vals = self._get_symmetric_current_vals()
+            # Tạo full values đối xứng
+            vals_half = self.current_vals_real
+            vals_sym = torch.stack([vals_half[:, 0], -vals_half[:, 1]], dim=1)
+            full_vals = torch.cat([vals_half, vals_sym], dim=0)
             
-            # Đẩy về CPU
-            curr_u_cpu = self.current_u.cpu()
-            curr_v_cpu = self.current_v.cpu()
-            curr_vals_cpu = full_vals.data.cpu()
-            
-            self.global_u = torch.cat([self.global_u, curr_u_cpu])
-            self.global_v = torch.cat([self.global_v, curr_v_cpu])
-            self.global_vals = torch.cat([self.global_vals, curr_vals_cpu])
+            # Đẩy về CPU lưu trữ
+            self.global_u = torch.cat([self.global_u, self.current_u.cpu()])
+            self.global_v = torch.cat([self.global_v, self.current_v.cpu()])
+            self.global_vals = torch.cat([self.global_vals, full_vals.data.cpu()])
         
         self.current_vals_real.requires_grad = False
-
-    def _sparse_freq_matmul(self, x_freq, u, v, vals):
-        x_selected = torch.index_select(x_freq, -1, u) 
-        weighted_x = x_selected * vals 
-        out = torch.zeros_like(x_freq)
-        out.index_add_(-1, v, weighted_x)
-        return out
 
     def forward(self, x):
         if self.current_task_id < 0: return x
         
+        # Lưu lại type gốc (thường là float16/bfloat16)
         orig_dtype = x.dtype 
-        
-        # 1. MLP
-        x_mlp = self.MLP(x)
-        
-        # 2. FFT
-        x_f32 = x.to(torch.float32)
-        h = x_f32 @ self.w_down.to(torch.float32)
-        h_freq = torch.fft.fft(h.to(torch.complex64), dim=-1)
-        
-        # 3. Mixing (Current)
-        full_vals_float = self._get_symmetric_current_vals()
-        current_vals_complex = torch.view_as_complex(full_vals_float)
-        out_freq = self._sparse_freq_matmul(h_freq, self.current_u, self.current_v, current_vals_complex)
-        
-        # 4. Mixing (Global - Streaming)
-        if len(self.global_u) > 0:
-            # Chỉ nạp lên GPU một lượng nhỏ cần thiết
-            g_u = self.global_u.to(x.device, non_blocking=True)
-            g_v = self.global_v.to(x.device, non_blocking=True)
-            g_vals = torch.view_as_complex(self.global_vals.to(x.device, non_blocking=True))
-            
-            out_freq_global = self._sparse_freq_matmul(h_freq, g_u, g_v, g_vals)
-            out_freq = out_freq + out_freq_global
-            
-            # Xóa ngay lập tức
-            del g_u, g_v, g_vals, out_freq_global
+        device = x.device
 
-        # 5. IFFT (No GELU)
-        h_out_complex = torch.fft.ifft(out_freq, dim=-1)
-        h_out_real = h_out_complex.real
+        # 1. Nhánh MLP (Giữ nguyên)
+        x_mlp = self.MLP(x)
+
+        # 2. Nhánh FFT (Tối ưu bộ nhớ cục bộ)
+        # Dùng scope con để giải phóng biến tạm 'h', 'h_freq' ngay khi xong
+        def compute_noise(inp):
+            # Casting
+            inp_32 = inp.to(torch.float32)
+            # Projection Down
+            h = inp_32 @ self.w_down.to(device, dtype=torch.float32)
+            
+            # FFT (Tốn bộ nhớ nhất -> Cần giải phóng nhanh)
+            h_freq = torch.fft.fft(h.to(torch.complex64), dim=-1)
+            
+            # -- A. Current Task (GPU) --
+            vals_half = self.current_vals_real
+            vals_sym = torch.stack([vals_half[:, 0], -vals_half[:, 1]], dim=1)
+            full_vals = torch.cat([vals_half, vals_sym], dim=0)
+            cur_vals_c = torch.view_as_complex(full_vals)
+            
+            # Sparse Matmul (Current)
+            # Logic: out[..., v] += h_freq[..., u] * val
+            x_sel = torch.index_select(h_freq, -1, self.current_u)
+            weighted = x_sel * cur_vals_c
+            out_freq = torch.zeros_like(h_freq)
+            out_freq.index_add_(-1, self.current_v, weighted)
+            
+            # Giải phóng biến tạm
+            del x_sel, weighted, full_vals, cur_vals_c
+
+            # -- B. Global History (STREAMING TỪ CPU) --
+            if len(self.global_u) > 0:
+                # [KỸ THUẬT QUAN TRỌNG] Chunking
+                # Nếu global quá lớn, ta chia nhỏ ra để đưa lên GPU từng chút một
+                # Ở đây giả sử RAM GPU chịu được 1 cục, nhưng phải xóa ngay.
+                
+                # 1. Load từ CPU -> GPU (Non-blocking để nhanh hơn)
+                g_u = self.global_u.to(device, non_blocking=True)
+                g_v = self.global_v.to(device, non_blocking=True)
+                g_vals_float = self.global_vals.to(device, non_blocking=True)
+                g_vals_c = torch.view_as_complex(g_vals_float)
+                
+                # 2. Tính toán
+                x_sel_g = torch.index_select(h_freq, -1, g_u)
+                weighted_g = x_sel_g * g_vals_c
+                out_freq.index_add_(-1, g_v, weighted_g)
+                
+                # 3. [XÓA NGAY LẬP TỨC]
+                del g_u, g_v, g_vals_float, g_vals_c, x_sel_g, weighted_g
+            
+            # IFFT
+            h_out_c = torch.fft.ifft(out_freq, dim=-1)
+            
+            # Chỉ lấy phần thực và trả về
+            return h_out_c.real
+
+        # Gọi hàm tính noise
+        noise_real = compute_noise(x)
         
-        bilora_out = h_out_real @ self.w_up.to(torch.float32)
+        # Projection Up
+        bilora_out = noise_real @ self.w_up.to(device, dtype=torch.float32)
         
-        # Auto-Scaling
+        # Scaling
         num_tasks = max(1, len(self.global_u) // self.k + 1)
-        scale_factor = 1.0 / math.sqrt(num_tasks)
+        scale = 1.0 / math.sqrt(num_tasks)
         
-        return x_mlp + (self.alpha * scale_factor) * bilora_out.to(orig_dtype) + x
+        return x_mlp + (self.alpha * scale) * bilora_out.to(orig_dtype) + x
 
     def unfreeze_task_0(self):
         for p in self.MLP.parameters(): p.requires_grad = True
@@ -535,7 +559,6 @@ class PiNoise(nn.Module):
     def unfreeze_incremental(self):
         for p in self.MLP.parameters(): p.requires_grad = True
         self.current_vals_real.requires_grad = True
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
@@ -1158,19 +1181,6 @@ class VisionTransformer(nn.Module):
             return tuple(zip(outputs, prefix_tokens))
         return tuple(outputs)
 
-    # def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
-    #     x = self.patch_embed(x)
-    #     x = self._pos_embed(x)
-    #     x = self.patch_drop(x)
-    #     x = self.norm_pre(x)
-
-    #     for i in range(len(self.blocks)):
-    #         if new_forward:
-    #             x = self.noise_maker[i].forward_new(self.blocks[i](x))
-    #         else:
-    #             x = self.noise_maker[i](self.blocks[i](x))
-    #     x = self.norm(x)
-    #     return x
     def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
         x = self.patch_embed(x)
         x = self._pos_embed(x)
@@ -1178,31 +1188,44 @@ class VisionTransformer(nn.Module):
         x = self.norm_pre(x)
 
         for i in range(len(self.blocks)):
-            # --- BƯỚC 1: Checkpoint khối ViT Block (Attention + MLP) ---
-            if self.training:
-                # use_reentrant=False là chuẩn mới, ổn định hơn
-                x = checkpoint(self.blocks[i], x, use_reentrant=False)
+            if new_forward:
+                x = self.noise_maker[i].forward_new(self.blocks[i](x))
             else:
-                x = self.blocks[i](x)
-
-            # --- BƯỚC 2: Checkpoint khối PiNoise (FFT + BiLoRA) ---
-            # Vì FFT sinh ra tensor phức (Complex64) rất nặng, cần checkpoint luôn đoạn này
-            if self.training:
-                if new_forward:
-                    # Checkpoint hàm forward_new
-                    x = checkpoint(self.noise_maker[i].forward_new, x, use_reentrant=False)
-                else:
-                    # Checkpoint hàm forward thường
-                    x = checkpoint(self.noise_maker[i], x, use_reentrant=False)
-            else:
-                # Chế độ Eval (Validation/Test) thì chạy bình thường
-                if new_forward:
-                    x = self.noise_maker[i].forward_new(x)
-                else:
-                    x = self.noise_maker[i](x)
-
+                x = self.noise_maker[i](self.blocks[i](x))
         x = self.norm(x)
         return x
+    # def forward_features(self, x: torch.Tensor, new_forward: bool = False) -> torch.Tensor:
+    #     x = self.patch_embed(x)
+    #     x = self._pos_embed(x)
+    #     x = self.patch_drop(x)
+    #     x = self.norm_pre(x)
+
+    #     for i in range(len(self.blocks)):
+    #         # --- BƯỚC 1: Checkpoint khối ViT Block (Attention + MLP) ---
+    #         if self.training:
+    #             # use_reentrant=False là chuẩn mới, ổn định hơn
+    #             x = checkpoint(self.blocks[i], x, use_reentrant=False)
+    #         else:
+    #             x = self.blocks[i](x)
+
+    #         # --- BƯỚC 2: Checkpoint khối PiNoise (FFT + BiLoRA) ---
+    #         # Vì FFT sinh ra tensor phức (Complex64) rất nặng, cần checkpoint luôn đoạn này
+    #         if self.training:
+    #             if new_forward:
+    #                 # Checkpoint hàm forward_new
+    #                 x = checkpoint(self.noise_maker[i].forward_new, x, use_reentrant=False)
+    #             else:
+    #                 # Checkpoint hàm forward thường
+    #                 x = checkpoint(self.noise_maker[i], x, use_reentrant=False)
+    #         else:
+    #             # Chế độ Eval (Validation/Test) thì chạy bình thường
+    #             if new_forward:
+    #                 x = self.noise_maker[i].forward_new(x)
+    #             else:
+    #                 x = self.noise_maker[i](x)
+
+    #     x = self.norm(x)
+    #     return x
 
     def forward_head(self, x: torch.Tensor, pre_logits: bool = False) -> torch.Tensor:
         if self.attn_pool is not None:
