@@ -234,7 +234,7 @@ import math
 from torch.utils.checkpoint import checkpoint
 
 class PiNoise(torch.nn.Linear):
-    def __init__(self, in_dim, out_dim, hidden_dim=384, k=3000, alpha=0.1, max_tasks=40):
+    def __init__(self, in_dim, out_dim, hidden_dim=384, k=1000, alpha=0.1, max_tasks=40):
         super(torch.nn.Linear, self).__init__()
         self.bias = None
         self.d = in_dim
@@ -323,8 +323,8 @@ class PiNoise(torch.nn.Linear):
             dense[self.current_u, self.current_v] = self.current_values.data
             
             indices = torch.nonzero(dense, as_tuple=True)
-            self.global_u, self.global_v = indices[0], indices[1]
-            self.global_vals = dense[indices]
+            self.global_u, self.global_v = indices[0].to('cpu'), indices[1].to('cpu')
+            self.global_vals = dense[indices].to('cpu')
         self.freeze_noise()
 
     def _forward_compute_noise(self, x, current_values):
@@ -335,10 +335,14 @@ class PiNoise(torch.nn.Linear):
 
         # Quá khứ
         if len(self.global_u) > 0:
-            v_old = self.global_vals.view(*view_shape).to(x.dtype)
-            source_old = (h_rot[..., self.global_u] * v_old).to(h_mixed.dtype)
-            h_mixed.index_add_(-1, self.global_v, source_old)
-            
+            u_gpu = self.global_u.to(x.device)
+            v_gpu = self.global_v.to(x.device)
+            vals_gpu = self.global_vals.to(x.device)
+            v_old = vals_gpu.view(*view_shape).to(x.dtype)
+            source_old = (h_rot[..., u_gpu] * v_old).to(h_mixed.dtype)
+            h_mixed.index_add_(-1, v_gpu, source_old)
+
+            del u_gpu, v_gpu, vals_gpu
         # Hiện tại
         v_curr = current_values.view(*view_shape).to(x.dtype)
         source_curr = (h_rot[..., self.current_u] * v_curr).to(h_mixed.dtype)
