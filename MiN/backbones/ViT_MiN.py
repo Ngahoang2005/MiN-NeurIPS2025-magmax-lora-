@@ -387,20 +387,12 @@ from torch.utils.checkpoint import checkpoint
 # chuẩn bilora hơnimport torch
 import torch.nn as nn
 import torch.fft
+import torch
+import torch.nn as nn
+import torch.fft
 
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=384, k=1000, alpha=1.0):
-        """
-        PiNoise (Powered by BiLoRA Engine): 
-        Frequency Domain Sparse Adaptation for Continual Learning.
-        
-        Args:
-            in_dim: Input dimension của ViT (ví dụ 768)
-            out_dim: Output dimension (ví dụ 768)
-            hidden_dim: Dimension của không gian tần số (thường là 384 hoặc 768)
-            k: Số lượng tham số phức (Complex Parameters) cho mỗi Task.
-            alpha: Scaling factor cho nhánh Noise.
-        """
         super(PiNoise, self).__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
@@ -410,135 +402,106 @@ class PiNoise(nn.Module):
         
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         
-        # --- 1. Nhánh MLP (Base Classifier / Adapter) ---
-        # Task 0 sẽ train nhánh này, Task > 0 sẽ freeze nó.
+        # 1. Nhánh MLP
         self.MLP = nn.Linear(in_dim, out_dim)
         nn.init.constant_(self.MLP.weight, 0)
         nn.init.constant_(self.MLP.bias, 0)
 
-        # --- 2. Projections (Spatial <-> Latent) ---
-        # Fixed Random Orthogonal Projections (Buffer để tiết kiệm bộ nhớ optimizer)
+        # 2. Projections
         self.register_buffer("w_down", torch.empty((in_dim, hidden_dim), device=device))
         self.register_buffer("w_up", torch.empty((hidden_dim, out_dim), device=device))
-        
-        # Khởi tạo Xavier để bảo toàn phương sai tín hiệu
         nn.init.xavier_uniform_(self.w_down)
-        nn.init.zeros_(self.w_up) # Init 0 để bắt đầu giống Identity
+        nn.init.zeros_(self.w_up)
 
-        # --- 3. GLOBAL SPARSE STORAGE (CPU) ---
-        # Lưu trữ lịch sử của tất cả các task trước đó trên CPU để tránh OOM
+        # 3. Global Storage (Vẫn lưu Complex trên CPU ok vì không dùng GradScaler trên CPU)
         self.register_buffer("global_u", torch.empty(0, dtype=torch.long, device='cpu'))
         self.register_buffer("global_v", torch.empty(0, dtype=torch.long, device='cpu'))
         self.register_buffer("global_vals", torch.empty(0, dtype=torch.complex64, device='cpu'))
 
-        # --- 4. CURRENT TASK PARAMETERS (GPU - Trainable) ---
-        # Tham số phức (Complex64) để học Phase + Magnitude
-        self.current_vals = nn.Parameter(torch.randn(k, dtype=torch.complex64, device=device) * 0.01)
+        # 4. CURRENT TASK PARAMETERS (SỬA ĐỔI QUAN TRỌNG)
+        # Thay vì complex64, ta dùng float32 shape (k, 2)
+        # [:, 0] là phần thực, [:, 1] là phần ảo.
+        # GradScaler sẽ coi đây là float thường -> Hết lỗi.
+        self.current_vals_real = nn.Parameter(torch.randn(k, 2, dtype=torch.float32, device=device) * 0.01)
         
-        # Indices (u, v) cố định cho task hiện tại
         self.register_buffer("current_u", torch.zeros(k, dtype=torch.long, device=device))
         self.register_buffer("current_v", torch.zeros(k, dtype=torch.long, device=device))
         
         self.current_task_id = -1
 
     def update_noise(self, task_id: int):
-        """
-        Khởi tạo task mới:
-        - Chọn ngẫu nhiên k vị trí trong không gian tần số (Probabilistic Orthogonality).
-        - Reset tham số về noise nhỏ.
-        """
         self.current_task_id = task_id
         
-        # 1. Chọn Indices ngẫu nhiên trên toàn không gian Hidden x Hidden
-        # Không còn giới hạn 'zone' hay 'max_tasks'.
-        u_idx = torch.randint(0, self.hidden_dim, (self.k,), device=self.current_vals.device)
-        v_idx = torch.randint(0, self.hidden_dim, (self.k,), device=self.current_vals.device)
+        # 1. Random Indices
+        u_idx = torch.randint(0, self.hidden_dim, (self.k,), device=self.current_vals_real.device)
+        v_idx = torch.randint(0, self.hidden_dim, (self.k,), device=self.current_vals_real.device)
         
         self.current_u.copy_(u_idx)
         self.current_v.copy_(v_idx)
 
-        # 2. Reset giá trị tham số (Complex Noise)
+        # 2. Reset giá trị (Reset trên bản float)
         with torch.no_grad():
-            self.current_vals.data.normal_(0, 0.02)      # Phần thực
-            self.current_vals.data.imag.normal_(0, 0.02) # Phần ảo
+            self.current_vals_real.data.normal_(0, 0.02) 
         
-        # Mở khóa gradient cho task mới
         self.unfreeze_incremental()
         if task_id == 0:
             self.unfreeze_task_0()
 
     def after_task_training(self):
-        """Merge tham số task hiện tại vào bộ nhớ chung trên CPU"""
         if self.current_task_id < 0: return
         
         with torch.no_grad():
-            # Đẩy về CPU
             curr_u_cpu = self.current_u.cpu()
             curr_v_cpu = self.current_v.cpu()
-            curr_vals_cpu = self.current_vals.data.cpu()
             
-            # Nối vào danh sách Global
+            # Convert từ (K, 2) float -> (K) complex trước khi lưu vào Global
+            # Để tiết kiệm bộ nhớ cho Global Storage
+            vals_complex = torch.view_as_complex(self.current_vals_real.data)
+            curr_vals_cpu = vals_complex.cpu()
+            
             self.global_u = torch.cat([self.global_u, curr_u_cpu])
             self.global_v = torch.cat([self.global_v, curr_v_cpu])
             self.global_vals = torch.cat([self.global_vals, curr_vals_cpu])
         
-        # Freeze tham số hiện tại để bảo vệ
-        self.current_vals.requires_grad = False
+        self.current_vals_real.requires_grad = False
 
     def _sparse_freq_matmul(self, x_freq, u, v, vals):
-        """
-        Thực hiện phép nhân ma trận thưa trong miền tần số: Y = X @ B
-        Args:
-            x_freq: [Batch, Tokens, Hidden] (Complex)
-            u, v: Indices [K]
-            vals: Weights [K] (Complex)
-        """
-        # 1. Gather: Lấy các cột tần số Input theo chỉ số u
-        # x_freq: [B, T, H] -> x_selected: [B, T, K]
-        x_selected = torch.index_select(x_freq, -1, u) 
+        # x_freq: [B, T, H] (Complex)
+        # vals: [K] (Complex)
         
-        # 2. Modulate: Nhân với trọng số phức (trộn biên độ và pha)
+        x_selected = torch.index_select(x_freq, -1, u) 
         weighted_x = x_selected * vals 
         
-        # 3. Scatter: Cộng dồn vào các cột tần số Output theo chỉ số v
         out = torch.zeros_like(x_freq)
         out.index_add_(-1, v, weighted_x)
-        
         return out
 
     def forward(self, x):
-        """
-        Forward pass với Type Safety tuyệt đối.
-        Luồng: Input(Any) -> Float32 -> FFT(Complex) -> Mixing -> IFFT -> Float32 -> Output(Any)
-        """
         if self.current_task_id < 0: return x
         
-        # Lưu kiểu dữ liệu gốc (ví dụ float16)
         orig_dtype = x.dtype 
-        
-        # 1. Nhánh MLP (Chạy trên dtype gốc của x)
         x_mlp = self.MLP(x)
         
-        # 2. Nhánh BiLoRA (Frequency Domain)
-        
-        # [Bước 1] Projection xuống Hidden Dim
-        # Cast sang float32 để đảm bảo độ chính xác cho phép nhân và FFT sau này
+        # --- BiLoRA Branch ---
         x_f32 = x.to(torch.float32)
         h = x_f32 @ self.w_down.to(torch.float32)
         
-        # [Bước 2] FFT: Chuyển sang miền tần số (Complex64)
+        # FFT
         h_freq = torch.fft.fft(h.to(torch.complex64), dim=-1)
         
-        # [Bước 3] Sparse Mixing (Current Task)
+        # [QUAN TRỌNG] Tạo view Complex từ Float Parameter
+        # GradScaler sẽ theo dõi current_vals_real (float), phép view này chỉ là logic
+        current_vals_complex = torch.view_as_complex(self.current_vals_real)
+        
+        # Mixing (Current)
         out_freq = self._sparse_freq_matmul(
             h_freq, 
             self.current_u, 
             self.current_v, 
-            self.current_vals
+            current_vals_complex
         )
         
-        # [Bước 4] Sparse Mixing (Global History)
-        # Chỉ nạp lên GPU khi cần thiết để tránh OOM
+        # Mixing (Global)
         if len(self.global_u) > 0:
             g_u = self.global_u.to(x.device)
             g_v = self.global_v.to(x.device)
@@ -546,38 +509,24 @@ class PiNoise(nn.Module):
             
             out_freq_global = self._sparse_freq_matmul(h_freq, g_u, g_v, g_vals)
             out_freq = out_freq + out_freq_global
-            
-            # Dọn dẹp bộ nhớ ngay lập tức
             del g_u, g_v, g_vals, out_freq_global
 
-        # [Bước 5] IFFT: Chuyển về miền không gian & Projection lên Output
-        # IFFT trả về Complex -> Lấy phần thực (.real)
+        # IFFT
         h_out_complex = torch.fft.ifft(out_freq, dim=-1)
         h_out_real = h_out_complex.real 
         
-        # Projection Up
         bilora_out = h_out_real @ self.w_up.to(torch.float32)
-        
-        # [Bước 6] Cast về kiểu dữ liệu gốc (để cộng với x_mlp)
         bilora_out = bilora_out.to(orig_dtype)
         
-        # Residual Connection
-        return x_mlp +  bilora_out + x
+        return x_mlp + self.alpha * bilora_out + x
 
-    # --- Gradient Management ---
-    
     def unfreeze_task_0(self):
-        """Task 0: Train cả MLP và Noise"""
         for p in self.MLP.parameters(): p.requires_grad = True
-        self.current_vals.requires_grad = True
+        self.current_vals_real.requires_grad = True
 
     def unfreeze_incremental(self):
-        """Task > 0: Freeze MLP, chỉ train Noise"""
         for p in self.MLP.parameters(): p.requires_grad = False
-        self.current_vals.requires_grad = True
-
-
-
+        self.current_vals_real.requires_grad = True
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
