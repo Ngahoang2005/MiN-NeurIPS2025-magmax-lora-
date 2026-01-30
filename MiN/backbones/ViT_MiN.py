@@ -402,58 +402,70 @@ class PiNoise(nn.Module):
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
 
-    def compute_projection_matrix(self, threshold=0.95):
+    def compute_projection_matrix(self, threshold=0.95): # [KHUYÊN: Giảm Threshold xuống nếu bỏ Limit]
         """
-        [FIX OOM 2]: Tính Covariance Matrix theo kiểu Streaming (Cộng dồn)
-        Không bao giờ tạo tensor khổng lồ chứa toàn bộ dữ liệu.
+        Phiên bản No-Limit: Tự do chọn số chiều dựa trên năng lượng thông tin.
         """
         if not self.feature_cache: return
         
-        # Khởi tạo ma trận tương quan [Hidden, Hidden] trên CPU
-        # Kích thước cố định [192, 192], rất nhẹ
-        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim)
+        # 1. Tính Covariance Matrix (Streaming - Tiết kiệm RAM)
+        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(self.w_down.device)
         
-        # Duyệt từng batch trong cache để cộng dồn
+        # Nếu feature_cache đang ở CPU thì chuyển batch lên GPU để nhân cho nhanh
+        # Hoặc tính tại CPU cũng được (an toàn hơn cho VRAM)
+        device = self.w_down.device
+        
         for batch in self.feature_cache:
-            # 1. Reshape 3D -> 2D
-            if batch.dim() > 2:
-                batch = batch.reshape(-1, batch.shape[-1])
+            # batch đang ở CPU, float32
+            b = batch.to(device) # Đưa lên GPU tính cho lẹ
             
-            # 2. Cộng dồn: C += X^T * X
-            # batch.t() @ batch chỉ tốn bộ nhớ cục bộ cho 1 batch
-            correlation_matrix += batch.t() @ batch
+            if b.dim() > 2:
+                b = b.reshape(-1, b.shape[-1])
+            
+            correlation_matrix += b.t() @ b
+            del b # Xóa ngay trên GPU
         
-        # Xóa cache ngay lập tức để giải phóng RAM
+        # Xóa cache RAM
         self.feature_cache = [] 
         import gc; gc.collect()
 
-        # --- Phần sau giữ nguyên logic SVD ---
-        # SVD trên ma trận [192, 192] -> Cực nhanh
-        U_new, S_new, _ = torch.svd(correlation_matrix)
+        # 2. SVD
+        # U, S, V = torch.svd(correlation_matrix) # Cách cũ
+        # Cách mới ổn định hơn:
+        U_new, S_new, _ = torch.linalg.svd(correlation_matrix)
         
+        # 3. Chọn k dựa trên Threshold (BỎ LIMIT)
         total_var = torch.sum(S_new)
         s_cumsum = torch.cumsum(S_new, dim=0)
+        
+        # Tìm vị trí k thỏa mãn threshold
         k_threshold = torch.searchsorted(s_cumsum, total_var * threshold).item()
         
-        # Hard limit cho Dim 192
-        k_final = min(k_threshold, 65) # Limit 65 chiều/task
+        # [ĐÃ BỎ LIMIT 65]
+        # k_final = min(k_threshold, 65) -> BỎ DÒNG NÀY
+        k_final = k_threshold
 
-        print(f"--> GPM: Selected {k_final+1} dims (Threshold {threshold})")
+        print(f"--> GPM Selection: Task này chiếm {k_final+1}/{self.hidden_dim} chiều (Threshold {threshold})")
 
-        U_task = U_new[:, :k_final+1].to(self.memory_U.device)
+        # 4. Cập nhật Memory
+        U_task = U_new[:, :k_final+1] # Giữ nguyên device
 
-        # Merge Memory
         if self.memory_U.shape[1] == 0:
             self.memory_U = U_task
         else:
             combined_U = torch.cat([self.memory_U, U_task], dim=1)
-            U_final, _, _ = torch.svd(combined_U)
-            max_capacity = 170
-            final_k = min(U_final.shape[1], max_capacity)
+            
+            # Trực giao hóa lại
+            U_final, _, _ = torch.linalg.svd(combined_U, full_matrices=False)
+            
+            # Giữ lại tối đa không gian (nhưng không vượt quá hidden_dim)
+            # Logic: Giữ rank bằng đúng rank của combined
+            # Hoặc giới hạn trần mềm để tránh crash (ví dụ max 190)
+            final_k = min(U_final.shape[1], self.hidden_dim) 
+            
             self.memory_U = U_final[:, :final_k]
 
-        print(f"GPM Updated: Memory Rank = {self.memory_U.shape[1]}/{self.hidden_dim}")
-
+        print(f"GPM Updated: Total Memory Rank = {self.memory_U.shape[1]}/{self.hidden_dim}")
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
