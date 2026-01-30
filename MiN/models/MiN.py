@@ -195,6 +195,7 @@ class MinNet(object):
         self._clear_gpu()
 
         self.run(train_loader)
+        self._network.collect_projections()
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -322,7 +323,15 @@ class MinNet(object):
                         loss = F.cross_entropy(logits, targets.long()) 
                         logits_final = logits
 
+        
                 self.scaler.scale(loss).backward()
+                if self.cur_task > 0:
+                    # Unscale gradient trước khi thực hiện phép toán ma trận
+                    self.scaler.unscale_(optimizer)
+                    
+                    # Gọi hàm chiếu gradient đã định nghĩa trong IncNet
+                    # Hàm này sẽ duyệt qua các layer PiNoise và ép gradient trực giao với basis
+                    self._network.apply_gpm_to_grads()
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
