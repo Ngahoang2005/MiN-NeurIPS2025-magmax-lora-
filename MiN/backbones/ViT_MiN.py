@@ -194,7 +194,7 @@ class PiNoise(nn.Module):
             if self.sigma.weight.grad is not None:
                 self.sigma.weight.grad -= self.sigma.weight.grad @ self.basis
 
-    def compute_projection_matrix(self, threshold=0.99):
+    def compute_projection_matrix(self, threshold=0.95):
         """SVD để tìm không gian con quan trọng của task vừa học"""
         if not self.feature_cache: return
         
