@@ -662,7 +662,7 @@ class VisionTransformer(nn.Module):
             )
             for i in range(depth)])
         self.noise_maker = nn.Sequential(*[
-            PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
+            PiNoise(768, 768, 192) for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 
