@@ -460,8 +460,9 @@ class PiNoise(nn.Module):
     def unfreeze_noise(self): self.update_noise()
     
     def unfreeze_task_0(self):
-        for param in self.parameters():
-            param.requires_grad = True
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
+        
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
@@ -472,10 +473,14 @@ class PiNoise(nn.Module):
         # [CẢNH BÁO]: Việc bật MLP train ở đây có thể gây OOM VRAM 
         # vì nó tạo ra Optimizer State cho toàn bộ MLP.
         # Nếu muốn tiết kiệm VRAM tối đa, hãy cân nhắc đóng băng MLP.
-        self.MLP.requires_grad_(True) 
+        # self.MLP.requires_grad_(True) 
         
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
+
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
