@@ -189,6 +189,35 @@ class PiNoise(nn.Module):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
     def unfreeze_noise(self): self.update_noise()
+    # Trong class PiNoise
+
+    def unfreeze_task_0(self):
+        """
+        Tại Task 0, bạn có thể cho phép học mạnh hơn để khởi tạo base.
+        Tuy nhiên, w_down/w_up thường được khởi tạo ngẫu nhiên cố định.
+        """
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
+        # Tùy chọn: Task 0 có thể cho học MLP để thích nghi ban đầu
+        self.MLP.weight.requires_grad = True 
+        
+        # Luôn freeze w_down/w_up nếu muốn giữ đúng lý thuyết MiN 
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
+
+    def unfreeze_incremental(self):
+        """
+        Tại Task > 0: Chỉ mu và sigma được học[cite: 204].
+        Backbone và các bộ chiếu (w_down, w_up) phải đóng băng tuyệt đối.
+        """
+        # Chỉ mở gradient cho mu và sigma
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
+        
+        # Khóa toàn bộ phần còn lại
+        self.MLP.weight.requires_grad = True 
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
