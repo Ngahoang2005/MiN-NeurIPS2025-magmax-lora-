@@ -96,8 +96,7 @@ class PiNoise(nn.Module):
         self.history_mu = []    
         self.history_sigma = [] 
         
-        self.register_buffer('basis', torch.zeros(hidden_dim, hidden_dim, dtype=torch.float32))
-        # feature_cache: Dùng để thu thập activation trong quá trình train
+        self.register_buffer('memory_U', torch.zeros(hidden_dim, 0))
         self.feature_cache = []
 
     def _init_zero(self, module):
@@ -185,62 +184,97 @@ class PiNoise(nn.Module):
         noise = self.mu(x_down) + self.sigma(x_down)
         
         return x1 + (noise @ self.w_up) + hyper_features
-    def apply_gradient_projection(self):
-        """Chiếu gradient của mu và sigma trực giao với tri thức cũ"""
-        if torch.sum(self.basis) == 0: return
-        with torch.no_grad():
-            if self.mu.weight.grad is not None:
-                self.mu.weight.grad -= self.mu.weight.grad @ self.basis
-            if self.sigma.weight.grad is not None:
-                self.sigma.weight.grad -= self.sigma.weight.grad @ self.basis
 
-    def compute_projection_matrix(self, threshold=0.95): # Nên đổi từ 0.99 sang 0.95
-        """SVD để tìm không gian con quan trọng của task vừa học"""
+
+    def apply_gradient_projection(self):
+        """
+        Chiếu gradient trực giao với không gian bộ nhớ (Core Subspace).
+        Công thức chuẩn: g_proj = g - g @ P = g - g @ (U @ U.T) = g - (g @ U) @ U.T
+        """
+        # Nếu chưa có ký ức gì thì thôi
+        if self.memory_U.shape[1] == 0: return
+
+        with torch.no_grad():
+            U = self.memory_U  # [H, k]
+            
+            # Hàm chiếu nội bộ để tái sử dụng
+            def project_grad(weight):
+                if weight.grad is not None:
+                    # 1. Chiếu grad lên không gian U: [H, H] @ [H, k] -> [H, k]
+                    # Lưu ý: weight.grad là [Out, In] hay [H, H]? 
+                    # Trong PiNoise (Linear), weight là [H, H].
+                    
+                    # Grad @ U -> Tìm thành phần của Grad nằm trong không gian U
+                    # inner = weight.grad @ U  <-- SAI: Linear grad shape là [Out, In]
+                    # Ta cần chiếu row-space hoặc col-space tùy bài toán.
+                    # Với GPM cho Linear layer, thường ta chiếu input space (Row space).
+                    
+                    # Công thức đúng cho Linear Layer GPM:
+                    # Grad_new = Grad - Grad @ (U @ U.T)
+                    
+                    g_inner = weight.grad @ U # [H, H] x [H, k] -> [H, k]
+                    g_proj = g_inner @ U.t()  # [H, k] x [k, H] -> [H, H]
+                    
+                    weight.grad -= g_proj
+
+            project_grad(self.mu.weight)
+            project_grad(self.sigma.weight)
+
+    def compute_projection_matrix(self, threshold=0.95): # Dùng 0.95 như đã bàn
+        """Cập nhật bộ nhớ U dựa trên Task vừa học"""
         if not self.feature_cache: return
         
-        # 1. Chuyển list tensor thành ma trận lớn trên CPU
-        # feat lúc này thường là [N_batches, Batch_size, Tokens, Dim] hoặc tương tự
+        # 1. Lấy dữ liệu và Reshape đúng logic 2D
         feat = torch.cat(self.feature_cache, dim=0) 
-        self.feature_cache = [] # Xóa cache ngay để giải phóng RAM
+        self.feature_cache = [] 
         
-        # [QUAN TRỌNG: FIX LỖI 3D]
-        # Nếu feat là [Samples, Tokens, Dim] -> Gộp Samples và Tokens lại thành 2D
-        if feat.dim() == 3:
+        # [FIX 3D TENSOR]
+        if feat.dim() > 2:
             feat = feat.reshape(-1, feat.shape[-1])
-        elif feat.dim() == 4: # Trường hợp đặc biệt nếu cache giữ nguyên batch
-            feat = feat.reshape(-1, feat.shape[-1])
+            
+        # 2. Tính SVD để tìm U_new của task hiện tại
+        # Dùng addmm hoặc mm cho nhanh
+        # out = feat.t() @ feat
+        # U, S, V = torch.svd(out)
+        
+        # TỐI ƯU: Dùng svd_lowrank hoặc PCA nếu feat quá lớn, 
+        # nhưng với hidden_dim=192 thì torch.svd(feat.t() @ feat) vẫn rất nhanh.
+        correlation_matrix = feat.t() @ feat
+        U_new, S_new, _ = torch.svd(correlation_matrix)
+        
+        # 3. Chọn k vector dựa trên threshold
+        s_cumsum = torch.cumsum(S_new, dim=0)
+        total_var = torch.sum(S_new)
+        k_idx = torch.searchsorted(s_cumsum, total_var * threshold).item()
+        
+        # Lấy Basis mới (U_task)
+        U_task = U_new[:, :k_idx+1] # [H, k_new]
+        U_task = U_task.to(self.memory_U.device)
 
-        # 2. Tính ma trận hiệp phương sai trên CPU (feat giờ đã là 2D)
-        # out sẽ có kích thước [192, 192] vì hidden_dim của bạn là 192
-        out = feat.t() @ feat
-        
-        # 3. Phân rã giá trị đặc dị (SVD)
-        U, S, V = torch.svd(out)
-        
-        # 4. Tính toán số chiều k dựa trên threshold
-        s_sum = torch.sum(S)
-        s_cum = torch.cumsum(S, dim=0)
-        # searchsorted tìm vị trí mà tại đó tổng phương sai đạt threshold%
-        k = torch.searchsorted(s_cum, s_sum * threshold).item()
-        
-        # In ra để bạn debug:
-        print(f"--> GPM: Task vừa học chiếm {k+1}/192 chiều không gian (Threshold {threshold})")
-        
-        new_basis = U[:, :k+1]
-
-        # 5. Đưa basis lên thiết bị của model (GPU) và cập nhật không gian cấm
-        new_basis = new_basis.to(self.basis.device)
-
-        if torch.sum(self.basis) == 0:
-            self.basis = new_basis @ new_basis.t()
+        # 4. CẬP NHẬT BỘ NHỚ (Merge U_old và U_task)
+        if self.memory_U.shape[1] == 0:
+            self.memory_U = U_task
         else:
-            # Gộp Basis cũ và mới, sau đó trực giao hóa lại bằng SVD
-            combined = torch.cat([self.basis, new_basis], dim=1)
-            U_c, _, _ = torch.svd(combined)
-            # Giới hạn không gian để không bị đầy (Saturation)
-            # Với Dim 192, không nên để basis chiếm quá 170 chiều
-            max_k = min(combined.shape[1], 170) 
-            self.basis = U_c[:, :max_k] @ U_c[:, :max_k].t()
+            # [LOGIC ĐÚNG]: Concat các BASIS cột lại với nhau
+            combined_U = torch.cat([self.memory_U, U_task], dim=1) # [H, k_old + k_new]
+            
+            # Trực giao hóa lại (Re-orthogonalization) bằng SVD
+            # Vì combined_U có kích thước [192, k_total] (khá nhỏ), SVD cực nhanh
+            U_final, S_final, _ = torch.svd(combined_U)
+            
+            # Giới hạn số chiều tối đa để tránh Full Rank (Saturation)
+            # Với Dim 192, giữ tối đa khoảng 150-170 chiều
+            max_capacity = 170
+            
+            # Có thể cắt bớt nếu k_total vượt quá max_capacity
+            # (Hoặc dùng lại threshold trên S_final để cắt thông minh hơn)
+            final_k = min(U_final.shape[1], max_capacity)
+            
+            self.memory_U = U_final[:, :final_k]
+
+        print(f"GPM Updated: Memory Rank = {self.memory_U.shape[1]}/{self.hidden_dim}")
+    
+    
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
     def init_weight_noise(self, prototypes): pass
