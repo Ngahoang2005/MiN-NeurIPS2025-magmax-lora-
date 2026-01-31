@@ -272,7 +272,7 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, mode='eigenvalue', val=1e-3):
+    def collect_projections(self, mode='eigenvalue', val=1e-2):
         """
         Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
         """

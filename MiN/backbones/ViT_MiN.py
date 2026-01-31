@@ -762,7 +762,7 @@ class PiNoise(nn.Module):
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
 
-    def compute_projection_matrix(self, mode='eigenvalue', val=1e-3):
+    def compute_projection_matrix(self, mode='eigenvalue', val=1e-2):
         """
         Tính SVD trên Covariance Matrix.
         Args:
