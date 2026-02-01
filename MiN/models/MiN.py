@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.99)
+        self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -196,7 +196,7 @@ class MinNet(object):
         self._clear_gpu()
 
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.99)
+        self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
         
@@ -348,7 +348,7 @@ class MinNet(object):
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
                         # Áp dụng Adaptive Scale
-                        self._network.apply_gpm_to_grads(scale=0.5)
+                        self._network.apply_gpm_to_grads(scale=0.85)
                     else:
                         # Warm-up: Thả trôi gradient để học nhanh
                         pass
@@ -372,6 +372,7 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
+            print(info)
             
             # Clear cache định kỳ
             if epoch % 5 == 0:
