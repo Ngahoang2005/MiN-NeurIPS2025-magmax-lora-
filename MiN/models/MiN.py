@@ -258,32 +258,54 @@ class MinNet(object):
             prog_bar.set_description(info)
         self._clear_gpu()
 
-    def run(self, train_loader):
-        try:
-            from torch.amp import autocast, GradScaler
-        except ImportError:
-            from torch.cuda.amp import autocast, GradScaler
-
-        scaler = GradScaler()
-
-        if self.cur_task == 0:
-            epochs = self.init_epochs
-            lr = self.init_lr
-            weight_decay = self.init_weight_decay
-        else:
-            epochs = self.epochs
-            lr = self.lr 
-            weight_decay = self.weight_decay
-
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
+    def compute_adaptive_scale(self, current_loader):
+        # 1. Tính prototype task hiện tại
+        curr_proto = self.get_task_prototype(self._network, current_loader)
+        
+        if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
+        
+        if not self.old_prototypes:
+            self.old_prototypes.append(curr_proto)
+            return 0.95 # Task đầu tiên chưa cần scale, hoặc scale cao
             
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
+        # 2. So sánh với quá khứ
+        max_sim = 0.0
+        curr_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
+        for old_p in self.old_prototypes:
+            old_norm = F.normalize(old_p.unsqueeze(0), p=2, dim=1)
+            sim = torch.mm(curr_norm, old_norm.t()).item()
+            if sim > max_sim: max_sim = sim
+                
+        self.old_prototypes.append(curr_proto)
+        
+        # 3. Tính Scale: Giống nhau nhiều -> Scale thấp (để học đè lên). Khác nhau -> Scale cao.
+        # Công thức: Scale chạy từ 0.5 đến 0.95
+        scale = 0.5 + 0.5 * (1.0 - max_sim)
+        scale = max(0.65, min(scale, 0.95)) # Kẹp giá trị an toàn
+        
+        self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
+        return scale
+    def run(self, train_loader):
+        # [TỐI ƯU 1]: Import nên để đầu file, nhưng nếu để đây cũng ko sao.
+        # scaler = GradScaler() -> [SAI]: Đừng tạo mới mỗi task!
+        # Hãy dùng self.scaler đã tạo trong __init__
+
+        epochs = self.init_epochs if self.cur_task == 0 else self.epochs
+        lr = self.init_lr if self.cur_task == 0 else self.lr
+        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+
+        # [TỐI ƯU 2]: Tính scale một lần đầu task
+        current_scale = 0.85 
+        if self.cur_task > 0:
+            # Đảm bảo bạn đã thêm hàm compute_adaptive_scale vào class MinNet nhé
+            current_scale = self.compute_adaptive_scale(train_loader)
+
+        # Freeze/Unfreeze Logic
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
+        
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
@@ -293,70 +315,67 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        # [ĐÃ BỎ L1 REGULARIZATION THEO YÊU CẦU]
         WARMUP_EPOCHS = 5
+
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
                 optimizer.zero_grad(set_to_none=True) 
 
+                # Tự động detect device cho autocast
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                    
-                        loss = F.cross_entropy(logits2, targets.long())
-                        
-                        logits_final = logits2
-
+                            # forward cũ
+                            logits1 = self._network(inputs, new_forward=False)['logits']
+                        # forward mới
+                        logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                        logits_final = logits2 + logits1
                     else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long()) 
-                        logits_final = logits
+                        logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                    
+                    loss = F.cross_entropy(logits_final, targets.long())
 
-        
+                # [TỐI ƯU 3]: Dùng self.scaler
                 self.scaler.scale(loss).backward()
+                
+                # Logic GPM + Warmup
                 if self.cur_task > 0:
-                    # [QUAN TRỌNG]: LOGIC WARM-UP + GPM
+                    # Đã vào task > 0 thì check epoch thôi
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        self._network.apply_gpm_to_grads(scale = 0.8)
+                        # Áp dụng Adaptive Scale
+                        self._network.apply_gpm_to_grads(scale=current_scale)
                     else:
-                        # Warm-up phase: Gradient updates freely -> High Plasticity
+                        # Warm-up: Thả trôi gradient để học nhanh
                         pass
+                
                 self.scaler.step(optimizer)
                 self.scaler.update()
-                
                 
                 losses += loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
+                # Cleanup
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc,
+            info = "Task {} | Ep {}/{} | Loss {:.3f} | Acc {:.2f} | Scale {:.2f}".format(
+                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, current_scale
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
+            # Clear cache định kỳ
             if epoch % 5 == 0:
-                torch.cuda.empty_cache()
-
+                self._clear_gpu()
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
