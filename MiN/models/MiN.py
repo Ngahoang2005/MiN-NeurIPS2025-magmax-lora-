@@ -54,7 +54,6 @@ class MinNet(object):
             torch.cuda.empty_cache()
 
     def calculate_drift(self, clean_loader):
-        """[DPCR] Tính Drift Matrix P bằng dữ liệu sạch"""
         self.logger.info("Calculating Drift Matrix P (TSSP)...")
         self._network.eval()
         self._old_network.eval()
@@ -81,8 +80,6 @@ class MinNet(object):
     # --- TASK 0 ---
     def init_train(self, data_manger):
         self.cur_task += 1
-        
-        # [FIX]: Cập nhật known_class NGAY LẬP TỨC để dùng cho các hàm fit phía dưới
         self.known_class = self.init_class 
         
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
@@ -97,18 +94,17 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # 1. Run (Train Noise & SGD Classifier)
+        # 1. Run 
         train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         
-        # 2. Fit Final (Gom stats Streaming & Compress)
-        # Lúc này known_class đã = init_class -> Vòng lặp fit_fc sẽ chạy đúng range(0, init_class)
+        # 2. Fit Final
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 3. Refit (Chốt)
+        # 3. Refit
         self.re_fit(None, None) 
         
         self.after_train(data_manger)
@@ -116,10 +112,7 @@ class MinNet(object):
     # --- TASK > 0 ---
     def increment_train(self, data_manger):
         self.cur_task += 1
-        
-        # [FIX]: Cập nhật known_class NGAY LẬP TỨC
         self.known_class += self.increment
-        
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
@@ -131,20 +124,20 @@ class MinNet(object):
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
-        # 1. Fit Init (Gom toàn bộ để giải RLS Init)
+        # 1. Fit Init
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=True)
 
-        # 2. Run (Train Noise gây drift)
+        # 2. Run
         run_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(run_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         
-        # 3. Fit Final (Gom stats MỚI theo kiểu Streaming & Compress)
+        # 3. Fit Final
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 4. Refit (DPCR Calibration)
+        # 4. Refit
         clean_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         clean_set.labels = self.cat2order(clean_set.labels, data_manger)
         clean_loader = DataLoader(clean_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
@@ -153,15 +146,10 @@ class MinNet(object):
         self.after_train(data_manger)
 
     def fit_fc(self, train_loader, test_loader=None, init_mode=False):
-        """
-        init_mode=True: Gom toàn bộ để giải RLS Init.
-        init_mode=False: STREAMING từng class lên GPU để gom và nén ngay lập tức (Không OOM).
-        """
         self._network.eval()
         self._network.to(self.device)
         
         if init_mode:
-            # Init mode giải RLS toàn cục, cần gom hết. 
             desc = f"Task {self.cur_task} Fit (Init - RLS)"
             for _ in tqdm(range(self.fit_epoch), desc=desc):
                 for _, inputs, targets in train_loader:
@@ -171,21 +159,14 @@ class MinNet(object):
             self._network.solve_temporary_analytic()
             
         else:
-            # === [STREAMING MODE - FIX OOM] ===
+            # Streaming Mode
             dataset = train_loader.dataset
-            
-            # Xác định các class cần xử lý (Task hiện tại)
-            # Vì self.known_class đã được cập nhật ở đầu hàm init/increment_train, công thức này sẽ đúng:
-            # Task 0: known=10, inc=10 (ví dụ) -> start = 0 (vì cur_task ko > 0) -> 0 to 10
-            # Task 1: known=20, inc=10 -> start = 20-10=10 -> 10 to 20
             start_class = self.known_class - self.increment if self.cur_task > 0 else 0
             end_class = self.known_class
             
             print(f"--> [GPU Stream Fit] Processing classes {start_class} to {end_class} sequentially...")
             
-            # [FIX LỖI INDEX ERROR]: Bây giờ range sẽ chạy từ 0->10 chứ không phải 0->0 nữa
             for c in range(start_class, end_class):
-                # 1. Lọc index của class c
                 if hasattr(dataset, 'labels'): 
                     indices = np.where(np.array(dataset.labels) == c)[0]
                 elif hasattr(dataset, 'targets'):
@@ -195,18 +176,15 @@ class MinNet(object):
                 
                 if len(indices) == 0: continue
 
-                # 2. Tạo Loader con
                 sub_set = Subset(dataset, indices)
                 sub_loader = DataLoader(sub_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
                 
-                # 3. Gom thống kê (Chỉ cho class c)
                 for _ in range(self.fit_epoch):
                     for _, inputs, targets in sub_loader:
                         inputs, targets = inputs.to(self.device), targets.to(self.device)
                         y_onehot = F.one_hot(targets, num_classes=self._network.known_class)
                         self._network.fit(inputs, y_onehot)
                 
-                # 4. Nén và Giải phóng VRAM NGAY LẬP TỨC
                 self._network.finalize_task_stats() 
                 self._clear_gpu()
                 print(f"    -> Class {c}: Compressed & VRAM cleared.")
@@ -223,7 +201,6 @@ class MinNet(object):
             self._network.reconstruct_classifier_dpcr(None, known_classes_boundary=0)
         self._clear_gpu()
 
-    # --- HÀM RUN (GIỮ NGUYÊN) ---
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
@@ -260,6 +237,14 @@ class MinNet(object):
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                        
+                        # [FIX LOGIC]: Padding logits1 để khớp size với logits2
+                        old_dim = logits1.shape[1]
+                        new_dim = logits2.shape[1]
+                        if new_dim > old_dim:
+                            padding = torch.full((logits1.shape[0], new_dim - old_dim), float('-inf'), device=self.device)
+                            logits1 = torch.cat([logits1, padding], dim=1)
+                        
                         logits_final = logits2 + logits1
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
@@ -364,7 +349,6 @@ class MinNet(object):
         }
     
     def after_train(self, data_manger):
-        # [FIX]: Đã cập nhật known_class ở đầu hàm train, không cập nhật ở đây nữa để tránh cộng dồn sai
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
