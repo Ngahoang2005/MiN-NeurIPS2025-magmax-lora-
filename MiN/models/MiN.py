@@ -107,8 +107,7 @@ class MinNet(object):
         # 3. Refit
         self.re_fit(None, None) 
         
-        self.after_train(data_manger)
-
+      
     # --- TASK > 0 ---
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -143,7 +142,7 @@ class MinNet(object):
         clean_loader = DataLoader(clean_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
         self.re_fit(clean_loader, None)
         
-        self.after_train(data_manger)
+
 
     def fit_fc(self, train_loader, test_loader=None, init_mode=False):
         self._network.eval()
