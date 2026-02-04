@@ -59,7 +59,6 @@ class MinNet(object):
         self._network.eval()
         self._old_network.eval()
         
-        # Nếu OOM tại đây, có thể chuyển xuống CPU, nhưng thường 16k^2 trên GPU 16GB vẫn vừa.
         XtX = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
         XtY = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
         
@@ -79,9 +78,13 @@ class MinNet(object):
             P = torch.inverse(XtX + reg) @ XtY
         return P
 
-    # --- TASK 0: Run -> Fit Final -> Refit ---
+    # --- TASK 0 ---
     def init_train(self, data_manger):
         self.cur_task += 1
+        
+        # [FIX]: Cập nhật known_class NGAY LẬP TỨC để dùng cho các hàm fit phía dưới
+        self.known_class = self.init_class 
+        
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info(f"task_list: {train_list_name}")
         
@@ -100,7 +103,8 @@ class MinNet(object):
         self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         
-        # 2. Fit Final (Gom stats Streaming)
+        # 2. Fit Final (Gom stats Streaming & Compress)
+        # Lúc này known_class đã = init_class -> Vòng lặp fit_fc sẽ chạy đúng range(0, init_class)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=False)
 
@@ -109,9 +113,13 @@ class MinNet(object):
         
         self.after_train(data_manger)
 
-    # --- TASK > 0: Fit Init -> Run -> Fit Final -> Refit ---
+    # --- TASK > 0 ---
     def increment_train(self, data_manger):
         self.cur_task += 1
+        
+        # [FIX]: Cập nhật known_class NGAY LẬP TỨC
+        self.known_class += self.increment
+        
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
@@ -123,7 +131,7 @@ class MinNet(object):
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
-        # 1. Fit Init (Khởi tạo normal_fc tốt)
+        # 1. Fit Init (Gom toàn bộ để giải RLS Init)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=True)
 
@@ -133,7 +141,7 @@ class MinNet(object):
         self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         
-        # 3. Fit Final (Streaming stats)
+        # 3. Fit Final (Gom stats MỚI theo kiểu Streaming & Compress)
         self.fit_fc(fit_loader, init_mode=False)
 
         # 4. Refit (DPCR Calibration)
@@ -146,7 +154,7 @@ class MinNet(object):
 
     def fit_fc(self, train_loader, test_loader=None, init_mode=False):
         """
-        init_mode=True: Gom toàn bộ (chấp nhận tốn VRAM/RAM tạm thời) để giải RLS Init.
+        init_mode=True: Gom toàn bộ để giải RLS Init.
         init_mode=False: STREAMING từng class lên GPU để gom và nén ngay lập tức (Không OOM).
         """
         self._network.eval()
@@ -154,8 +162,6 @@ class MinNet(object):
         
         if init_mode:
             # Init mode giải RLS toàn cục, cần gom hết. 
-            # Nếu OOM ở đây, có thể giảm batch size hoặc dùng RAM CPU.
-            # Với task mới (ít class), thường GPU vẫn chịu được.
             desc = f"Task {self.cur_task} Fit (Init - RLS)"
             for _ in tqdm(range(self.fit_epoch), desc=desc):
                 for _, inputs, targets in train_loader:
@@ -165,16 +171,19 @@ class MinNet(object):
             self._network.solve_temporary_analytic()
             
         else:
-            # === [STREAMING MODE] ===
-            # Gom stats từng class -> Nén SVD -> Xóa VRAM -> Class tiếp
+            # === [STREAMING MODE - FIX OOM] ===
             dataset = train_loader.dataset
             
             # Xác định các class cần xử lý (Task hiện tại)
+            # Vì self.known_class đã được cập nhật ở đầu hàm init/increment_train, công thức này sẽ đúng:
+            # Task 0: known=10, inc=10 (ví dụ) -> start = 0 (vì cur_task ko > 0) -> 0 to 10
+            # Task 1: known=20, inc=10 -> start = 20-10=10 -> 10 to 20
             start_class = self.known_class - self.increment if self.cur_task > 0 else 0
             end_class = self.known_class
             
             print(f"--> [GPU Stream Fit] Processing classes {start_class} to {end_class} sequentially...")
             
+            # [FIX LỖI INDEX ERROR]: Bây giờ range sẽ chạy từ 0->10 chứ không phải 0->0 nữa
             for c in range(start_class, end_class):
                 # 1. Lọc index của class c
                 if hasattr(dataset, 'labels'): 
@@ -182,7 +191,6 @@ class MinNet(object):
                 elif hasattr(dataset, 'targets'):
                     indices = np.where(np.array(dataset.targets) == c)[0]
                 else:
-                    # Fallback
                     indices = [i for i, x in enumerate(dataset) if x[1] == c]
                 
                 if len(indices) == 0: continue
@@ -192,7 +200,6 @@ class MinNet(object):
                 sub_loader = DataLoader(sub_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
                 
                 # 3. Gom thống kê (Chỉ cho class c)
-                # Vì chỉ gom 1 class, temp_phi chỉ tốn 1GB VRAM -> AN TOÀN
                 for _ in range(self.fit_epoch):
                     for _, inputs, targets in sub_loader:
                         inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -357,10 +364,7 @@ class MinNet(object):
         }
     
     def after_train(self, data_manger):
-        if self.cur_task == 0:
-            self.known_class = self.init_class
-        else:
-            self.known_class += self.increment
+        # [FIX]: Đã cập nhật known_class ở đầu hàm train, không cập nhật ở đây nữa để tránh cộng dồn sai
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
