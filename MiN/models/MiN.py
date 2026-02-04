@@ -7,12 +7,12 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import copy
-import gc
+import gc 
+import os
 
 from utils.inc_net import MiNbaseNet
-from utils.toolkit import tensor2numpy
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -22,67 +22,68 @@ class MinNet(object):
         self._network = MiNbaseNet(args)
         self.device = args['device']
         self.num_workers = args["num_workers"]
-        
+
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
         self.init_batch_size = args["init_batch_size"]
-        
+
         self.lr = args["lr"]
         self.batch_size = args["batch_size"]
         self.weight_decay = args["weight_decay"]
         self.epochs = args["epochs"]
-        
+
         self.init_class = args["init_class"]
         self.increment = args["increment"]
+
+        self.buffer_size = args["buffer_size"]
         self.buffer_batch = args["buffer_batch"]
+        self.gamma = args['gamma']
         self.fit_epoch = args["fit_epochs"]
-        
+
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
         
         self.scaler = GradScaler('cuda')
-        self._old_network = None # Để lưu mạng cũ tính drift
+        self._old_network = None # [DPCR: Mạng cũ để tính Drift]
 
     def _clear_gpu(self):
         gc.collect()
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def calculate_drift(self, clean_loader):
-        """Tính ma trận Drift P (TSSP) dùng dữ liệu sạch"""
+        """[DPCR] Tính Drift Matrix P bằng dữ liệu sạch"""
         self.logger.info("Calculating Drift Matrix P (TSSP)...")
         self._network.eval()
         self._old_network.eval()
         
-        buffer_size = self.args['buffer_size']
-        XtX = torch.zeros(buffer_size, buffer_size, device=self.device)
-        XtY = torch.zeros(buffer_size, buffer_size, device=self.device)
+        XtX = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
+        XtY = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
         
         with torch.no_grad():
             for _, inputs, _ in clean_loader:
                 inputs = inputs.to(self.device)
                 with autocast('cuda', enabled=False):
-                    # Feature cũ
                     f_old = self._old_network.buffer(self._old_network.backbone(inputs).float())
-                    # Feature mới
                     f_new = self._network.buffer(self._network.backbone(inputs).float())
-                
                 XtX += f_old.t() @ f_old
                 XtY += f_old.t() @ f_new
         
-        # Giải Ridge: P = (XtX + eps*I)^-1 @ XtY
-        reg = 1e-4 * torch.eye(buffer_size, device=self.device)
+        reg = 1e-4 * torch.eye(self.args['buffer_size'], device=self.device)
         try:
             P = torch.linalg.solve(XtX + reg, XtY)
         except:
             P = torch.inverse(XtX + reg) @ XtY
         return P
 
-    # --- TASK 0 ---
+    # --- TASK 0: Run -> Fit Final -> Refit ---
     def init_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, _ = data_manger.get_task_list(0)
+        train_list, test_list, train_list_name = data_manger.get_task_list(0)
+        self.logger.info(f"task_list: {train_list_name}")
+        
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
@@ -91,61 +92,62 @@ class MinNet(object):
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-
-        # 1. Run: Train Noise & SGD Classifier trước (xây nền móng)
+        
+        # 1. Run (Train Noise & SGD Classifier)
         train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
+        # GPM Collection (Giữ nguyên logic của bạn)
         self._network.collect_projections(mode='threshold', val=0.95)
+        # MagMax Merge (Giữ nguyên logic của bạn)
+        self._network.after_task_magmax_merge()
         
-        # 2. Fit Final: Gom stats chính thức (Augment)
+        # 2. Fit Final (Gom stats, nén và lưu)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 3. Re-fit: Chốt đơn DPCR (Clean)
-        # Task 0 không có drift nên pass None
+        # 3. Refit (Chốt DPCR)
         self.re_fit(None, None) 
         
-     
+        self.after_train(data_manger)
 
-    # --- TASK > 0 ---
+    # --- TASK > 0: Fit Init -> Run -> Fit Final -> Refit ---
     def increment_train(self, data_manger):
         self.cur_task += 1
-        # [QUAN TRỌNG]: Lưu mạng cũ để so sánh Drift
+        # Lưu mạng cũ để tính Drift
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
         
-        train_list, test_list, _ = data_manger.get_task_list(self.cur_task)
+        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
+        self.logger.info(f"task_list: {train_list_name}")
+        
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
 
-        # Update mạng
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
-        # 1. Fit Init: Giải RLS tạm để có Normal FC tốt hướng dẫn Noise
+        # 1. Fit Init (Khởi tạo normal_fc tốt bằng RLS tạm)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=True)
 
-        # 2. Run: Train Noise (Gây Drift trên feature)
+        # 2. Run (Train Noise gây drift - CÓ GPM)
         run_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(run_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
+        self._network.after_task_magmax_merge()
         
-        # 3. Fit Final: Gom stats MỚI sau khi feature đã drift (Augment)
+        # 3. Fit Final (Gom stats MỚI - Augment)
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 4. Re-fit: Tính Drift & Hiệu chỉnh DPCR (Clean Data)
+        # 4. Refit (DPCR Calibration - Clean)
         clean_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         clean_set.labels = self.cat2order(clean_set.labels, data_manger)
         clean_loader = DataLoader(clean_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
         self.re_fit(clean_loader, None)
         
-  
+        self.after_train(data_manger)
 
     def fit_fc(self, train_loader, test_loader=None, init_mode=False):
-        """
-        init_mode=True: Gom -> Giải tạm -> Gán normal_fc -> Xóa stats
-        init_mode=False: Gom -> Lưu stats vào _phi_list (để Re-fit dùng)
-        """
+        """Bước gom thống kê. Init Mode = True để tạo normal_fc."""
         self._network.eval()
         desc = f"Task {self.cur_task} Fit ({'Init' if init_mode else 'Final'})"
         for _ in tqdm(range(self.fit_epoch), desc=desc):
@@ -155,36 +157,35 @@ class MinNet(object):
                 self._network.fit(inputs, y_onehot)
         
         if init_mode:
-            self._network.solve_temporary_analytic() 
+            self._network.solve_temporary_analytic() # Init normal_fc
         else:
-            self._network.finalize_task_stats()
+            self._network.finalize_task_stats() # Save Compressed
         
         self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
-        """
-        Bước hiệu chỉnh DPCR. 
-        Nếu Task > 0: train_loader là clean_loader để tính Drift P.
-        """
+        """Bước hiệu chỉnh DPCR cuối cùng."""
         if self.cur_task > 0:
+            self.logger.info("--> [DPCR] Estimating Shift & Reconstructing...")
             P_drift = self.calculate_drift(train_loader)
-            # Số class cũ cần hiệu chỉnh là tổng số class TRƯỚC task này
             old_class_boundary = self._network.known_class - self.increment
             self._network.reconstruct_classifier_dpcr(P_drift, known_classes_boundary=old_class_boundary)
         else:
             self._network.reconstruct_classifier_dpcr(None, known_classes_boundary=0)
         self._clear_gpu()
 
-    # Các hàm run, compute_adaptive, eval_task giữ nguyên
+    # --- HÀM RUN (GIỮ NGUYÊN GPM LOGIC CỦA BẠN) ---
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
+        # Logic Adaptive GPM Scale
         current_scale = 0.85 
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
 
+        # Freeze/Unfreeze
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -208,6 +209,7 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
+                    # Logic Forward (Normal + Noise)
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
@@ -215,15 +217,15 @@ class MinNet(object):
                         logits_final = logits2 + logits1
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
-                    
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
                 
+                # Logic GPM Projection
                 if self.cur_task > 0:
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        self._network.apply_gpm_to_grads(scale=0.85)
+                        self._network.apply_gpm_to_grads(scale=current_scale)
 
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -242,6 +244,7 @@ class MinNet(object):
         self.logger.info(info)
 
     def compute_adaptive_scale(self, current_loader):
+        # ... (Giữ nguyên logic của bạn) ...
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
         if not self.old_prototypes:
@@ -258,6 +261,7 @@ class MinNet(object):
         return max(0.65, min(scale, 0.95))
 
     def get_task_prototype(self, model, train_loader):
+        # ... (Giữ nguyên logic của bạn) ...
         model = model.eval()
         features = []
         with torch.no_grad():
@@ -274,6 +278,7 @@ class MinNet(object):
         torch.save(self._network.state_dict(), path_name)
 
     def compute_test_acc(self, test_loader):
+        # ... (Giữ nguyên) ...
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
@@ -294,6 +299,7 @@ class MinNet(object):
         return targets
 
     def eval_task(self, test_loader):
+        # ... (Giữ nguyên) ...
         model = self._network.eval()
         pred, label = [], []
         with torch.no_grad():
@@ -316,12 +322,10 @@ class MinNet(object):
         }
     
     def after_train(self, data_manger):
-        # Lưu ý: known_class đã được cập nhật ở update_fc rồi, nhưng giữ logic này để đảm bảo consistency
         if self.cur_task == 0:
             self.known_class = self.init_class
         else:
-            self.known_class += self.increment # Đảm bảo biến này match với network
-            
+            self.known_class += self.increment
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
