@@ -3,7 +3,7 @@ import numpy as np
 import torch
 from torch import optim
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 import copy
@@ -46,7 +46,7 @@ class MinNet(object):
         self.total_acc = []
         
         self.scaler = GradScaler('cuda')
-        self._old_network = None # [DPCR: Mạng cũ để tính Drift]
+        self._old_network = None 
 
     def _clear_gpu(self):
         gc.collect()
@@ -59,6 +59,7 @@ class MinNet(object):
         self._network.eval()
         self._old_network.eval()
         
+        # Nếu OOM tại đây, có thể chuyển xuống CPU, nhưng thường 16k^2 trên GPU 16GB vẫn vừa.
         XtX = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
         XtY = torch.zeros(self.args['buffer_size'], self.args['buffer_size'], device=self.device)
         
@@ -96,16 +97,14 @@ class MinNet(object):
         # 1. Run (Train Noise & SGD Classifier)
         train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
-        # GPM Collection (Giữ nguyên logic của bạn)
         self._network.collect_projections(mode='threshold', val=0.95)
-        # MagMax Merge (Giữ nguyên logic của bạn)
         self._network.after_task_magmax_merge()
         
-        # 2. Fit Final (Gom stats, nén và lưu)
+        # 2. Fit Final (Gom stats Streaming)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 3. Refit (Chốt DPCR)
+        # 3. Refit (Chốt)
         self.re_fit(None, None) 
         
         self.after_train(data_manger)
@@ -113,7 +112,6 @@ class MinNet(object):
     # --- TASK > 0: Fit Init -> Run -> Fit Final -> Refit ---
     def increment_train(self, data_manger):
         self.cur_task += 1
-        # Lưu mạng cũ để tính Drift
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
@@ -125,20 +123,20 @@ class MinNet(object):
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
-        # 1. Fit Init (Khởi tạo normal_fc tốt bằng RLS tạm)
+        # 1. Fit Init (Khởi tạo normal_fc tốt)
         fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
         self.fit_fc(fit_loader, init_mode=True)
 
-        # 2. Run (Train Noise gây drift - CÓ GPM)
+        # 2. Run (Train Noise gây drift)
         run_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(run_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._network.after_task_magmax_merge()
         
-        # 3. Fit Final (Gom stats MỚI - Augment)
+        # 3. Fit Final (Streaming stats)
         self.fit_fc(fit_loader, init_mode=False)
 
-        # 4. Refit (DPCR Calibration - Clean)
+        # 4. Refit (DPCR Calibration)
         clean_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         clean_set.labels = self.cat2order(clean_set.labels, data_manger)
         clean_loader = DataLoader(clean_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
@@ -147,24 +145,68 @@ class MinNet(object):
         self.after_train(data_manger)
 
     def fit_fc(self, train_loader, test_loader=None, init_mode=False):
-        """Bước gom thống kê. Init Mode = True để tạo normal_fc."""
+        """
+        init_mode=True: Gom toàn bộ (chấp nhận tốn VRAM/RAM tạm thời) để giải RLS Init.
+        init_mode=False: STREAMING từng class lên GPU để gom và nén ngay lập tức (Không OOM).
+        """
         self._network.eval()
-        desc = f"Task {self.cur_task} Fit ({'Init' if init_mode else 'Final'})"
-        for _ in tqdm(range(self.fit_epoch), desc=desc):
-            for _, inputs, targets in train_loader:
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                y_onehot = F.one_hot(targets, num_classes=self._network.known_class)
-                self._network.fit(inputs, y_onehot)
+        self._network.to(self.device)
         
         if init_mode:
-            self._network.solve_temporary_analytic() # Init normal_fc
+            # Init mode giải RLS toàn cục, cần gom hết. 
+            # Nếu OOM ở đây, có thể giảm batch size hoặc dùng RAM CPU.
+            # Với task mới (ít class), thường GPU vẫn chịu được.
+            desc = f"Task {self.cur_task} Fit (Init - RLS)"
+            for _ in tqdm(range(self.fit_epoch), desc=desc):
+                for _, inputs, targets in train_loader:
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    y_onehot = F.one_hot(targets, num_classes=self._network.known_class)
+                    self._network.fit(inputs, y_onehot)
+            self._network.solve_temporary_analytic()
+            
         else:
-            self._network.finalize_task_stats() # Save Compressed
-        
+            # === [STREAMING MODE] ===
+            # Gom stats từng class -> Nén SVD -> Xóa VRAM -> Class tiếp
+            dataset = train_loader.dataset
+            
+            # Xác định các class cần xử lý (Task hiện tại)
+            start_class = self.known_class - self.increment if self.cur_task > 0 else 0
+            end_class = self.known_class
+            
+            print(f"--> [GPU Stream Fit] Processing classes {start_class} to {end_class} sequentially...")
+            
+            for c in range(start_class, end_class):
+                # 1. Lọc index của class c
+                if hasattr(dataset, 'labels'): 
+                    indices = np.where(np.array(dataset.labels) == c)[0]
+                elif hasattr(dataset, 'targets'):
+                    indices = np.where(np.array(dataset.targets) == c)[0]
+                else:
+                    # Fallback
+                    indices = [i for i, x in enumerate(dataset) if x[1] == c]
+                
+                if len(indices) == 0: continue
+
+                # 2. Tạo Loader con
+                sub_set = Subset(dataset, indices)
+                sub_loader = DataLoader(sub_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+                
+                # 3. Gom thống kê (Chỉ cho class c)
+                # Vì chỉ gom 1 class, temp_phi chỉ tốn 1GB VRAM -> AN TOÀN
+                for _ in range(self.fit_epoch):
+                    for _, inputs, targets in sub_loader:
+                        inputs, targets = inputs.to(self.device), targets.to(self.device)
+                        y_onehot = F.one_hot(targets, num_classes=self._network.known_class)
+                        self._network.fit(inputs, y_onehot)
+                
+                # 4. Nén và Giải phóng VRAM NGAY LẬP TỨC
+                self._network.finalize_task_stats() 
+                self._clear_gpu()
+                print(f"    -> Class {c}: Compressed & VRAM cleared.")
+
         self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
-        """Bước hiệu chỉnh DPCR cuối cùng."""
         if self.cur_task > 0:
             self.logger.info("--> [DPCR] Estimating Shift & Reconstructing...")
             P_drift = self.calculate_drift(train_loader)
@@ -174,18 +216,16 @@ class MinNet(object):
             self._network.reconstruct_classifier_dpcr(None, known_classes_boundary=0)
         self._clear_gpu()
 
-    # --- HÀM RUN (GIỮ NGUYÊN GPM LOGIC CỦA BẠN) ---
+    # --- HÀM RUN (GIỮ NGUYÊN) ---
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # Logic Adaptive GPM Scale
         current_scale = 0.85 
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
 
-        # Freeze/Unfreeze
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -209,7 +249,6 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
-                    # Logic Forward (Normal + Noise)
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
@@ -221,7 +260,6 @@ class MinNet(object):
 
                 self.scaler.scale(loss).backward()
                 
-                # Logic GPM Projection
                 if self.cur_task > 0:
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
@@ -244,7 +282,6 @@ class MinNet(object):
         self.logger.info(info)
 
     def compute_adaptive_scale(self, current_loader):
-        # ... (Giữ nguyên logic của bạn) ...
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
         if not self.old_prototypes:
@@ -261,7 +298,6 @@ class MinNet(object):
         return max(0.65, min(scale, 0.95))
 
     def get_task_prototype(self, model, train_loader):
-        # ... (Giữ nguyên logic của bạn) ...
         model = model.eval()
         features = []
         with torch.no_grad():
@@ -272,13 +308,13 @@ class MinNet(object):
                 features.append(feature.detach().cpu())
         all_features = torch.cat(features, dim=0)
         prototype = torch.mean(all_features, dim=0).to(self.device)
+        self._clear_gpu()
         return prototype
     
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
     def compute_test_acc(self, test_loader):
-        # ... (Giữ nguyên) ...
         model = self._network.eval()
         correct, total = 0, 0
         device = self.device
@@ -299,7 +335,6 @@ class MinNet(object):
         return targets
 
     def eval_task(self, test_loader):
-        # ... (Giữ nguyên) ...
         model = self._network.eval()
         pred, label = [], []
         with torch.no_grad():
