@@ -141,7 +141,7 @@ class MiNbaseNet(nn.Module):
         for i in range(feat.shape[0]):
             label = labels[i].item()
             f = feat[i:i+1]
-            # [FIX OOM]: detach() để cắt đứt graph
+            # [FIX OOM]: .detach()
             outer = (f.t() @ f).detach()
             
             if label not in self.temp_phi:
@@ -152,31 +152,26 @@ class MiNbaseNet(nn.Module):
             self.temp_phi[label] += outer
             self.temp_mu[label] += f.squeeze(0).detach()
             self.temp_count[label] += 1
+            
+            # Xóa biến tạm ngay
+            del outer
 
     @torch.no_grad()
     def compress_stats(self):
         """
-        Nén dữ liệu. Sử dụng eigh cho ma trận đối xứng để tiết kiệm bộ nhớ.
-        Không dùng SVD vì SVD cần VRAM gấp đôi eigh.
+        [FIX OOM]: Nén trên GPU dùng eigh, xóa dữ liệu thô ngay lập tức.
         """
         COMPRESS_RANK = 256
-        torch.cuda.empty_cache() # Dọn dẹp trước khi nén
+        torch.cuda.empty_cache()
         
         for label in sorted(list(self.temp_phi.keys())):
             raw_phi = self.temp_phi[label]
             
-            # [FIX OOM]: Dùng eigh thay vì svd. Ma trận Phi = X^T X luôn đối xứng.
-            # eigh trả về (Eigenvalues, Eigenvectors)
-            try:
-                S, V = torch.linalg.eigh(raw_phi) 
-            except:
-                # Nếu eigh lỗi (hiếm), chuyển về CPU xử lý rồi nạp lại
-                print(f"Warning: GPU eigh failed for class {label}, falling back to CPU.")
-                raw_cpu = raw_phi.cpu()
-                S, V = torch.linalg.eigh(raw_cpu)
-                S, V = S.to(self.device), V.to(self.device)
+            # Sử dụng eigh trên GPU (Nhẹ hơn SVD)
+            # Trả về (eigenvalues, eigenvectors)
+            S, V = torch.linalg.eigh(raw_phi) 
 
-            # Eigh trả về giá trị tăng dần, lấy phần cuối (lớn nhất)
+            # Lấy đuôi (lớn nhất)
             if S.shape[0] > COMPRESS_RANK:
                 S_top = S[-COMPRESS_RANK:]
                 V_top = V[:, -COMPRESS_RANK:]
@@ -184,12 +179,12 @@ class MiNbaseNet(nn.Module):
                 S_top = S
                 V_top = V
 
-            # Lưu vào list (chuyển về CPU để giữ VRAM trống cho class tiếp theo)
+            # Lưu kết quả về CPU để trống VRAM cho class tiếp theo
             self._compressed_stats.append((V_top.cpu(), S_top.cpu()))
             self._mu_list.append((self.temp_mu[label] / self.temp_count[label]).cpu())
             self._class_counts.append(self.temp_count[label])
             
-            # Xóa ngay lập tức
+            # Xóa ngay lập tức khỏi GPU
             del self.temp_phi[label]
             del self.temp_mu[label]
             del raw_phi
@@ -201,7 +196,6 @@ class MiNbaseNet(nn.Module):
     def fit(self, P_drift=None, known_classes_boundary=0, init_mode=False):
         device = self.device
         
-        # Tính toán size
         num_existing = len(self._compressed_stats)
         num_new = 0
         if self.temp_phi: num_new = max(self.temp_phi.keys()) + 1
@@ -219,9 +213,9 @@ class MiNbaseNet(nn.Module):
 
         if P_drift is not None: P_drift = P_drift.to(device)
 
-        # 1. Cộng dồn dữ liệu cũ (Load từ CPU lên GPU từng cái)
         for c in range(len(self._compressed_stats)):
             V, S = self._compressed_stats[c]
+            # Load từng cái lên GPU
             V, S = V.to(device), S.to(device)
             
             phi_c = (V @ torch.diag(S)) @ V.t()
@@ -233,7 +227,7 @@ class MiNbaseNet(nn.Module):
                 phi_c = P_dual.t() @ phi_c @ P_dual
                 mu_c = mu_c @ P_dual
                 
-                if not init_mode: # Re-compress nếu cần
+                if not init_mode:
                     try:
                         S_n, V_n = torch.linalg.eigh(phi_c)
                         self._compressed_stats[c] = (V_n[:, -256:].cpu(), S_n[-256:].cpu())
@@ -242,28 +236,25 @@ class MiNbaseNet(nn.Module):
 
             total_phi += phi_c
             total_q[:, c] = mu_c * self._class_counts[c]
+            # Xóa ngay
             del V, S, phi_c, mu_c
 
-        # 2. Cộng dồn dữ liệu mới
         for label in self.temp_phi:
             total_phi += self.temp_phi[label]
             total_q[:, label] = self.temp_mu[label]
 
-        # 3. Giải (Solve)
         reg_phi = total_phi + self.gamma * torch.eye(self.buffer_size, device=device)
         try:
             W = torch.linalg.solve(reg_phi, total_q)
         except:
             W = torch.inverse(reg_phi) @ total_q
             
-        # 4. Update
         if init_mode:
             min_dim = min(self.normal_fc.weight.shape[0], W.shape[1])
             self.normal_fc.weight.data[:min_dim] = W.t()[:min_dim].to(self.normal_fc.weight.dtype)
         else:
             self.weight.data = F.normalize(W, p=2, dim=0)
             
-        # Xóa temp nếu xong
         if not init_mode:
             self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()

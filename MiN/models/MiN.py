@@ -92,7 +92,13 @@ class MinNet(object):
         
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
-        
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+
+        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
+        self.test_loader = test_loader
+
         if self.args['pretrained']:
              for param in self._network.backbone.parameters(): param.requires_grad = True
 
@@ -101,7 +107,6 @@ class MinNet(object):
         self._clear_gpu()
         
         # 1. Run
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
@@ -125,14 +130,22 @@ class MinNet(object):
         
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
+        self.test_loader = test_loader
+
+        if self.args['pretrained']:
+             for param in self._network.backbone.parameters(): param.requires_grad = False
 
         # Update FC ngay đầu
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
         # 1. Fit Init
-        fit_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        self.fit_fc(fit_loader, init_mode=True)
+        self.fit_fc(train_loader, init_mode=True)
 
         # 2. Run
         run_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -152,7 +165,7 @@ class MinNet(object):
         # 4. Refit
         self.re_fit(train_loader)
         
-        del train_set
+        del train_set, test_set
         self._clear_gpu()
         self.after_train(data_manger)
 
@@ -187,7 +200,7 @@ class MinNet(object):
                 
                 if len(indices) == 0: continue
 
-                # [FIX HANG]: num_workers=0
+                # num_workers=0 để tránh treo
                 sub_loader = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch, shuffle=False, num_workers=0)
                 
                 for _ in range(self.fit_epoch):
@@ -197,7 +210,8 @@ class MinNet(object):
                         self._network.accumulate_stats(inputs, targets)
                 
                 self._network.compress_stats()
-                # [FIX OOM]: Xóa cache ngay sau mỗi class
+                
+                # [QUAN TRỌNG]: Dọn rác VRAM sau mỗi class
                 self._clear_gpu()
 
             self._network.fit(init_mode=False)
@@ -282,6 +296,11 @@ class MinNet(object):
             prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
         self.logger.info(info)
+        
+        # [CỰC KỲ QUAN TRỌNG]: Xóa optimizer để giải phóng VRAM cho bước Fit
+        del optimizer
+        del scheduler
+        self._clear_gpu()
 
     def compute_adaptive_scale(self, current_loader): return 0.85
 
@@ -320,17 +339,6 @@ class MinNet(object):
                 total += len(targets)
         return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-    def after_train(self, data_manger):
-        _, test_list, _ = data_manger.get_task_list(self.cur_task)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
-        eval_res = self.eval_task(test_loader)
-        self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
-        self.logger.info('total acc: {}'.format(self.total_acc))
-        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
-        del test_set
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -352,3 +360,18 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
+
+    def after_train(self, data_manger):
+        _, test_list, _ = data_manger.get_task_list(self.cur_task)
+        test_set = data_manger.get_task_data(source="test", class_list=test_list)
+        test_set.labels = self.cat2order(test_set.labels, data_manger)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
+        eval_res = self.eval_task(test_loader)
+        self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
+        self.logger.info('total acc: {}'.format(self.total_acc))
+        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
+        del test_set
+
+    def save_check_point(self, path_name):
+        torch.save(self._network.state_dict(), path_name)
