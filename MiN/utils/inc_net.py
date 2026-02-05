@@ -180,25 +180,35 @@ class MiNbaseNet(nn.Module):
         return features @ self.weight
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        """Phiên bản Batch-wise: Nhanh hơn gấp 100 lần và ít tốn RAM"""
         self.eval()
-        # Đảm bảo input khớp thiết bị và kiểu dữ liệu (FP32 cho thống kê)
         ref_p = next(self.backbone.parameters())
         X = X.to(device=self.device, dtype=ref_p.dtype)
         
-        # Trích xuất đặc trưng và đưa về FP32 để tính toán ma trận hiệp phương sai
+        # Feature extraction
         feat = self.buffer(self.backbone(X)).float()
-        labels = torch.argmax(Y, dim=1)
         
-        for i in range(feat.shape[0]):
-            label = labels[i].item()
-            f = feat[i:i+1]
-            if label not in self.temp_phi:
-                self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
-                self.temp_mu[label] = torch.zeros(self.buffer_size, device=self.device)
-                self.temp_count[label] = 0
-            self.temp_phi[label] += (f.t() @ f).detach()
-            self.temp_mu[label] += f.squeeze(0).detach()
-            self.temp_count[label] += 1
+        # Xử lý nhãn (hỗ trợ cả One-hot và Index)
+        if Y.dim() > 1: labels = torch.argmax(Y, dim=1)
+        else: labels = Y
+            
+        unique_labels = torch.unique(labels)
+
+        for label in unique_labels:
+            l = label.item()
+            # Lấy mask cho class l
+            mask = (labels == l)
+            f_sub = feat[mask]
+            
+            if l not in self.temp_phi:
+                self.temp_phi[l] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
+                self.temp_mu[l] = torch.zeros(self.buffer_size, device=self.device)
+                self.temp_count[l] = 0
+            
+            # Cộng dồn ma trận (Phép nhân ma trận trên GPU cực nhanh)
+            self.temp_phi[l] += (f_sub.t() @ f_sub).detach()
+            self.temp_mu[l] += f_sub.sum(dim=0).detach()
+            self.temp_count[l] += f_sub.shape[0]
     @torch.no_grad()
     def compress_stats(self):
         RANK = 256 # Rank nén của DPCR
@@ -217,28 +227,24 @@ class MiNbaseNet(nn.Module):
             del self.temp_phi[label], self.temp_mu[label]
         self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
-    
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        [ORIGINAL RLS]: Hàm gốc 100%. 
-        """
+        """ [ORIGINAL RLS] """
         try:
             from torch.amp import autocast
         except ImportError:
             from torch.cuda.amp import autocast
 
         with autocast('cuda', enabled=False):
-            # [FIX]: Đặt tên biến rõ ràng để tránh lỗi del
+            # [FIX]: Đặt tên biến rõ ràng
             X_input = X.to(self.device).float()
             
-            # Feature Extraction -> Đặt tên là feat
+            # [FIX]: Khai báo biến 'feat' rõ ràng để tí nữa del được
             feat = self.backbone(X_input).float()
             feat = self.buffer(feat) 
             
             Y = Y.to(self.weight.device).float()
 
-            # Tự động mở rộng chiều
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
@@ -249,7 +255,6 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # RLS Update Batch-wise
             # Sử dụng feat thay vì X
             term = torch.eye(feat.shape[0], device=feat.device) + feat @ self.R @ feat.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
@@ -263,17 +268,15 @@ class MiNbaseNet(nn.Module):
             self.R -= K @ feat @ self.R
             self.weight += K @ (Y - feat @ self.weight)
             
-            # [FIX]: Xóa đúng biến đã khai báo
+            # [FIX]: Giờ del feat mới không bị lỗi
             del term, jitter, K, X_input, Y, feat
             torch.cuda.empty_cache()
-    
     @torch.no_grad()
     def solve_analytic(self, P_drift=None, boundary=0, init_mode=False):
-        # Tính toán số lượng class hiện có
         all_keys = list(self._compressed_stats.keys()) + list(self.temp_phi.keys())
-        num_total = max(all_keys) + 1 if all_keys else 0
+        if not all_keys: return
+        num_total = max(all_keys) + 1
         
-        # Mở rộng ma trận trọng số
         if num_total > self.weight.shape[1]:
             new_w = torch.zeros((self.buffer_size, num_total), device=self.device)
             new_w[:, :self.weight.shape[1]] = self.weight
@@ -282,33 +285,41 @@ class MiNbaseNet(nn.Module):
         total_phi = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
         total_q = torch.zeros(self.buffer_size, num_total, device=self.device)
 
-        # Hồi phục từ dữ liệu nén
+        # 1. Class CŨ (Phục hồi + Drift)
+        if P_drift is not None: P_drift = P_drift.to(self.device)
+
         for c, (V, S) in self._compressed_stats.items():
             phi_c = (V @ torch.diag(S)) @ V.t()
             mu_c = self._mu_list[c]
             
-            # Áp dụng Drift Correction cho các class cũ (Task < hiện tại)
+            # Drift Correction (Sửa lại công thức chuẩn)
             if P_drift is not None and c < boundary:
-                P_drift = P_drift.to(self.device)
-                P_cs = V @ V.t()
-                phi_c = P_drift.t() @ P_cs.t() @ phi_c @ P_cs @ P_drift
-                mu_c = mu_c @ P_cs @ P_drift
+                # [FIX]: Bỏ P_cs, xoay trực tiếp để không mất thông tin
+                phi_c = P_drift.t() @ phi_c @ P_drift
+                mu_c = mu_c @ P_drift
                 
             total_phi += phi_c
             total_q[:, c] = mu_c * self._class_counts[c]
 
-        # Giải hệ phương trình tuyến tính
+        # 2. Class MỚI (Dữ liệu thô)
+        for label, phi in self.temp_phi.items():
+            total_phi += phi
+            total_q[:, label] = self.temp_mu[label]
+
+        # 3. Giải hệ phương trình
         reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
-        W = torch.linalg.solve(total_phi + reg, total_q)
+        try:
+            W = torch.linalg.solve(total_phi + reg, total_q)
+        except:
+            W = torch.inverse(total_phi + reg) @ total_q
         
         if init_mode:
             self.normal_fc.weight.data[:W.shape[1]] = W.t().to(self.normal_fc.weight.dtype)
         else:
-            self.weight.data = F.normalize(W, p=2, dim=0)
-    # =========================================================================
-    # [FORWARD PASSES]
-    # =========================================================================
+            # [QUAN TRỌNG]: BỎ F.normalize ĐỂ KHỚP TỶ LỆ VỚI RLS
+            self.weight.data = W
 
+        
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)

@@ -257,47 +257,45 @@ class MinNet(object):
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        # [CASE 1]: Task 0 -> Dùng RLS gốc (Acc 99.3%)
-        # Task 0 không cần giải DPCR ở đây, việc nén Task 0 đã làm ở init_train rồi
+
+        # [CASE 1]: Task 0 -> RLS Gốc
         if self.cur_task == 0:
             prog_bar = tqdm(train_loader, desc="RLS Refitting (Task 0)")
             for i, (_, inputs, targets) in enumerate(prog_bar):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
-                self._network.fit(inputs, targets) # Gọi hàm fit gốc RLS
+                self._network.fit(inputs, targets)
             self._clear_gpu()
             return
 
-        # [CASE 2]: Task > 0 -> Quy trình DPCR chuẩn
-        # Tính toán Drift từ Model cũ (đã lưu ở đầu increment_train)
+        # [CASE 2]: Task > 0 -> DPCR
         P = self.calculate_drift(train_loader)
         boundary = self.known_class - self.increment
         
-        # Reset biến tạm để gom dữ liệu Task này
-        self._network.temp_phi = {}
+        self._network.temp_phi = {} 
         self._network.temp_mu = {}
         self._network.temp_count = {}
 
-        # 1. GOM DỮ LIỆU (Accumulate)
+        # 1. Gom dữ liệu
         for _, inputs, targets in tqdm(train_loader, desc="DPCR Accumulating"):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            y_oh = torch.nn.functional.one_hot(targets)
-            self._network.accumulate_stats(inputs, y_oh)
+            # accumulate_stats bản mới đã tự xử lý one-hot/index bên trong
+            self._network.accumulate_stats(inputs, targets)
         
-        # 2. GIẢI HỆ PHƯƠNG TRÌNH (Solve)
-        # Giải TRƯỚC KHI NÉN để tận dụng dữ liệu thô (temp_phi) của Task hiện tại -> Acc cao hơn
-        self.logger.info(f"--> Solving DPCR with Drift Correction (Boundary: {boundary})...")
+        # 2. Giải (Trước nén để Acc cao nhất)
+        self.logger.info(f"--> Solving DPCR with Drift Correction...")
         self._network.solve_analytic(P_drift=P, boundary=boundary)
 
-        # 3. NÉN DỮ LIỆU (Compress)
-        # Giờ mới nén temp_phi vào compressed_stats để dành cho Task sau
+        # 3. Nén
         self._network.compress_stats()
+        
+        # 4. Dọn dẹp sạch sẽ
         self._network.temp_phi = {} 
         self._network.temp_mu = {}
-        
-       
+        del P # [QUAN TRỌNG]: Xóa ma trận P nặng 256MB
         
         self._clear_gpu()
+    
     def compute_adaptive_scale(self, current_loader):
         # 1. Tính prototype task hiện tại
         curr_proto = self.get_task_prototype(self._network, current_loader)
