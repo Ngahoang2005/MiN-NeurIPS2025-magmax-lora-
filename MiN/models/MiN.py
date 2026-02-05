@@ -55,6 +55,7 @@ class MinNet(object):
         self._old_network = None 
 
     def _clear_gpu(self):
+        # [DỌN RÁC]: Cực kỳ quan trọng để tránh OOM
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -107,9 +108,9 @@ class MinNet(object):
         self._clear_gpu()
         
         # 1. Run
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
+        # self._network.after_task_magmax_merge()
         self._clear_gpu()
         
         # 2. Fit Final
@@ -141,6 +142,7 @@ class MinNet(object):
         if self.args['pretrained']:
              for param in self._network.backbone.parameters(): param.requires_grad = False
 
+        # [QUAN TRỌNG]: Update FC trước khi train/fit
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
@@ -174,7 +176,7 @@ class MinNet(object):
         self._network.to(self.device)
         
         if init_mode:
-            # Init Fit: Gom 1 lần
+            # Init Fit: Gom 1 lần (Cho init RLS)
             for _ in tqdm(range(self.fit_epoch), desc="Fit FC (Init)"):
                 for i, (_, inputs, targets) in enumerate(train_loader):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -185,7 +187,8 @@ class MinNet(object):
             self._clear_gpu()
             
         else:
-            # Final Fit: Streaming từng class
+            # Final Fit: Streaming từng class (Cho DPCR)
+            # Cách này an toàn cho VRAM hơn là gom tất cả
             dataset = train_loader.dataset
             if hasattr(dataset, 'labels'): classes = sorted(list(set(dataset.labels)))
             elif hasattr(dataset, 'targets'): classes = sorted(list(set(dataset.targets)))
@@ -209,7 +212,7 @@ class MinNet(object):
                         self._network.accumulate_stats(inputs, targets)
                 
                 self._network.compress_stats()
-                self._clear_gpu()
+                self._clear_gpu() # Dọn rác ngay sau mỗi class
 
             self._network.fit(init_mode=False)
             self._clear_gpu()
@@ -292,10 +295,12 @@ class MinNet(object):
                 self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc)
             prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
+        
         self.logger.info(info)
         
-        # [QUAN TRỌNG]: Dọn rác
-        del optimizer, scheduler
+        # [QUAN TRỌNG]: Dọn rác Optimizer và Gradient để trả VRAM cho DPCR
+        del optimizer
+        del scheduler
         self._network.zero_grad(set_to_none=True)
         self._clear_gpu()
 
@@ -368,6 +373,9 @@ class MinNet(object):
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
+        print('total acc: {}'.format(self.total_acc))
+        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        print('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         del test_set
 
     def save_check_point(self, path_name):
