@@ -18,6 +18,7 @@ class RandomBuffer(torch.nn.Linear):
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # Ép về float32 để nhân ma trận chính xác
         X = X.to(self.weight.dtype)
         return F.relu(X @ self.weight)
 
@@ -34,7 +35,7 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), device=self.device))
 
-        # [FIX TRIỆT ĐỂ INDEX]: Dùng Dict để ID Class luôn khớp với Ma trận
+        # [FIX INDEX]: Dùng Dict để Class ID luôn chuẩn, không bị append nhầm
         self._compressed_stats = {} 
         self._mu_list = {}          
         self._class_counts = {}     
@@ -50,6 +51,7 @@ class MiNbaseNet(nn.Module):
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
+        # Giữ nguyên logic bias của bạn
         new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=(self.cur_task==0))
         if self.normal_fc is not None:
             with torch.no_grad():
@@ -73,15 +75,20 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.norm.parameters(): p.requires_grad = True
 
     def collect_projections(self, mode='threshold', val=0.95):
-        for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+        for j in range(self.backbone.layer_num): 
+            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
 
     def apply_gpm_to_grads(self, scale=1.0):
-        for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+        for j in range(self.backbone.layer_num): 
+            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
 
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         self.eval()
+        # [FIX TYPE]: Ép về đúng dtype của backbone trước khi chạy
+        X = X.to(self.backbone.patch_embed.proj.weight.dtype)
         feat = self.buffer(self.backbone(X).float())
+        
         labels = torch.argmax(Y, dim=1)
         for i in range(feat.shape[0]):
             label = labels[i].item()
@@ -101,8 +108,11 @@ class MiNbaseNet(nn.Module):
         for label in sorted(list(self.temp_phi.keys())):
             raw_phi = self.temp_phi[label]
             try:
+                # Thử tính trên GPU
                 S, V = torch.linalg.eigh(raw_phi)
-            except RuntimeError: # Fallback CPU nếu OOM ma trận 16k
+            except RuntimeError: 
+                # [CPU FALLBACK]: Nếu 16k gây OOM, đẩy sang CPU giải
+                print(f"!!! GPU OOM on Class {label}, Falling back to CPU for 16k matrix...")
                 S, V = torch.linalg.eigh(raw_phi.cpu())
                 S, V = S.to(self.device), V.to(self.device)
 
@@ -135,9 +145,8 @@ class MiNbaseNet(nn.Module):
             mu_c = self._mu_list[c].to(self.device)
             if P_drift is not None and c < known_classes_boundary:
                 P_cs = V @ V.t()
-                P_dual = P_drift @ P_cs
-                phi_c = P_dual.t() @ phi_c @ P_dual
-                mu_c = mu_c @ P_dual
+                phi_c = P_drift.t() @ P_cs.t() @ phi_c @ P_cs @ P_drift # Drift Correction
+                mu_c = mu_c @ P_cs @ P_drift
             total_phi += phi_c
             total_q[:, c] = mu_c * self._class_counts[c]
             del V, S, phi_c, mu_c
@@ -147,15 +156,25 @@ class MiNbaseNet(nn.Module):
             total_q[:, label] = self.temp_mu[label]
 
         reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
+        # 16k matrix solve
         W = torch.linalg.solve(total_phi + reg, total_q)
-        if init_mode: self.normal_fc.weight.data[:W.shape[1]] = W.t()
-        else: self.weight.data = F.normalize(W, p=2, dim=0)
+        if init_mode: 
+            self.normal_fc.weight.data[:W.shape[1]] = W.t()
+        else: 
+            self.weight.data = F.normalize(W, p=2, dim=0)
         torch.cuda.empty_cache()
 
     def forward(self, x, new_forward=False):
+        # [FIX TYPE]: Đồng bộ Half/Float
+        x = x.to(self.backbone.patch_embed.proj.weight.dtype)
         h = self.buffer(self.backbone(x, new_forward=new_forward))
         return {'logits': h.to(self.weight.dtype) @ self.weight}
 
     def forward_normal_fc(self, x, new_forward=False):
+        x = x.to(self.backbone.patch_embed.proj.weight.dtype)
         h = self.buffer(self.backbone(x, new_forward=new_forward))
         return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
+    
+    def extract_feature(self, x):
+        x = x.to(self.backbone.patch_embed.proj.weight.dtype)
+        return self.backbone(x)
