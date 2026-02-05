@@ -2,38 +2,12 @@ import copy
 import torch
 from torch import nn
 from torch.nn import functional as F
-from backbones.pretrained_backbone import get_pretrained_backbone
-from backbones.linears import SimpleLinear
 try:
     from torch.amp import autocast
 except ImportError:
     from torch.cuda.amp import autocast 
-
-class BaseIncNet(nn.Module):
-    def __init__(self, args: dict):
-        super(BaseIncNet, self).__init__()
-        self.args = args
-        self.backbone = get_pretrained_backbone(args)
-        self.feature_dim = self.backbone.out_dim
-        self.fc = None
-
-    def update_fc(self, nb_classes):
-        fc = self.generate_fc(self.feature_dim, nb_classes)
-        if self.fc is not None:
-            nb_output = self.fc.out_features
-            fc.weight.data[:nb_output] = copy.deepcopy(self.fc.weight.data)
-            fc.bias.data[:nb_output] = copy.deepcopy(self.fc.bias.data)
-        del self.fc
-        self.fc = fc
-
-    @staticmethod
-    def generate_fc(in_dim, out_dim):
-        return SimpleLinear(in_dim, out_dim)
-
-    def forward(self, x):
-        hyper_features = self.backbone(x)
-        logits = self.fc(hyper_features)['logits']
-        return {'features': hyper_features, 'logits': logits}
+from backbones.pretrained_backbone import get_pretrained_backbone
+from backbones.linears import SimpleLinear
 
 class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
@@ -41,13 +15,16 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
+        # [TỐI ƯU]: Tạo thẳng trên GPU
         factory_kwargs = {"device": device, "dtype": torch.float32}
-        self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
-        self.register_buffer("weight", self.W)
+        self.register_buffer("weight", torch.empty((self.in_features, self.out_features), **factory_kwargs))
         self.reset_parameters()
 
+    def reset_parameters(self) -> None:
+        # Khởi tạo nhanh bằng phân phối chuẩn
+        nn.init.normal_(self.weight, std=0.02)
+
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # Ép về float32 và cùng device với weight để nhân ma trận
         X = X.to(device=self.weight.device, dtype=self.weight.dtype)
         return F.relu(X @ self.weight)
 
@@ -55,16 +32,23 @@ class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
         self.args = args
-        self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
-        self.gamma = args['gamma']
-        self.buffer_size = args['buffer_size']
+        
+        print("--> [Step 1] Loading Backbone...")
+        self.backbone = get_pretrained_backbone(args).to(self.device)
         self.feature_dim = self.backbone.out_dim 
+        
+        self.buffer_size = args['buffer_size']
+        self.gamma = args['gamma']
 
+        print(f"--> [Step 2] Initializing 16k Random Buffer ({self.buffer_size})...")
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         
-        # [DPCR STORAGE]: Thay thế R bằng Dict để chống Index Error và lưu trữ nén
+        print("--> [Step 3] Initializing DPCR Storage...")
+        # Tạo trọng số Analytic thẳng trên GPU
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), device=self.device, dtype=torch.float32))
+        
+        # DPCR Stats (Dictionary)
         self._compressed_stats = {} 
         self._mu_list = {}          
         self._class_counts = {}     
@@ -75,32 +59,21 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
+        print("--> MiNbaseNet Ready!")
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
-        if self.cur_task > 0:
-            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
-        else:
-            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
-            
+        new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=(self.cur_task==0))
         if self.normal_fc is not None:
-            old_nb_output = self.normal_fc.out_features
-            new_fc.weight.data[:old_nb_output] = self.normal_fc.weight.data
+            new_fc.weight.data[:self.normal_fc.out_features] = self.normal_fc.weight.data
             if new_fc.bias is not None and self.normal_fc.bias is not None:
-                new_fc.bias.data[:old_nb_output] = self.normal_fc.bias.data
-        
-        # [FIX DEVICE]: Layer mới tạo phải đẩy lên GPU ngay
+                new_fc.bias.data[:self.normal_fc.out_features] = self.normal_fc.bias.data
         self.normal_fc = new_fc.to(self.device)
-
-    def forward_fc(self, features):
-        return features.to(self.weight.dtype) @ self.weight
 
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """Thay thế hàm fit cũ để gom dữ liệu kiểu DPCR"""
         self.eval()
-        # [FIX TYPE/DEVICE]: Chặn đứng lỗi Mismatch ngay tại cửa ngõ backbone
         X = X.to(self.device)
         with autocast('cuda', enabled=False):
             feat = self.buffer(self.backbone(X.float()).float())
@@ -110,6 +83,7 @@ class MiNbaseNet(nn.Module):
             label = labels[i].item()
             f = feat[i:i+1]
             if label not in self.temp_phi:
+                # Cấp phát 1GB thẳng trên GPU
                 self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
                 self.temp_mu[label] = torch.zeros(self.buffer_size, device=self.device)
                 self.temp_count[label] = 0
@@ -119,14 +93,14 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def compress_stats(self):
-        """Nén dữ liệu class vừa gom để giải phóng GPU (Đặc trưng của DPCR)"""
         COMPRESS_RANK = 256
         torch.cuda.empty_cache()
         for label in sorted(list(self.temp_phi.keys())):
             raw_phi = self.temp_phi[label]
             try:
                 S, V = torch.linalg.eigh(raw_phi)
-            except RuntimeError: # CPU Fallback cho ma trận 16k
+            except RuntimeError:
+                # Nếu 16k làm GPU quá tải, đẩy sang CPU
                 S, V = torch.linalg.eigh(raw_phi.cpu())
                 S, V = S.to(self.device), V.to(self.device)
 
@@ -139,10 +113,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit_analytic(self, P_drift=None, known_classes_boundary=0, init_mode=False):
-        """Hàm giải phương trình cuối cùng của DPCR"""
-        all_keys = list(self._compressed_stats.keys()) + list(self.temp_phi.keys())
-        num_total_classes = max(all_keys) + 1 if all_keys else 0
-        
+        num_total_classes = max(list(self._compressed_stats.keys()) + list(self.temp_phi.keys())) + 1
         if num_total_classes > self.weight.shape[1]:
             new_w = torch.zeros((self.buffer_size, num_total_classes), device=self.device)
             new_w[:, :self.weight.shape[1]] = self.weight
@@ -175,11 +146,10 @@ class MiNbaseNet(nn.Module):
         torch.cuda.empty_cache()
 
     def forward(self, x, new_forward=False):
-        # [FIX TYPE]: Đồng bộ hóa thiết bị/kiểu dữ liệu
         ref = next(self.backbone.parameters())
         with autocast('cuda', enabled=False):
             h = self.buffer(self.backbone(x.to(device=ref.device, dtype=ref.dtype), new_forward=new_forward).float())
-        return {'logits': self.forward_fc(h)}
+        return {'logits': h.to(self.weight.dtype) @ self.weight}
 
     def forward_normal_fc(self, x, new_forward=False):
         ref = next(self.backbone.parameters())
@@ -187,12 +157,11 @@ class MiNbaseNet(nn.Module):
             h = self.buffer(self.backbone(x.to(device=ref.device, dtype=ref.dtype), new_forward=new_forward).float())
         return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
 
+    # Giữ nguyên các hàm noise/gpm của mày
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
-
     def unfreeze_noise(self):
         for j in range(len(self.backbone.noise_maker)): self.backbone.noise_maker[j].unfreeze_incremental()
-
     def init_unfreeze(self):
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_task_0()
@@ -200,9 +169,7 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
-
     def collect_projections(self, mode='threshold', val=0.95):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
-
     def apply_gpm_to_grads(self, scale=1.0):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)

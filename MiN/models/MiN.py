@@ -6,10 +6,7 @@ import torch
 from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Subset
-import copy
-import gc 
-import os
-
+import copy, gc, os
 from utils.inc_net import MiNbaseNet
 from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
@@ -20,8 +17,12 @@ class MinNet(object):
         super().__init__()
         self.args, self.logger = args, loger
         self.device = args['device']
+        # Khởi tạo network
+        print("--> Initializing MiNbaseNet...")
         self._network = MiNbaseNet(args).to(self.device)
-        self.num_workers = args["num_workers"]
+        # Ép worker về 0 để tránh treo khi load data đầu task
+        self.num_workers = 0 
+        
         self.init_epochs, self.init_lr = args["init_epochs"], args["init_lr"]
         self.lr, self.batch_size = args["lr"], args["batch_size"]
         self.init_class, self.increment = args["init_class"], args["increment"]
@@ -62,52 +63,46 @@ class MinNet(object):
         self._network.update_noise()
         self._network.to(self.device)
         
-        self.run(DataLoader(train_set, batch_size=self.args['init_batch_size'], shuffle=True, num_workers=self.num_workers))
+        self.run(DataLoader(train_set, batch_size=self.args['init_batch_size'], shuffle=True, num_workers=0))
         self._network.collect_projections(val=0.95)
         
-        # [WORKFLOW CỦA MÀY]: Fit FC
-        self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
+        self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=0), None)
 
-        # [WORKFLOW CỦA MÀY]: Re-fit với no_aug
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
+        self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=0), None)
         self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
-        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
+        train_list, _, _ = data_manger.get_task_list(self.cur_task)
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        # [WORKFLOW CỦA MÀY]: Fit trước khi Run
-        self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
+        self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=0), None)
         self._network.update_fc(self.increment)
         self._network.update_noise()
         self._network.to(self.device)
 
-        self.run(DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers))
+        self.run(DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=0))
         self._network.collect_projections(val=0.95)
 
-        # [WORKFLOW CỦA MÀY]: Re-fit sau khi Run
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
+        self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=0), None)
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
-        """Fit FC kiểu DPCR: Gom -> Nén -> Giải"""
         self._network.eval()
         dataset = train_loader.dataset
         classes = sorted(list(set(dataset.labels)))
-        # Gom và nén từng class để tiết kiệm VRAM
         for c in classes:
             indices = np.where(np.array(dataset.labels) == c)[0]
             sub = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch)
@@ -116,19 +111,14 @@ class MinNet(object):
                     y_oh = F.one_hot(y.to(self.device), self._network.known_class)
                     self._network.accumulate_stats(x.to(self.device), y_oh)
             self._network.compress_stats(); self._clear_gpu()
-        # Giải hệ phương trình
         self._network.fit_analytic(init_mode=(self.cur_task==0))
 
     def re_fit(self, train_loader, test_loader):
-        """Re-fit kiểu DPCR: Có Drift Correction"""
-        self._network.eval()
         P = self.calculate_drift(train_loader) if self.cur_task > 0 else None
         boundary = self.known_class - self.increment if self.cur_task > 0 else 0
-        # Gom dữ liệu mới (nếu có)
         for _, x, y in train_loader:
             y_oh = F.one_hot(y.to(self.device), self._network.known_class)
             self._network.accumulate_stats(x.to(self.device), y_oh)
-        # Giải với ma trận P
         self._network.fit_analytic(P_drift=P, known_classes_boundary=boundary, init_mode=False)
         self._clear_gpu()
 
@@ -167,10 +157,7 @@ class MinNet(object):
         test_set.labels = self.cat2order(test_set.labels, data_manger)
         eval_res = self.eval_task(DataLoader(test_set, batch_size=self.init_batch_size, num_workers=0))
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
-        # [IN KẾT QUẢ ĐÚNG YÊU CẦU]
-        print(f'\nTask {self.cur_task} Results:')
-        print(f'Total Accuracy List: {self.total_acc}')
-        print(f'Average Accuracy: {np.mean(self.total_acc):.2f}%')
+        print(f'\n[RESULT] Task {self.cur_task} | Total Acc: {self.total_acc} | Avg: {np.mean(self.total_acc):.2f}%')
         self.logger.info(f'total acc: {self.total_acc}')
         self._clear_gpu()
 
