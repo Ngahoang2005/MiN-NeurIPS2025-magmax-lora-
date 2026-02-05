@@ -18,8 +18,9 @@ class RandomBuffer(torch.nn.Linear):
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # Ép về float32 để nhân ma trận chính xác với Buffer
-        return F.relu(X.float() @ self.weight.float())
+        # Ép X về cùng thiết bị và kiểu dữ liệu với weight của Buffer
+        X = X.to(device=self.weight.device, dtype=self.weight.dtype)
+        return F.relu(X @ self.weight)
 
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
@@ -34,7 +35,6 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), device=self.device))
 
-        # [FIX INDEX]: Dùng Dict để ID Class luôn chuẩn
         self._compressed_stats = {} 
         self._mu_list = {}          
         self._class_counts = {}     
@@ -56,6 +56,7 @@ class MiNbaseNet(nn.Module):
                 new_fc.weight[:self.normal_fc.out_features] = self.normal_fc.weight.data
                 if new_fc.bias is not None and self.normal_fc.bias is not None:
                     new_fc.bias[:self.normal_fc.out_features] = self.normal_fc.bias.data
+        # [FIX]: Ép layer mới tạo về đúng device ngay lập tức
         self.normal_fc = new_fc.to(self.device)
 
     def update_noise(self):
@@ -81,9 +82,11 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         self.eval()
-        # Ép float() để tránh lỗi mismatch khi thống kê ma trận 16k
+        # Ép X về device của backbone để tránh lỗi mismatch
+        X = X.to(self.device)
         with autocast('cuda', enabled=False):
-            feat = self.buffer(self.backbone(X.to(self.device).float()).float())
+            # Tính toán ở float32 cho chính xác
+            feat = self.buffer(self.backbone(X.float()).float())
         
         labels = torch.argmax(Y, dim=1)
         for i in range(feat.shape[0]):
@@ -106,7 +109,6 @@ class MiNbaseNet(nn.Module):
             try:
                 S, V = torch.linalg.eigh(raw_phi)
             except RuntimeError: 
-                # CPU Fallback cho ma trận 16k nếu GPU OOM
                 S, V = torch.linalg.eigh(raw_phi.cpu())
                 S, V = S.to(self.device), V.to(self.device)
 
@@ -156,15 +158,23 @@ class MiNbaseNet(nn.Module):
         torch.cuda.empty_cache()
 
     def forward(self, x, new_forward=False):
-        # [TRIỆT HẠ LỖI TYPE]: Ép x về float() trước khi vào ViT
-        with autocast('cuda', enabled=False):
-            h = self.buffer(self.backbone(x.float(), new_forward=new_forward).float())
+        # [QUAN TRỌNG]: Ép X về cùng device và type với backbone
+        # Dùng parameter đầu tiên của backbone làm chuẩn
+        ref_param = next(self.backbone.parameters())
+        x = x.to(device=ref_param.device, dtype=ref_param.dtype)
+        
+        h = self.buffer(self.backbone(x, new_forward=new_forward))
         return {'logits': h.to(self.weight.dtype) @ self.weight}
 
     def forward_normal_fc(self, x, new_forward=False):
-        with autocast('cuda', enabled=False):
-            h = self.buffer(self.backbone(x.float(), new_forward=new_forward).float())
+        # [QUAN TRỌNG]: Đồng bộ thiết bị
+        ref_param = next(self.backbone.parameters())
+        x = x.to(device=ref_param.device, dtype=ref_param.dtype)
+        
+        h = self.buffer(self.backbone(x, new_forward=new_forward))
+        # Ép h về cùng kiểu với normal_fc
         return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
     
     def extract_feature(self, x):
-        return self.backbone(x.float())
+        ref_param = next(self.backbone.parameters())
+        return self.backbone(x.to(device=ref_param.device, dtype=ref_param.dtype))
