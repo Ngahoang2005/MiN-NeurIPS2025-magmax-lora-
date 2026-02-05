@@ -18,8 +18,8 @@ class RandomBuffer(torch.nn.Linear):
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        X = X.to(self.weight.dtype)
-        return F.relu(X @ self.weight)
+        # Ép về float32 để nhân ma trận chính xác với Buffer
+        return F.relu(X.float() @ self.weight.float())
 
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
@@ -34,7 +34,7 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), device=self.device))
 
-        # [CHỐNG LỆCH INDEX]: Dùng Dictionary
+        # [FIX INDEX]: Dùng Dict để ID Class luôn chuẩn
         self._compressed_stats = {} 
         self._mu_list = {}          
         self._class_counts = {}     
@@ -81,8 +81,10 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         self.eval()
-        # Ép kiểu float() trước khi qua backbone để thống kê chính xác
-        feat = self.buffer(self.backbone(X.to(self.device).float()).float())
+        # Ép float() để tránh lỗi mismatch khi thống kê ma trận 16k
+        with autocast('cuda', enabled=False):
+            feat = self.buffer(self.backbone(X.to(self.device).float()).float())
+        
         labels = torch.argmax(Y, dim=1)
         for i in range(feat.shape[0]):
             label = labels[i].item()
@@ -103,7 +105,8 @@ class MiNbaseNet(nn.Module):
             raw_phi = self.temp_phi[label]
             try:
                 S, V = torch.linalg.eigh(raw_phi)
-            except RuntimeError: # Xử lý 16k bằng CPU nếu GPU quá tải
+            except RuntimeError: 
+                # CPU Fallback cho ma trận 16k nếu GPU OOM
                 S, V = torch.linalg.eigh(raw_phi.cpu())
                 S, V = S.to(self.device), V.to(self.device)
 
@@ -153,17 +156,15 @@ class MiNbaseNet(nn.Module):
         torch.cuda.empty_cache()
 
     def forward(self, x, new_forward=False):
-        # [FIX TYPE]: Đồng bộ hóa kiểu dữ liệu để tránh mismatch
-        target_dtype = self.backbone.patch_embed.proj.weight.dtype
-        h = self.buffer(self.backbone(x.to(target_dtype), new_forward=new_forward).to(self.buffer.weight.dtype))
+        # [TRIỆT HẠ LỖI TYPE]: Ép x về float() trước khi vào ViT
+        with autocast('cuda', enabled=False):
+            h = self.buffer(self.backbone(x.float(), new_forward=new_forward).float())
         return {'logits': h.to(self.weight.dtype) @ self.weight}
 
     def forward_normal_fc(self, x, new_forward=False):
-        # [FIX TYPE]: Đồng bộ hóa kiểu dữ liệu
-        target_dtype = self.backbone.patch_embed.proj.weight.dtype
-        h = self.buffer(self.backbone(x.to(target_dtype), new_forward=new_forward).to(self.buffer.weight.dtype))
+        with autocast('cuda', enabled=False):
+            h = self.buffer(self.backbone(x.float(), new_forward=new_forward).float())
         return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
     
     def extract_feature(self, x):
-        target_dtype = self.backbone.patch_embed.proj.weight.dtype
-        return self.backbone(x.to(target_dtype))
+        return self.backbone(x.float())

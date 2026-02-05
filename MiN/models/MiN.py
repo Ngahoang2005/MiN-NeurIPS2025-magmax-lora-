@@ -11,11 +11,8 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 from torch.amp import autocast, GradScaler
 
 class MinNet(object):
@@ -25,7 +22,7 @@ class MinNet(object):
         self.logger = loger
         self._network = MiNbaseNet(args)
         self.device = args['device']
-        self.num_workers = args["num_workers"] # Giữ nguyên cấu hình worker của bạn
+        self.num_workers = args["num_workers"]
 
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
@@ -39,7 +36,6 @@ class MinNet(object):
 
         self.init_class = args["init_class"]
         self.increment = args["increment"]
-
         self.buffer_size = args["buffer_size"]
         self.buffer_batch = args["buffer_batch"]
         self.gamma = args['gamma']
@@ -49,6 +45,7 @@ class MinNet(object):
         self.cur_task = -1
         self.total_acc = []
         self.scaler = GradScaler('cuda')
+        self._old_network = None 
 
     def _clear_gpu(self):
         gc.collect()
@@ -60,6 +57,7 @@ class MinNet(object):
         XtX = torch.zeros(bs, bs); XtY = torch.zeros(bs, bs)
         with torch.no_grad():
             for _, inputs, _ in clean_loader:
+                # Ép float() để tính drift chính xác
                 f_old = self._old_network.buffer(self._old_network.backbone(inputs.to(self.device).float()).float()).cpu()
                 f_new = self._network.buffer(self._network.backbone(inputs.to(self.device).float()).float()).cpu()
                 XtX += f_old.t() @ f_old; XtY += f_old.t() @ f_new
@@ -68,69 +66,61 @@ class MinNet(object):
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
+        self.logger.info(f"task_list: {train_list_name}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
-        self.test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = True
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-        self._clear_gpu()
         
-        self.run(train_loader)
+        # 1. Run training
+        self.run(DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers))
         self._network.collect_projections(val=0.95)
         self._clear_gpu()
         
+        # 2. Fit FC (Giai đoạn 1)
         self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
 
+        # 3. Re-fit với no_aug
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
-        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, None)
-     
+        self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
+        self._clear_gpu()
+        # [BỎ GỌI AFTER_TRAIN]
+
     def increment_train(self, data_manger):
         self.cur_task += 1
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
-        test_set = data_manger.get_task_data(source="test", class_list=test_list)
-        test_set.labels = self.cat2order(test_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        self.test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False, num_workers=self.num_workers)
-
+        
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        # LOGIC CỦA BẠN: Fit trước khi Run
-        self.fit_fc(train_loader, None)
+        # LOGIC: Fit trước -> Update FC -> Run -> Re-fit sau
+        self.fit_fc(DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
         self._network.update_fc(self.increment)
         self._network.update_noise()
-        self._clear_gpu()
 
         self.run(DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers))
         self._network.collect_projections(val=0.95)
-        self._clear_gpu()
 
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         self.re_fit(DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers), None)
-    
+        self._clear_gpu()
+        # [BỎ GỌI AFTER_TRAIN]
 
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
@@ -138,17 +128,16 @@ class MinNet(object):
         classes = sorted(list(set(dataset.labels)))
         for c in classes:
             indices = np.where(np.array(dataset.labels) == c)[0]
-            sub_loader = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch)
+            sub = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch)
             for _ in range(self.fit_epoch):
-                for _, inputs, targets in sub_loader:
-                    self._network.accumulate_stats(inputs, F.one_hot(targets.to(self.device), self._network.known_class))
+                for _, x, y in sub: self._network.accumulate_stats(x.to(self.device), F.one_hot(y.to(self.device), self._network.known_class))
             self._network.compress_stats(); self._clear_gpu()
         self._network.fit(init_mode=(self.cur_task==0))
 
     def re_fit(self, train_loader, test_loader):
-        P_drift = self.calculate_drift(train_loader) if self.cur_task > 0 else None
+        P = self.calculate_drift(train_loader) if self.cur_task > 0 else None
         boundary = self.known_class - self.increment if self.cur_task > 0 else 0
-        self._network.fit(P_drift=P_drift, known_classes_boundary=boundary, init_mode=False)
+        self._network.fit(P_drift=P, known_classes_boundary=boundary, init_mode=False)
         self._clear_gpu()
 
     def run(self, train_loader):
@@ -177,19 +166,24 @@ class MinNet(object):
             scheduler.step()
         self._clear_gpu()
 
-    @staticmethod
-    def cat2order(targets, datamanger): return [datamanger.map_cat2order(t) for t in targets]
-
     def after_train(self, data_manger):
         if self.cur_task == 0: self.known_class = self.init_class
         else: self.known_class += self.increment
+        
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
         eval_res = self.eval_task(DataLoader(test_set, batch_size=self.init_batch_size, num_workers=0))
+        
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
-        self.logger.info('total acc: {}'.format(self.total_acc)); self._clear_gpu()
-        print("Current Total Acc: ", self.total_acc)
+        
+        # [IN RA TOTAL VÀ AVG ACC]
+        print(f'total acc: {self.total_acc}')
+        print(f'avg_acc: {np.mean(self.total_acc):.2f}')
+        self.logger.info(f'total acc: {self.total_acc}')
+        self.logger.info(f'avg_acc: {np.mean(self.total_acc):.2f}')
+        self._clear_gpu()
+
     def eval_task(self, test_loader):
         self._network.eval(); pred, label = [], []
         with torch.no_grad():
@@ -199,3 +193,6 @@ class MinNet(object):
         res = calculate_class_metrics(pred, label)
         task_res = calculate_task_metrics(pred, label, self.init_class, self.increment)
         return {"all_class_accy": res['all_accy'], "task_confusion": task_res['task_confusion_matrices']}
+
+    @staticmethod
+    def cat2order(targets, datamanger): return [datamanger.map_cat2order(t) for t in targets]
