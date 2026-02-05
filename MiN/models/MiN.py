@@ -17,7 +17,7 @@ from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# Mixed Precision
+# Import Mixed Precision
 from torch.amp import autocast, GradScaler
 
 EPSILON = 1e-8
@@ -31,6 +31,7 @@ class MinNet(object):
         self.device = args['device']
         self.num_workers = args["num_workers"]
 
+        # [FULL RESTORE]: Khôi phục đầy đủ các biến khởi tạo của mày
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
         self.init_weight_decay = args["init_weight_decay"]
@@ -73,6 +74,8 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
+        
+        # [IN KẾT QUẢ THEO MẪU GỐC]
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
@@ -137,6 +140,7 @@ class MinNet(object):
         self.re_fit(train_loader_no_aug, self.test_loader)
         del train_set, test_set
         self._clear_gpu()
+        # [BỎ AFTER_TRAIN]
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -173,17 +177,17 @@ class MinNet(object):
         self.re_fit(train_loader_no_aug, self.test_loader)
         del train_set, test_set, train_set_no_aug
         self._clear_gpu()
+        # [BỎ AFTER_TRAIN]
 
     def fit_fc(self, train_loader, test_loader):
-        """Fit FC: Workflow gốc của mày + DPCR nén thống kê"""
         self._network.eval()
         dataset = train_loader.dataset
         classes = sorted(list(set(dataset.labels)))
         prog_bar = tqdm(range(self.fit_epoch))
         for _ in prog_bar:
             for c in classes:
-                indices = np.where(np.array(dataset.labels) == c)[0]
-                sub = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch)
+                idx = np.where(np.array(dataset.labels) == c)[0]
+                sub = DataLoader(Subset(dataset, idx), batch_size=self.buffer_batch)
                 for _, x, y in sub:
                     y_oh = F.one_hot(y.to(self.device), self._network.known_class)
                     self._network.fit(x.to(self.device), y_oh)
@@ -193,16 +197,13 @@ class MinNet(object):
         self._network.solve_analytic(init_mode=(self.cur_task==0))
 
     def re_fit(self, train_loader, test_loader):
-        """Re-fit: Workflow gốc của mày + Drift Correction"""
-        self._network.eval()
         P = self.calculate_drift(train_loader) if self.cur_task > 0 else None
         boundary = self.known_class - self.increment if self.cur_task > 0 else 0
         prog_bar = tqdm(train_loader)
         for _, x, y in prog_bar:
             y_oh = F.one_hot(y.to(self.device), self._network.known_class)
             self._network.fit(x.to(self.device), y_oh)
-            info = f"Task {self.cur_task} --> Reupdate Analytical Classifier!"
-            prog_bar.set_description(info)
+            prog_bar.set_description(f"Task {self.cur_task} --> Reupdate Analytical Classifier!")
         self._network.solve_analytic(P_drift=P, boundary=boundary, init_mode=False)
         self._clear_gpu()
 
@@ -214,15 +215,15 @@ class MinNet(object):
         with torch.no_grad():
             for _, inputs, _ in clean_loader:
                 inputs = inputs.to(self.device)
-                f_old = self._old_network.buffer(self._old_network.backbone(inputs.float()).float())
-                f_new = self._network.buffer(self._network.backbone(inputs.float()).float())
+                f_old = self._old_network.buffer(self._old_network.backbone(inputs))
+                f_new = self._network.buffer(self._network.backbone(inputs))
                 XtX += f_old.t() @ f_old; XtY += f_old.t() @ f_new
         return torch.linalg.solve(XtX + 1e-4*torch.eye(bs, device=self.device), XtY)
 
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, (self.init_lr if self.cur_task==0 else self.lr), self.args['weight_decay'])
+        optimizer = get_optimizer(self.args['optimizer_type'], filter(lambda p: p.requires_grad, self._network.parameters()), 
+                                  (self.init_lr if self.cur_task==0 else self.lr), self.args['weight_decay'])
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
         self._network.train()
         current_scale = self.compute_adaptive_scale(train_loader) if self.cur_task > 0 else 0.95
@@ -237,7 +238,8 @@ class MinNet(object):
                     if self.cur_task > 0:
                         with torch.no_grad(): l1 = self._network(inputs)['logits']
                         if l2.shape[1] > l1.shape[1]:
-                            l1 = torch.cat([l1, torch.zeros((l1.shape[0], l2.shape[1]-l1.shape[1]), device=self.device, dtype=l1.dtype)], dim=1)
+                            pad = torch.zeros((l1.shape[0], l2.shape[1]-l1.shape[1]), device=self.device, dtype=l1.dtype)
+                            l1 = torch.cat([l1, pad], dim=1)
                         logits = l2 + l1.to(l2.dtype)
                     else: logits = l2
                     loss = F.cross_entropy(logits, targets.long())

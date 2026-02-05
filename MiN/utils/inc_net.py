@@ -7,7 +7,6 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
-# Import autocast chuẩn để đồng bộ kiểu dữ liệu
 try:
     from torch.amp import autocast
 except ImportError:
@@ -52,8 +51,8 @@ class RandomBuffer(torch.nn.Linear):
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
-        # [FIX]: Đồng bộ device/type để tránh RuntimeError
-        X = X.to(device=self.weight.device, dtype=self.weight.dtype)
+        # [FIX TYPE]: Ép về dtype của weight để nhân ma trận nhanh/chuẩn
+        X = X.to(self.weight.dtype)
         return F.relu(X @ self.weight)
 
 class MiNbaseNet(nn.Module):
@@ -64,9 +63,9 @@ class MiNbaseNet(nn.Module):
         self.gamma, self.buffer_size = args['gamma'], args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
 
-        self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
+        self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
         
-        # [DPCR]: Thay ma trận R bằng storage Dictionary để chống OOM 16k
+        # [DPCR STORAGE]: Thay R bằng Dict để bất tử với Index/OOM
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
         
@@ -92,23 +91,24 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None and self.normal_fc.bias is not None:
                 new_fc.bias.data[:old_nb_output] = self.normal_fc.bias.data
         
-        # [FIX]: Layer mới tạo phải đẩy lên GPU ngay để tránh Device Mismatch
         self.normal_fc = new_fc.to(self.device)
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """Thay thế nội dung RLS bằng tích lũy thống kê DPCR"""
+        """Thay thế RLS bằng tích lũy thống kê DPCR, giữ nguyên signature Fit(X, Y)"""
         self.eval()
-        # [FIX TYPE]: Ép X về float() và tắt autocast để tránh lỗi bias mismatch của timm
-        X = X.to(self.device)
-        with autocast('cuda', enabled=False):
-            feat = self.buffer(self.backbone(X.float()).float())
-            Y = Y.to(self.device).float()
+        # [FIX TYPE]: Đồng bộ hóa trước khi vào backbone
+        ref_dtype = next(self.backbone.parameters()).dtype
+        X = X.to(device=self.device, dtype=ref_dtype)
+        
+        # Tính toán đặc trưng (Backbone chạy Mixed Precision nếu đang trong autocast)
+        feat = self.buffer(self.backbone(X))
+        Y = Y.to(device=self.device, dtype=self.weight.dtype)
 
         labels = torch.argmax(Y, dim=1)
         for i in range(feat.shape[0]):
             label = labels[i].item()
-            f = feat[i:i+1]
+            f = feat[i:i+1].float() # DPCR cần độ chính xác cao FP32
             if label not in self.temp_phi:
                 self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
                 self.temp_mu[label] = torch.zeros(self.buffer_size, device=self.device)
@@ -119,7 +119,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def compress_stats(self):
-        """Hàm nén của DPCR để giải phóng VRAM"""
+        """Hàm nén để tiết kiệm VRAM"""
         RANK = 256
         for label in sorted(list(self.temp_phi.keys())):
             S, V = torch.linalg.eigh(self.temp_phi[label])
@@ -132,7 +132,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def solve_analytic(self, P_drift=None, boundary=0, init_mode=False):
-        """Hàm giải cuối cùng của DPCR"""
+        """Bước giải hệ phương trình thay cho RLS"""
         all_keys = list(self._compressed_stats.keys()) + list(self.temp_phi.keys())
         num_total = max(all_keys) + 1 if all_keys else 0
         if num_total > self.weight.shape[1]:
@@ -164,18 +164,19 @@ class MiNbaseNet(nn.Module):
         else: self.weight.data = F.normalize(W, p=2, dim=0)
 
     def forward(self, x, new_forward=False):
-        ref = next(self.backbone.parameters())
-        with autocast('cuda', enabled=False):
-            h = self.buffer(self.backbone(x.to(ref.device, ref.dtype), new_forward=new_forward).float())
-        return {'logits': h.to(self.weight.dtype) @ self.weight}
+        ref_dtype = next(self.backbone.parameters()).dtype
+        h = self.buffer(self.backbone(x.to(dtype=ref_dtype), new_forward=new_forward))
+        return {'logits': self.forward_fc(h)}
+
+    def forward_fc(self, features):
+        return features.to(self.weight.dtype) @ self.weight
 
     def forward_normal_fc(self, x, new_forward=False):
-        ref = next(self.backbone.parameters())
-        with autocast('cuda', enabled=False):
-            h = self.buffer(self.backbone(x.to(ref.device, ref.dtype), new_forward=new_forward).float())
+        ref_dtype = next(self.backbone.parameters()).dtype
+        h = self.buffer(self.backbone(x.to(dtype=ref_dtype), new_forward=new_forward))
         return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
 
-    # Giữ nguyên các hàm bổ trợ
+    # Giữ nguyên các hàm noise/gpm gốc
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
     def unfreeze_noise(self):
@@ -190,7 +191,8 @@ class MiNbaseNet(nn.Module):
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
     def collect_projections(self, mode='threshold', val=0.95):
+        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
     def apply_gpm_to_grads(self, scale=1.0):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
-    def extract_feature(self, x): return self.backbone(x.to(self.device).float())
+    def extract_feature(self, x): return self.backbone(x.to(self.device))
