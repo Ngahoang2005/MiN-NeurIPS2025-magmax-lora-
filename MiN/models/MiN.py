@@ -180,6 +180,7 @@ class MinNet(object):
                                  num_workers=self.num_workers)
 
         self.test_loader = test_loader
+        self._old_network = copy.deepcopy(self._network).to(self.device).eval()
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
