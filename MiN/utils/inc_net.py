@@ -65,15 +65,12 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        # [DPCR]: Weight Analytic Classifier
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
 
-        # [DPCR STORAGE]: Lưu trữ thống kê nén
         self._compressed_stats = [] 
         self._mu_list = []          
         self._class_counts = []     
 
-        # Biến tạm (Lưu trên GPU, xóa ngay sau khi nén)
         self.temp_phi = {}
         self.temp_mu = {}
         self.temp_count = {}
@@ -135,10 +132,6 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        Gom dữ liệu kiểu DPCR: Cộng dồn trực tiếp vào Covariance Matrix.
-        KHÔNG lưu trữ Feature thô.
-        """
         self.eval()
         with autocast('cuda', enabled=False):
             feat = self.backbone(X).float()
@@ -147,9 +140,7 @@ class MiNbaseNet(nn.Module):
         labels = torch.argmax(Y, dim=1)
         for i in range(feat.shape[0]):
             label = labels[i].item()
-            f = feat[i:i+1] # (1, D)
-            
-            # [QUAN TRỌNG]: .detach() để cắt đứt graph, tránh OOM
+            f = feat[i:i+1]
             outer = (f.t() @ f).detach()
             mu = f.squeeze(0).detach()
             
@@ -161,32 +152,45 @@ class MiNbaseNet(nn.Module):
             self.temp_phi[label] += outer
             self.temp_mu[label] += mu
             self.temp_count[label] += 1
-            
-            # Xóa biến cục bộ ngay
             del outer, mu
 
     @torch.no_grad()
     def compress_stats(self):
         """
-        Nén ma trận Covariance bằng Eigh (GPU).
+        Phiên bản CHỐNG PHÂN MẢNH (Anti-Fragmentation)
         """
         COMPRESS_RANK = 256
+        
+        # 1. Dọn rác tổng lực trước khi bắt đầu vòng lặp
         torch.cuda.empty_cache()
         
         for label in sorted(list(self.temp_phi.keys())):
+            print(f"      -> Compressing Class {label}...", end=" ")
+            
+            # Lấy ma trận raw
             raw_phi = self.temp_phi[label]
             
-            # Sử dụng eigh trên GPU (Nhanh và nhẹ hơn SVD 50%)
-            # Eigh trả về (eigenvalues, eigenvectors) theo thứ tự tăng dần
+            # 2. Dọn rác lần nữa để đảm bảo có vùng nhớ liền mạch lớn nhất cho hàm eigh
+            torch.cuda.empty_cache() 
+            
             try:
+                # Cố gắng tính trên GPU
                 S, V = torch.linalg.eigh(raw_phi) 
-            except:
-                print(f"Warning: Eigh failed for class {label}, fallback to SVD.")
-                U, S, _ = torch.svd(raw_phi)
-                V = U
+            except RuntimeError as e:
+                # Nếu GPU không đủ chỗ (OOM hoặc Fragmentation), tự động nhảy về CPU
+                # Đây là lưới an toàn cuối cùng để không bao giờ bị Crash chương trình
+                if 'out of memory' in str(e):
+                    print(" [GPU OOM -> CPU Fallback] ", end="")
+                    torch.cuda.empty_cache()
+                    raw_cpu = raw_phi.cpu()
+                    S, V = torch.linalg.eigh(raw_cpu)
+                    S = S.to(self.device)
+                    # Lưu ý: V không đưa lại GPU ngay để tránh đầy, chỉ đưa phần top k
+                    V = V.to(self.device) 
+                else:
+                    raise e # Lỗi khác thì báo ra
 
-            # Lấy Top-K (Phần đuôi nếu dùng eigh, phần đầu nếu dùng svd)
-            # Code này giả định dùng eigh thành công
+            # Lấy Top-K
             if S.shape[0] > COMPRESS_RANK:
                 S_top = S[-COMPRESS_RANK:]
                 V_top = V[:, -COMPRESS_RANK:]
@@ -194,16 +198,20 @@ class MiNbaseNet(nn.Module):
                 S_top = S
                 V_top = V
 
-            # Lưu kết quả nén về CPU để giải phóng VRAM
+            # Lưu kết quả về CPU ngay lập tức
             self._compressed_stats.append((V_top.cpu(), S_top.cpu()))
             self._mu_list.append((self.temp_mu[label] / self.temp_count[label]).cpu())
             self._class_counts.append(self.temp_count[label])
             
-            # [QUAN TRỌNG]: Xóa dữ liệu thô ngay lập tức
+            # 3. XÓA NGAY LẬP TỨC các biến to để giải phóng RAM
             del self.temp_phi[label]
             del self.temp_mu[label]
             del raw_phi
+            del S, V, S_top, V_top # Xóa các biến trung gian
+            
+            print("Done.")
         
+        # Reset và dọn rác lần cuối
         self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
 
@@ -211,13 +219,14 @@ class MiNbaseNet(nn.Module):
     def fit(self, P_drift=None, known_classes_boundary=0, init_mode=False):
         device = self.device
         
-        # Tính toán size
+        # Dọn rác trước khi cấp phát ma trận tổng
+        torch.cuda.empty_cache()
+
         num_existing = len(self._compressed_stats)
         num_new = 0
         if self.temp_phi: num_new = max(self.temp_phi.keys()) + 1
         num_total_classes = max(num_existing, num_new)
         
-        # Mở rộng weight
         if num_total_classes > self.weight.shape[1]:
             new_cols = num_total_classes - self.weight.shape[1]
             tail = torch.zeros((self.buffer_size, new_cols), device=device)
@@ -230,8 +239,8 @@ class MiNbaseNet(nn.Module):
 
         if P_drift is not None: P_drift = P_drift.to(device)
 
-        # 1. Dữ liệu cũ (Load từ CPU -> GPU, cộng dồn -> Xóa)
         for c in range(len(self._compressed_stats)):
+            # Load từng phần lên GPU -> Tính -> Xóa ngay
             V, S = self._compressed_stats[c]
             V, S = V.to(device), S.to(device)
             
@@ -244,7 +253,6 @@ class MiNbaseNet(nn.Module):
                 phi_c = P_dual.t() @ phi_c @ P_dual
                 mu_c = mu_c @ P_dual
                 
-                # Re-compress nếu cần (Optional trong DPCR nhưng tốt cho Analytic)
                 if not init_mode:
                     try:
                         S_n, V_n = torch.linalg.eigh(phi_c)
@@ -254,21 +262,20 @@ class MiNbaseNet(nn.Module):
 
             total_phi += phi_c
             total_q[:, c] = mu_c * self._class_counts[c]
+            
+            # Xóa ngay sau khi dùng xong
             del V, S, phi_c, mu_c
 
-        # 2. Dữ liệu mới (nếu có trong temp - thường là init_mode)
         for label in self.temp_phi:
             total_phi += self.temp_phi[label]
             total_q[:, label] = self.temp_mu[label]
 
-        # 3. Giải hệ phương trình
         reg_phi = total_phi + self.gamma * torch.eye(self.buffer_size, device=device)
         try:
             W = torch.linalg.solve(reg_phi, total_q)
         except:
             W = torch.inverse(reg_phi) @ total_q
             
-        # 4. Update
         if init_mode:
             min_dim = min(self.normal_fc.weight.shape[0], W.shape[1])
             self.normal_fc.weight.data[:min_dim] = W.t()[:min_dim].to(self.normal_fc.weight.dtype)
@@ -277,6 +284,8 @@ class MiNbaseNet(nn.Module):
             
         if not init_mode:
             self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
+        
+        # Dọn rác lần cuối sau khi fit xong
         torch.cuda.empty_cache()
 
     def forward_fc(self, features):
