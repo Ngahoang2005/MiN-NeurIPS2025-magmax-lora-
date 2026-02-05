@@ -292,6 +292,10 @@ class MinNet(object):
         # 3. NÉN DỮ LIỆU (Compress)
         # Giờ mới nén temp_phi vào compressed_stats để dành cho Task sau
         self._network.compress_stats()
+        self._network.temp_phi = {} 
+        self._network.temp_mu = {}
+        
+       
         
         self._clear_gpu()
     def compute_adaptive_scale(self, current_loader):
