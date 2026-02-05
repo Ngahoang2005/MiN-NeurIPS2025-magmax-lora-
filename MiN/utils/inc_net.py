@@ -271,7 +271,8 @@ class MiNbaseNet(nn.Module):
             self.weight += K @ (Y - X @ self.weight)
             
             # [QUAN TRỌNG] Xóa ngay lập tức để giải phóng VRAM cho batch sau
-            del term, jitter, K, X, Y    
+            del term, jitter, K, X, Y, feat
+            torch.cuda.empty_cache()
     @torch.no_grad()
     def solve_analytic(self, P_drift=None, boundary=0, init_mode=False):
         # Tính toán số lượng class hiện có
