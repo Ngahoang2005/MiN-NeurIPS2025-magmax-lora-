@@ -101,6 +101,9 @@ class MinNet(object):
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
+        print('total acc: {}'.format(self.total_acc))
+        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        print('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         del test_set
 
     def save_check_point(self, path_name):

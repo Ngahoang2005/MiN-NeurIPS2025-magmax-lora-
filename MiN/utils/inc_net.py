@@ -58,7 +58,6 @@ class MiNbaseNet(nn.Module):
         self.args = args
         self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
-        
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
@@ -66,16 +65,12 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        
-        # [DPCR]: Weight Analytic Classifier
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
 
-        # [DPCR STORAGE]: Thay thế self.R
         self._compressed_stats = [] 
         self._mu_list = []          
         self._class_counts = []     
 
-        # Biến tạm (Lưu trên GPU)
         self.temp_phi = {}
         self.temp_mu = {}
         self.temp_count = {}
@@ -110,9 +105,7 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].after_task_training()
+        pass 
 
     def unfreeze_noise(self):
         for j in range(len(self.backbone.noise_maker)):
@@ -128,17 +121,17 @@ class MiNbaseNet(nn.Module):
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
 
-    # =========================================================================
-    # [DPCR LOGIC] - Thay thế RLS
-    # =========================================================================
+    def collect_projections(self, mode='threshold', val=0.95):
+        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
 
-    def forward_fc(self, features):
-        features = features.to(self.weight.dtype) 
-        return features @ self.weight
+    def apply_gpm_to_grads(self, scale=1.0):
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
 
-    @torch.no_grad()
+    @torch.no_grad() # [QUAN TRỌNG]: Chặn lưu gradient để không nổ VRAM
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """ [Hàm Mới] Chỉ gom dữ liệu vào temp, chưa tính toán """
         self.eval()
         with autocast('cuda', enabled=False):
             feat = self.backbone(X).float()
@@ -159,13 +152,18 @@ class MiNbaseNet(nn.Module):
             self.temp_mu[label] += f.squeeze(0)
             self.temp_count[label] += 1
 
-    @torch.no_grad()
+    @torch.no_grad() # [QUAN TRỌNG]: Chặn lưu gradient
     def compress_stats(self):
-        """ [Hàm Mới] Nén SVD và xóa temp để giải phóng VRAM """
         COMPRESS_RANK = 256
-        for label in sorted(self.temp_phi.keys()):
-            raw_phi = self.temp_phi[label]
+        # Xóa cache rác trước khi chạy nặng
+        torch.cuda.empty_cache()
+        
+        for label in sorted(list(self.temp_phi.keys())):
+            raw_phi = self.temp_phi[label] # Vẫn ở trên GPU
+            
+            # SVD/Eigh trực tiếp trên GPU (Nhanh và không OOM nếu đã no_grad)
             try:
+                # eigh nhanh hơn và tốn ít bộ nhớ hơn svd cho ma trận đối xứng
                 S, V = torch.linalg.eigh(raw_phi) 
             except:
                 U, S, _ = torch.svd(raw_phi)
@@ -178,25 +176,29 @@ class MiNbaseNet(nn.Module):
                 S_top = S
                 V_top = V
 
+            # Chuyển kết quả về CPU để lưu trữ lâu dài
             self._compressed_stats.append((V_top.cpu(), S_top.cpu()))
             self._mu_list.append((self.temp_mu[label] / self.temp_count[label]).cpu())
             self._class_counts.append(self.temp_count[label])
+            
+            # [QUAN TRỌNG]: Xóa ngay lập tức khỏi VRAM
+            del self.temp_phi[label]
+            del self.temp_mu[label]
+            del raw_phi
         
+        # Reset sạch sẽ
         self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
 
-    @torch.no_grad()
+    @torch.no_grad() # [QUAN TRỌNG]
     def fit(self, P_drift=None, known_classes_boundary=0, init_mode=False):
-        """ [Thay đổi] Giải phương trình Analytic (Update Weight) """
         device = self.device
         
-        # Tính tổng số class (cũ + mới đang gom)
         num_existing = len(self._compressed_stats)
         num_new = 0
         if self.temp_phi: num_new = max(self.temp_phi.keys()) + 1
         num_total_classes = max(num_existing, num_new)
         
-        # Mở rộng weight nếu cần
         if num_total_classes > self.weight.shape[1]:
             new_cols = num_total_classes - self.weight.shape[1]
             tail = torch.zeros((self.buffer_size, new_cols), device=device)
@@ -209,10 +211,11 @@ class MiNbaseNet(nn.Module):
 
         if P_drift is not None: P_drift = P_drift.to(device)
 
-        # 1. Tái tạo từ stats cũ
+        # 1. Dữ liệu cũ (Compressed - Load từ CPU lên GPU từng cái một)
         for c in range(len(self._compressed_stats)):
             V, S = self._compressed_stats[c]
-            V, S = V.to(device), S.to(device)
+            V, S = V.to(device), S.to(device) # Load lên GPU
+            
             phi_c = (V @ torch.diag(S)) @ V.t()
             mu_c = self._mu_list[c].to(device)
 
@@ -222,7 +225,7 @@ class MiNbaseNet(nn.Module):
                 phi_c = P_dual.t() @ phi_c @ P_dual
                 mu_c = mu_c @ P_dual
                 
-                if not init_mode: # Re-compress
+                if not init_mode:
                     try:
                         S_n, V_n = torch.linalg.eigh(phi_c)
                         self._compressed_stats[c] = (V_n[:, -256:].cpu(), S_n[-256:].cpu())
@@ -233,39 +236,31 @@ class MiNbaseNet(nn.Module):
             total_q[:, c] = mu_c * self._class_counts[c]
             del V, S, phi_c, mu_c
 
-        # 2. Cộng stats mới (nếu đang gom dở ở Init Mode)
+        # 2. Dữ liệu mới (Temp - Đang ở GPU)
         for label in self.temp_phi:
             total_phi += self.temp_phi[label]
             total_q[:, label] = self.temp_mu[label]
 
-        # 3. Giải hệ phương trình
+        # 3. Solve
         reg_phi = total_phi + self.gamma * torch.eye(self.buffer_size, device=device)
         try:
             W = torch.linalg.solve(reg_phi, total_q)
         except:
             W = torch.inverse(reg_phi) @ total_q
             
-        # 4. Cập nhật
+        # 4. Update
         if init_mode:
-            # Nếu normal_fc chưa đủ lớn, ta chỉ copy phần tương ứng
             min_dim = min(self.normal_fc.weight.shape[0], W.shape[1])
             self.normal_fc.weight.data[:min_dim] = W.t()[:min_dim].to(self.normal_fc.weight.dtype)
         else:
             self.weight.data = F.normalize(W, p=2, dim=0)
             
-        # Clear nếu xong
         if not init_mode:
             self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
 
-    def collect_projections(self, mode='threshold', val=0.95):
-        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
-
-    def apply_gpm_to_grads(self, scale=1.0):
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+    def forward_fc(self, features):
+        return features.to(self.weight.dtype) @ self.weight
 
     def forward(self, x, new_forward=False):
         h = self.backbone(x, new_forward=new_forward)
