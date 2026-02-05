@@ -331,3 +331,24 @@ class MinNet(object):
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         del test_set
+    def eval_task(self, test_loader):
+        model = self._network.eval()
+        pred, label = [], []
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(self.device)
+                outputs = model(inputs)
+                logits = outputs["logits"]
+                predicts = torch.max(logits, dim=1)[1]
+                pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
+                label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
+        class_info = calculate_class_metrics(pred, label)
+        task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        return {
+            "all_class_accy": class_info['all_accy'],
+            "class_accy": class_info['class_accy'],
+            "class_confusion": class_info['class_confusion_matrices'],
+            "task_accy": task_info['all_accy'],
+            "task_confusion": task_info['task_confusion_matrices'],
+            "all_task_accy": task_info['task_accy'],
+        }
