@@ -60,7 +60,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for p in self._network.backbone.parameters(): p.requires_grad = False
         self.re_fit(DataLoader(train_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=0))
-        self.after_train(data_manger)
+        
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -79,7 +79,7 @@ class MinNet(object):
         train_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_no_aug.labels = self.cat2order(train_no_aug.labels, data_manger)
         self.re_fit(DataLoader(train_no_aug, batch_size=self.buffer_batch, shuffle=True, num_workers=0))
-        self.after_train(data_manger)
+
 
     def fit_fc(self, loader, init_mode=False):
         self._network.eval()
