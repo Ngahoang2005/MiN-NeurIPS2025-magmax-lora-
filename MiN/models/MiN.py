@@ -154,43 +154,100 @@ class MinNet(object):
             boundary = self.known_class - self.increment
         self._network.fit(P_drift=P_drift, known_classes_boundary=boundary, init_mode=False)
         self._clear_gpu()
-
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
+        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+        current_scale = 0.85 
+
+        # 1. Cấu hình đóng băng/giải băng tham số
+        for param in self._network.parameters(): 
+            param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): 
+            param.requires_grad = True
         
-        for p in self._network.parameters(): p.requires_grad = False
-        for p in self._network.normal_fc.parameters(): p.requires_grad = True
-        
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
+        if self.cur_task == 0: 
+            self._network.init_unfreeze()
+        else: 
+            self._network.unfreeze_noise()
             
-        optimizer = get_optimizer(self.args['optimizer_type'], filter(lambda p: p.requires_grad, self._network.parameters()), lr, self.args['weight_decay'])
+        # 2. Khởi tạo Optimizer và Scheduler
+        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
+        prog_bar = tqdm(range(epochs))
         self._network.train()
-        for epoch in range(epochs):
-            for _, inputs, targets in train_loader:
+        self._network.to(self.device)
+        WARMUP_EPOCHS = 2
+
+        for _, epoch in enumerate(prog_bar):
+            losses = 0.0
+            correct, total = 0, 0
+            for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                optimizer.zero_grad()
-                with autocast('cuda'):
+                optimizer.zero_grad(set_to_none=True) 
+
+                # [FIX]: Dùng autocast an toàn để tránh lỗi Half vs Float
+                with autocast('cuda', enabled=True):
                     if self.cur_task > 0:
-                        l1 = self._network(inputs)['logits']
-                        l2 = self._network.forward_normal_fc(inputs)['logits']
-                        if l2.shape[1] > l1.shape[1]:
-                            l1 = torch.cat([l1, torch.zeros((l1.shape[0], l2.shape[1]-l1.shape[1]), device=self.device)], dim=1)
-                        logits = l1 + l2
+                        with torch.no_grad():
+                            # Chạy backbone + analytic fc cũ
+                            logits1 = self._network(inputs, new_forward=False)['logits']
+                        
+                        # Chạy normal_fc mới (đang train)
+                        logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                        
+                        # Fix lỗi kích thước và kiểu dữ liệu khi cộng logits
+                        if logits2.shape[1] > logits1.shape[1]:
+                            padding = torch.zeros((logits1.shape[0], logits2.shape[1] - logits1.shape[1]), 
+                                                device=self.device, dtype=logits1.dtype)
+                            logits1 = torch.cat([logits1, padding], dim=1)
+                        
+                        # Ép kiểu l1 về l2 để cộng an toàn
+                        logits_final = logits2 + logits1.to(logits2.dtype)
                     else:
-                        logits = self._network.forward_normal_fc(inputs)['logits']
-                    loss = F.cross_entropy(logits, targets.long())
+                        # Task 0: Chỉ dùng normal_fc
+                        logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                    
+                    loss = F.cross_entropy(logits_final, targets.long())
+
+                # 3. Lan truyền ngược với Scaler (Mixed Precision)
                 self.scaler.scale(loss).backward()
-                if self.cur_task > 0: self._network.apply_gpm_to_grads(scale=0.85)
+                
+                # [QUAN TRỌNG]: Quy trình GPM cho GradScaler
+                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+                    # Phải unscale trước khi can thiệp vào Gradient (apply GPM)
+                    self.scaler.unscale_(optimizer)
+                    self._network.apply_gpm_to_grads(scale=current_scale)
+
+                # 4. Cập nhật trọng số
                 self.scaler.step(optimizer)
                 self.scaler.update()
-            scheduler.step()
-        del optimizer, scheduler
-        self._clear_gpu()
+                
+                # Thống kê
+                losses += loss.item()
+                _, preds = torch.max(logits_final, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
 
+            scheduler.step()
+            train_acc = 100. * correct / total
+            info = "Task {} | Ep {}/{} | Loss {:.3f} | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc)
+            prog_bar.set_description(info)
+            
+            # Giải phóng cache định kỳ trong vòng lặp epoch
+            if (epoch + 1) % 10 == 0: 
+                self._clear_gpu()
+
+        self.logger.info(info)
+        
+        # 5. [DỌN RÁC TRIỆT ĐỂ]: Trả lại VRAM cho bước nén (Compress)
+        del optimizer
+        del scheduler
+        self._network.zero_grad(set_to_none=True)
+        self._clear_gpu()
     @staticmethod
     def cat2order(targets, datamanger):
         return [datamanger.map_cat2order(t) for t in targets]
