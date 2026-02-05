@@ -120,7 +120,7 @@ class MinNet(object):
         # 3. Refit
         self.re_fit(None, None) 
         
-        self.after_train(data_manger)
+
 
     def increment_train(self, data_manger):
         self.cur_task += 1
@@ -169,8 +169,7 @@ class MinNet(object):
         
         del train_set, test_set
         self._clear_gpu()
-        self.after_train(data_manger)
-
+      
     def fit_fc(self, train_loader, init_mode=False):
         self._network.eval()
         self._network.to(self.device)
