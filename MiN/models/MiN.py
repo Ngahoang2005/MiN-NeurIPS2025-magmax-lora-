@@ -272,6 +272,9 @@ class MinNet(object):
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(eval_res['all_accy']*100, 2))
         self.logger.info(f'total acc: {self.total_acc}')
+        self.logger.info(f'Average acc: {round(np.mean(self.total_acc),2)}')
+        print(f'total acc: {self.total_acc}')
+        print(f'Average acc: {round(np.mean(self.total_acc),2)}')
         self._clear_gpu()
 
     def save_check_point(self, path):
