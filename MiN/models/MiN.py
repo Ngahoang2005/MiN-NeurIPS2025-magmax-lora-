@@ -413,4 +413,47 @@ class MinNet(object):
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
+    def calculate_drift(self, clean_loader):
+        """
+        Tính toán ma trận chuyển đổi P để bù đắp sự thay đổi (Drift) 
+        của backbone sau khi train task mới.
+        """
+        self._network.eval()
+        self._old_network.eval()
+        
+        # Đảm bảo cả 2 network nằm trên đúng thiết bị
+        self._network.to(self.device)
+        self._old_network.to(self.device)
+        
+        bs = self.buffer_size
+        # Khởi tạo ma trận hiệp phương sai và ma trận tương quan chéo trên GPU (FP32)
+        XtX = torch.zeros(bs, bs, device=self.device, dtype=torch.float32)
+        XtY = torch.zeros(bs, bs, device=self.device, dtype=torch.float32)
+        
+        # Lấy dtype chuẩn của backbone để tránh lỗi mismatch
+        ref_dtype = next(self._network.backbone.parameters()).dtype
+        
+        with torch.no_grad():
+            for _, inputs, _ in clean_loader:
+                inputs = inputs.to(self.device, dtype=ref_dtype)
+                
+                # Trích xuất đặc trưng từ model cũ và model mới
+                # Ép về float() ngay sau buffer để tính toán ma trận chính xác
+                f_old = self._old_network.buffer(self._old_network.backbone(inputs)).float()
+                f_new = self._network.buffer(self._network.backbone(inputs)).float()
+                
+                # Tích lũy ma trận: P = (f_old^T * f_old)^-1 * (f_old^T * f_new)
+                XtX += f_old.t() @ f_old
+                XtY += f_old.t() @ f_new
+        
+        # Giải hệ phương trình tuyến tính để tìm P: XtX * P = XtY
+        # Thêm một lượng epsilon nhỏ (reg) để ma trận không bị suy biến (singular)
+        reg = 1e-4 * torch.eye(bs, device=self.device)
+        P = torch.linalg.solve(XtX + reg, XtY)
+        
+        # Dọn dẹp bộ nhớ đệm
+        del XtX, XtY, reg
+        self._clear_gpu()
+        
+        return P
     
