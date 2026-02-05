@@ -55,9 +55,9 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
-        self._old_network = None # [FIX]: Đã thêm lại biến này
+        self._old_network = None 
+
     def _clear_gpu(self):
         gc.collect()
         if torch.cuda.is_available():
@@ -122,7 +122,6 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
                                  num_workers=self.num_workers)
-
         self.test_loader = test_loader
 
         if self.args['pretrained']:
@@ -131,57 +130,39 @@ class MinNet(object):
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-        
         self._clear_gpu()
         
+        # 1. RUN
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
-        
         self._clear_gpu()
         
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        # 2. FIT CLASSIFIER
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader_buf = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
+        self.fit_fc(train_loader_buf, test_loader_buf)
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
+        # 3. RE-FIT & SAVE STATS (Quan trọng cho Task 0)
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
+                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
+        self.re_fit(train_loader_no_aug, test_loader_buf)
         
-        # nén
-        self.logger.info("--> [DPCR] Compressing Task 0 statistics...")
-        self._network.temp_phi = {} 
-        self._network.temp_mu = {}
-        self._network.temp_count = {}
-        
-        for _, inputs, targets in tqdm(train_loader, desc="Task 0 Compression"):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            y_oh = torch.nn.functional.one_hot(targets)
-            self._network.accumulate_stats(inputs, y_oh)
-            
-        self._network.compress_stats()
-        self._clear_gpu()
-        #self.check_rls_quality()
-        del train_set, test_set
+        del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
@@ -192,153 +173,214 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
-
         self.test_loader = test_loader
+        
+        # [SAVE OLD MODEL] cho tính drift
         self._old_network = copy.deepcopy(self._network).to(self.device).eval()
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
+        # 1. Fit classifier teacher
         self.fit_fc(train_loader, test_loader)
 
+        # 2. Update network
         self._network.update_fc(self.increment)
 
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
+        # 3. Train Backbone (RUN)
+        train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
+                                  num_workers=self.num_workers)
         self._network.update_noise()
-        
         self._clear_gpu()
-
-        self.run(train_loader)
+        self.run(train_loader_run)
         self._network.collect_projections(mode='threshold', val=0.95)
-       
         self._clear_gpu()
 
+        del train_loader_run
 
-        del train_set
-
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                    num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
+        # 4. RE-FIT & DPCR
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
+                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
-        del train_set, test_set
+        self.re_fit(train_loader_no_aug, test_loader)
+        
+        del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
+        """RLS thuần túy để train classifier mạnh nhất cho task hiện tại"""
         self._network.eval()
         self._network.to(self.device)
 
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
-            self._network.to(self.device)
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets)
             
-            info = "Task {} --> Update Analytical Classifier!".format(
-                self.cur_task,
-            )
+            info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
             self.logger.info(info)
             prog_bar.set_description(info)
             self._clear_gpu()
 
+    def calculate_drift(self, clean_loader):
+        """Tính Drift P trên Backbone Space (768-d)"""
+        self._network.eval()
+        self._old_network.eval()
+        self._network.to(self.device)
+        self._old_network.to(self.device)
+        
+        dim = self._network.feature_dim
+        XtX = torch.zeros(dim, dim, device=self.device)
+        XtY = torch.zeros(dim, dim, device=self.device)
+        ref_dtype = next(self._network.backbone.parameters()).dtype
+        
+        with torch.no_grad():
+            for _, inputs, _ in clean_loader:
+                inputs = inputs.to(self.device, dtype=ref_dtype)
+                f_old = self._old_network.backbone(inputs).float()
+                f_new = self._network.backbone(inputs).float()
+                XtX += f_old.t() @ f_old
+                XtY += f_old.t() @ f_new
+        
+        # Regularization mạnh hơn chút (0.1) cho backbone space
+        reg = 0.1 * torch.eye(dim, device=self.device) 
+        P = torch.linalg.solve(XtX + reg, XtY)
+        
+        del XtX, XtY
+        self._clear_gpu()
+        return P
+
     def re_fit(self, train_loader, test_loader):
+        """Quy trình Backbone Space DPCR"""
         self._network.eval()
         self._network.to(self.device)
 
-        # [CASE 1]: Task 0 -> RLS Gốc
+        # [CASE 1]: Task 0 - Chỉ lưu stats
         if self.cur_task == 0:
-            prog_bar = tqdm(train_loader, desc="RLS Refitting (Task 0)")
-            for i, (_, inputs, targets) in enumerate(prog_bar):
+            self.logger.info("--> Task 0: Saving Backbone Statistics...")
+            self._network._saved_mean = {}
+            self._network._saved_cov = {}
+            self._network._saved_count = {}
+            
+            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Collecting Task 0 Stats")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets)
-                self._network.fit(inputs, targets)
+                # Lưu stats 768d
+                self._network.update_backbone_stats(inputs, targets)
+                # Fit nhẹ lại RLS để đồng bộ tối đa (optional)
+                y_oh = torch.nn.functional.one_hot(targets)
+                self._network.fit(inputs, y_oh)
+                
             self._clear_gpu()
             return
 
-        # [CASE 2]: Task > 0 -> DPCR
+        # [CASE 2]: Task > 0 - Replay + Drift
         P = self.calculate_drift(train_loader)
         boundary = self.known_class - self.increment
         
-        self._network.temp_phi = {} 
-        self._network.temp_mu = {}
-        self._network.temp_count = {}
-
-        # 1. Gom dữ liệu
-        for _, inputs, targets in tqdm(train_loader, desc="DPCR Accumulating"):
+        # 1. Sinh Replay Data từ stats cũ (đã bù drift)
+        self.logger.info("--> Generating Replay Features...")
+        HTH_old, HTY_old = self._network.solve_using_backbone_stats(P_drift=P, boundary=boundary)
+        
+        # 2. Gom dữ liệu thực tế Task hiện tại
+        HTH_curr = torch.zeros_like(HTH_old)
+        
+        # Init HTY_curr đủ lớn để chứa class mới
+        # (solve_using_backbone_stats đã trả về HTY_old size [Buffer, Old_Classes])
+        # Ta cần mở rộng nó ra
+        
+        # Biến tạm để xác định max class id
+        max_cls = 0 
+        
+        for _, inputs, targets in tqdm(train_loader, desc="Collecting Current Task"):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
-            # accumulate_stats bản mới đã tự xử lý one-hot/index bên trong
-            self._network.accumulate_stats(inputs, targets)
-        
-        # 2. Giải (Trước nén để Acc cao nhất)
-        self.logger.info(f"--> Solving DPCR with Drift Correction...")
-        self._network.solve_analytic(P_drift=P, boundary=boundary)
+            y_oh = torch.nn.functional.one_hot(targets)
+            
+            # Tính toán cho giải hệ phương trình (Qua Buffer)
+            feat = self._network.buffer(self._network.backbone(inputs)).float()
+            HTH_curr += feat.t() @ feat
+            
+            # Xử lý HTY (Dynamic Size)
+            # Nếu HTY_curr chưa khởi tạo đúng size
+            current_batch_max = y_oh.shape[1]
+            max_cls = max(max_cls, current_batch_max)
+            
+            # Pad nếu cần thiết để cộng dồn
+            if not isinstance(HTY_curr, torch.Tensor) or HTY_curr.sum() == 0: # First init
+                 HTY_curr = torch.zeros(self.buffer_size, current_batch_max, device=self.device)
+            
+            if current_batch_max > HTY_curr.shape[1]:
+                pad = torch.zeros(self.buffer_size, current_batch_max - HTY_curr.shape[1], device=self.device)
+                HTY_curr = torch.cat([HTY_curr, pad], dim=1)
+            
+            if HTY_curr.shape[1] > y_oh.shape[1]:
+                pad = torch.zeros(y_oh.shape[0], HTY_curr.shape[1] - y_oh.shape[1], device=self.device)
+                y_oh = torch.cat([y_oh, pad], dim=1)
+                
+            HTY_curr += feat.t() @ y_oh
+            
+            # Lưu Stats Backbone cho Task này (để dùng cho tương lai)
+            self._network.update_backbone_stats(inputs, targets)
 
-        # 3. Nén
-        self._network.compress_stats()
+        # 3. Tổng hợp và Giải
+        # Pad HTY_old và HTY_curr cho cùng kích thước
+        total_cols = max(HTY_old.shape[1], HTY_curr.shape[1])
+        if HTY_old.shape[1] < total_cols:
+            pad = torch.zeros(self.buffer_size, total_cols - HTY_old.shape[1], device=self.device)
+            HTY_old = torch.cat([HTY_old, pad], dim=1)
+        if HTY_curr.shape[1] < total_cols:
+            pad = torch.zeros(self.buffer_size, total_cols - HTY_curr.shape[1], device=self.device)
+            HTY_curr = torch.cat([HTY_curr, pad], dim=1)
+
+        HTH_total = HTH_old + HTH_curr
+        HTY_total = HTY_old + HTY_curr
         
-        # 4. Dọn dẹp sạch sẽ
-        self._network.temp_phi = {} 
-        self._network.temp_mu = {}
-        del P # [QUAN TRỌNG]: Xóa ma trận P nặng 256MB
+        reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
+        W = torch.linalg.solve(HTH_total + reg, HTY_total)
         
+        # Cập nhật Weight (Resize nếu cần)
+        if self._network.weight.shape[1] < W.shape[1]:
+             new_w = torch.zeros((self.buffer_size, W.shape[1]), device=self.device)
+             new_w[:, :self._network.weight.shape[1]] = self._network.weight
+             self._network.register_buffer("weight", new_w)
+             
+        self._network.weight.data = W
+        
+        del P, HTH_old, HTY_old, HTH_curr, HTY_curr
         self._clear_gpu()
-    
+
     def compute_adaptive_scale(self, current_loader):
-        # 1. Tính prototype task hiện tại
         curr_proto = self.get_task_prototype(self._network, current_loader)
-        
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
-        
         if not self.old_prototypes:
             self.old_prototypes.append(curr_proto)
-            return 0.95 # Task đầu tiên chưa cần scale, hoặc scale cao
-            
-        # 2. So sánh với quá khứ
+            return 0.95
         max_sim = 0.0
         curr_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
         for old_p in self.old_prototypes:
             old_norm = F.normalize(old_p.unsqueeze(0), p=2, dim=1)
             sim = torch.mm(curr_norm, old_norm.t()).item()
             if sim > max_sim: max_sim = sim
-                
         self.old_prototypes.append(curr_proto)
-        
-        # 3. Tính Scale: Giống nhau nhiều -> Scale thấp (để học đè lên). Khác nhau -> Scale cao.
-        # Công thức: Scale chạy từ 0.5 đến 0.95
         scale = 0.5 + 0.5 * (1.0 - max_sim)
-        scale = max(0.65, min(scale, 0.95)) # Kẹp giá trị an toàn
-        
+        scale = max(0.65, min(scale, 0.95))
         self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
         return scale
-    def run(self, train_loader):
-        # [TỐI ƯU 1]: Import nên để đầu file, nhưng nếu để đây cũng ko sao.
-        # scaler = GradScaler() -> [SAI]: Đừng tạo mới mỗi task!
-        # Hãy dùng self.scaler đã tạo trong __init__
 
+    def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
-
-        # [TỐI ƯU 2]: Tính scale một lần đầu task
         current_scale = 0.85 
         if self.cur_task > 0:
-            # Đảm bảo bạn đã thêm hàm compute_adaptive_scale vào class MinNet nhé
             current_scale = self.compute_adaptive_scale(train_loader)
 
-        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -352,44 +394,29 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-
         WARMUP_EPOCHS = 2
 
         for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            correct, total = 0, 0
-
+            losses, correct, total = 0.0, 0, 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 optimizer.zero_grad(set_to_none=True) 
-
-                # Tự động detect device cho autocast
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            # forward cũ
                             logits1 = self._network(inputs, new_forward=False)['logits']
-                        # forward mới
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
-                    
                     loss = F.cross_entropy(logits_final, targets.long())
 
-                # [TỐI ƯU 3]: Dùng self.scaler
                 self.scaler.scale(loss).backward()
                 
-                # Logic GPM + Warmup
                 if self.cur_task > 0:
-                    # Đã vào task > 0 thì check epoch thôi
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
-                        # Áp dụng Adaptive Scale
                         self._network.apply_gpm_to_grads(scale=0.85)
-                    else:
-                        # Warm-up: Thả trôi gradient để học nhanh
-                        pass
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -398,23 +425,18 @@ class MinNet(object):
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                
-                # Cleanup
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
-
             info = "Task {} | Ep {}/{} | Loss {:.3f} | Acc {:.2f} | Scale {:.2f}".format(
                 self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, current_scale
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             print(info)
-            
-            # Clear cache định kỳ
-            if epoch % 5 == 0:
-                self._clear_gpu()
+            if epoch % 5 == 0: self._clear_gpu()
+
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -447,52 +469,7 @@ class MinNet(object):
                 with autocast('cuda'):
                     feature = model.extract_feature(inputs)
                 features.append(feature.detach().cpu())
-        
         all_features = torch.cat(features, dim=0)
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
-    def calculate_drift(self, clean_loader):
-        """
-        Tính toán ma trận chuyển đổi P để bù đắp sự thay đổi (Drift) 
-        của backbone sau khi train task mới.
-        """
-        self._network.eval()
-        self._old_network.eval()
-        
-        # Đảm bảo cả 2 network nằm trên đúng thiết bị
-        self._network.to(self.device)
-        self._old_network.to(self.device)
-        
-        bs = self.buffer_size
-        # Khởi tạo ma trận hiệp phương sai và ma trận tương quan chéo trên GPU (FP32)
-        XtX = torch.zeros(bs, bs, device=self.device, dtype=torch.float32)
-        XtY = torch.zeros(bs, bs, device=self.device, dtype=torch.float32)
-        
-        # Lấy dtype chuẩn của backbone để tránh lỗi mismatch
-        ref_dtype = next(self._network.backbone.parameters()).dtype
-        
-        with torch.no_grad():
-            for _, inputs, _ in clean_loader:
-                inputs = inputs.to(self.device, dtype=ref_dtype)
-                
-                # Trích xuất đặc trưng từ model cũ và model mới
-                # Ép về float() ngay sau buffer để tính toán ma trận chính xác
-                f_old = self._old_network.buffer(self._old_network.backbone(inputs)).float()
-                f_new = self._network.buffer(self._network.backbone(inputs)).float()
-                
-                # Tích lũy ma trận: P = (f_old^T * f_old)^-1 * (f_old^T * f_new)
-                XtX += f_old.t() @ f_old
-                XtY += f_old.t() @ f_new
-        
-        # Giải hệ phương trình tuyến tính để tìm P: XtX * P = XtY
-        # Thêm một lượng epsilon nhỏ (reg) để ma trận không bị suy biến (singular)
-        reg = 1e-4 * torch.eye(bs, device=self.device)
-        P = torch.linalg.solve(XtX + reg, XtY)
-        
-        # Dọn dẹp bộ nhớ đệm
-        del XtX, XtY, reg
-        self._clear_gpu()
-        
-        return P
-    
