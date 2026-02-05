@@ -55,7 +55,6 @@ class MinNet(object):
         self._old_network = None 
 
     def _clear_gpu(self):
-        # [DỌN RÁC MẠNH TAY]
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -108,6 +107,7 @@ class MinNet(object):
         self._clear_gpu()
         
         # 1. Run
+        train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True, num_workers=self.num_workers)
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
@@ -141,7 +141,6 @@ class MinNet(object):
         if self.args['pretrained']:
              for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        # Update FC ngay đầu
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
@@ -201,7 +200,6 @@ class MinNet(object):
                 
                 if len(indices) == 0: continue
 
-                # num_workers=0 để tránh treo
                 sub_loader = DataLoader(Subset(dataset, indices), batch_size=self.buffer_batch, shuffle=False, num_workers=0)
                 
                 for _ in range(self.fit_epoch):
@@ -296,15 +294,9 @@ class MinNet(object):
             if epoch % 5 == 0: self._clear_gpu()
         self.logger.info(info)
         
-        # [QUAN TRỌNG]: DỌN RÁC NGAY SAU KHI TRAIN XONG
-        # Xóa optimizer và scheduler để giải phóng bộ nhớ (chúng chiếm rất nhiều VRAM)
-        del optimizer
-        del scheduler
-        
-        # Xóa sạch gradient còn sót lại trong model
+        # [QUAN TRỌNG]: Dọn rác
+        del optimizer, scheduler
         self._network.zero_grad(set_to_none=True)
-        
-        # Gọi GC để dọn bộ nhớ Python và Empty Cache để trả VRAM cho CUDA
         self._clear_gpu()
 
     def compute_adaptive_scale(self, current_loader): return 0.85

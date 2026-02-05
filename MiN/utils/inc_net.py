@@ -141,29 +141,48 @@ class MiNbaseNet(nn.Module):
         for i in range(feat.shape[0]):
             label = labels[i].item()
             f = feat[i:i+1]
-            outer = (f.t() @ f).detach()
+            
+            # [CHIẾN THUẬT]: Tính toán trên GPU nhưng lưu vào CPU
+            # Để VRAM trống hoàn toàn cho bước nén tiếp theo
+            outer = (f.t() @ f).detach().cpu()
+            mu = f.squeeze(0).detach().cpu()
             
             if label not in self.temp_phi:
-                self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
-                self.temp_mu[label] = torch.zeros(self.buffer_size, device=self.device)
+                # Khởi tạo trên CPU (RAM thường rẻ hơn VRAM)
+                self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device='cpu')
+                self.temp_mu[label] = torch.zeros(self.buffer_size, device='cpu')
                 self.temp_count[label] = 0
             
             self.temp_phi[label] += outer
-            self.temp_mu[label] += f.squeeze(0).detach()
+            self.temp_mu[label] += mu
             self.temp_count[label] += 1
-            del outer
+            
+            del outer, mu
 
     @torch.no_grad()
     def compress_stats(self):
+        """
+        Chiến thuật "Hybrid": Lưu trữ CPU -> Tính toán GPU -> Lưu kết quả CPU.
+        Đảm bảo không bao giờ OOM mà vẫn nhanh hơn CPU thuần.
+        """
         COMPRESS_RANK = 256
-        torch.cuda.empty_cache()
+        torch.cuda.empty_cache() # Dọn sạch sẽ VRAM trước khi bắt đầu
         
         for label in sorted(list(self.temp_phi.keys())):
-            raw_phi = self.temp_phi[label]
+            # 1. Đưa ma trận to (4GB) lên GPU để tính
+            # Lúc này VRAM đang trống (do stats lưu ở CPU), nên 4GB vào thoải mái
+            raw_phi_gpu = self.temp_phi[label].to(self.device)
             
-            # [GPU ONLY]: Dùng eigh
-            S, V = torch.linalg.eigh(raw_phi) 
+            # 2. Tính eigh trên GPU (Nhanh vù vù)
+            try:
+                S, V = torch.linalg.eigh(raw_phi_gpu) 
+            except:
+                # Hiếm khi xảy ra nếu đã empty_cache
+                print(f"Warning: GPU eigh failed for class {label}, fallback CPU.")
+                S, V = torch.linalg.eigh(self.temp_phi[label]) # Fallback tính tại chỗ
+                S, V = S.to(self.device), V.to(self.device)
 
+            # 3. Lấy Top-K
             if S.shape[0] > COMPRESS_RANK:
                 S_top = S[-COMPRESS_RANK:]
                 V_top = V[:, -COMPRESS_RANK:]
@@ -171,13 +190,19 @@ class MiNbaseNet(nn.Module):
                 S_top = S
                 V_top = V
 
+            # 4. Đưa kết quả nhỏ (256 chiều) về CPU để lưu trữ
             self._compressed_stats.append((V_top.cpu(), S_top.cpu()))
-            self._mu_list.append((self.temp_mu[label] / self.temp_count[label]).cpu())
+            self._mu_list.append((self.temp_mu[label] / self.temp_count[label])) # Temp_mu đã ở CPU rồi
             self._class_counts.append(self.temp_count[label])
             
+            # 5. Xóa ngay lập tức khỏi GPU để đón class tiếp theo
+            del raw_phi_gpu
+            del S, V, S_top, V_top
+            torch.cuda.empty_cache() # Bắt buộc gọi để PyTorch trả bộ nhớ
+            
+            # Xóa khỏi RAM CPU luôn
             del self.temp_phi[label]
             del self.temp_mu[label]
-            del raw_phi
         
         self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
@@ -203,6 +228,7 @@ class MiNbaseNet(nn.Module):
 
         if P_drift is not None: P_drift = P_drift.to(device)
 
+        # 1. Dữ liệu cũ (Compressed - Load từ CPU lên GPU từng cái)
         for c in range(len(self._compressed_stats)):
             V, S = self._compressed_stats[c]
             V, S = V.to(device), S.to(device)
@@ -227,22 +253,32 @@ class MiNbaseNet(nn.Module):
             total_q[:, c] = mu_c * self._class_counts[c]
             del V, S, phi_c, mu_c
 
+        # 2. Dữ liệu mới (Nếu còn trong temp - trường hợp Init Fit)
+        # Lưu ý: Nếu là Final Fit thì temp_phi đã được nén và clear ở compress_stats rồi
         for label in self.temp_phi:
-            total_phi += self.temp_phi[label]
-            total_q[:, label] = self.temp_mu[label]
+            # Temp đang ở CPU, cần đưa lên GPU để cộng
+            raw_phi_gpu = self.temp_phi[label].to(device)
+            mu_gpu = self.temp_mu[label].to(device)
+            
+            total_phi += raw_phi_gpu
+            total_q[:, label] = mu_gpu
+            del raw_phi_gpu, mu_gpu
 
+        # 3. Solve
         reg_phi = total_phi + self.gamma * torch.eye(self.buffer_size, device=device)
         try:
             W = torch.linalg.solve(reg_phi, total_q)
         except:
             W = torch.inverse(reg_phi) @ total_q
             
+        # 4. Update
         if init_mode:
             min_dim = min(self.normal_fc.weight.shape[0], W.shape[1])
             self.normal_fc.weight.data[:min_dim] = W.t()[:min_dim].to(self.normal_fc.weight.dtype)
         else:
             self.weight.data = F.normalize(W, p=2, dim=0)
             
+        # Xóa temp
         if not init_mode:
             self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
