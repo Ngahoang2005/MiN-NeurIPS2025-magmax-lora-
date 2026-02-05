@@ -235,9 +235,8 @@ class MinNet(object):
         self._old_network.cpu() 
         self._clear_gpu()
         return P
-
     def re_fit(self, train_loader, test_loader):
-        """Quy trình Backbone Space DPCR"""
+        """Quy trình Backbone Space DPCR (Đã fix lỗi unpack)"""
         self._network.eval()
         self._network.to(self.device)
 
@@ -248,8 +247,10 @@ class MinNet(object):
             self._network._saved_cov = {}
             self._network._saved_count = {}
             
+            # [FIX 1]: Thêm ngoặc ( ) để unpack đúng tuple từ enumerate
             for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Collecting Task 0 Stats")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+                # Lưu stats 768d
                 self._network.update_backbone_stats(inputs, targets)
                 # Đồng bộ RLS
                 y_oh = torch.nn.functional.one_hot(targets)
@@ -269,14 +270,17 @@ class MinNet(object):
         # 2. Gom dữ liệu thực tế (Real Data)
         HTH_curr = torch.zeros_like(HTH_old)
         
-        # Khởi tạo HTY_curr với kích thước an toàn
-        # Lấy max class id từ network hiện tại (vì update_fc đã chạy)
         current_total_class = self._network.known_class
         HTY_curr = torch.zeros(self.buffer_size, current_total_class, device=self.device)
         
         prog_bar = tqdm(train_loader, desc="Collecting Current Task")
-        for _, inputs, targets in enumerate(prog_bar):
+        
+        # [FIX 2]: Sửa cú pháp unpack cho đúng cấu trúc (index_loader, images, labels)
+        for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
+            
+            # Nếu targets vượt quá số lượng class hiện tại (phòng hờ), kẹp lại hoặc pad
+            # Ở đây ta dùng one_hot với num_classes chuẩn
             y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class)
             
             # Tính feature qua Buffer
@@ -289,7 +293,7 @@ class MinNet(object):
             self._network.update_backbone_stats(inputs, targets)
 
         # 3. Tổng hợp và Giải
-        # Pad HTY_old nếu nó nhỏ hơn HTY_curr (do class tăng lên)
+        # Pad HTY_old nếu nó nhỏ hơn HTY_curr
         if HTY_old.shape[1] < HTY_curr.shape[1]:
             pad = torch.zeros(self.buffer_size, HTY_curr.shape[1] - HTY_old.shape[1], device=self.device)
             HTY_old = torch.cat([HTY_old, pad], dim=1)
@@ -301,11 +305,15 @@ class MinNet(object):
         W = torch.linalg.solve(HTH_total + reg, HTY_total)
         
         # Cập nhật Weight
+        if self._network.weight.shape[1] < W.shape[1]:
+             new_w = torch.zeros((self.buffer_size, W.shape[1]), device=self.device)
+             new_w[:, :self._network.weight.shape[1]] = self._network.weight
+             self._network.register_buffer("weight", new_w)
+             
         self._network.weight.data = W
         
         del P, HTH_old, HTY_old, HTH_curr, HTY_curr, HTH_total, HTY_total
         self._clear_gpu()
-
     def compute_adaptive_scale(self, current_loader):
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
