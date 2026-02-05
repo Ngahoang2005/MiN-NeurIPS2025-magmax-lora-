@@ -7,7 +7,6 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
-# Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
 from torch.amp import autocast 
 
 class BaseIncNet(nn.Module):
@@ -26,23 +25,17 @@ class BaseIncNet(nn.Module):
             bias = copy.deepcopy(self.fc.bias.data)
             fc.weight.data[:nb_output] = weight
             fc.bias.data[:nb_output] = bias
-
         del self.fc
         self.fc = fc
 
     @staticmethod
     def generate_fc(in_dim, out_dim):
-        fc = SimpleLinear(in_dim, out_dim)
-        return fc
+        return SimpleLinear(in_dim, out_dim)
 
     def forward(self, x):
         hyper_features = self.backbone(x)
         logits = self.fc(hyper_features)['logits']
-        return {
-            'features': hyper_features,
-            'logits': logits
-        }
-
+        return {'features': hyper_features, 'logits': logits}
 
 class RandomBuffer(torch.nn.Linear):
     def __init__(self, in_features: int, buffer_size: int, device):
@@ -50,18 +43,14 @@ class RandomBuffer(torch.nn.Linear):
         self.bias = None
         self.in_features = in_features
         self.out_features = buffer_size
-        
         factory_kwargs = {"device": device, "dtype": torch.float32}
-        
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
         self.register_buffer("weight", self.W)
-
         self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         X = X.to(self.weight.dtype)
-        return F.relu(X @ self.W)
-
+        return F.relu(X @ self.weight)
 
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
@@ -70,7 +59,6 @@ class MiNbaseNet(nn.Module):
         self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
         
-        # Analytic Params
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
@@ -78,16 +66,16 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-
+        
         # [DPCR]: Weight Analytic Classifier
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
 
-        # [DPCR STORAGE]: Thay thế self.R bằng list nén SVD
+        # [DPCR STORAGE]: Thay thế self.R
         self._compressed_stats = [] 
         self._mu_list = []          
         self._class_counts = []     
 
-        # Biến tạm (Lưu trên GPU, sẽ được xóa liên tục)
+        # Biến tạm (Lưu trên GPU)
         self.temp_phi = {}
         self.temp_mu = {}
         self.temp_count = {}
@@ -114,8 +102,7 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = new_fc
         else:
             nn.init.constant_(new_fc.weight, 0.)
-            if new_fc.bias is not None:
-                nn.init.constant_(new_fc.bias, 0.)
+            if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
 
     def update_noise(self):
@@ -142,7 +129,7 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.norm.parameters(): p.requires_grad = True
 
     # =========================================================================
-    # [ANALYTIC LEARNING (DPCR) SECTION]
+    # [DPCR LOGIC] - Thay thế RLS
     # =========================================================================
 
     def forward_fc(self, features):
@@ -151,9 +138,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        [HÀM MỚI]: CHỈ GOM DỮ LIỆU.
-        """
+        """ [Hàm Mới] Chỉ gom dữ liệu vào temp, chưa tính toán """
         self.eval()
         with autocast('cuda', enabled=False):
             feat = self.backbone(X).float()
@@ -163,7 +148,6 @@ class MiNbaseNet(nn.Module):
         for i in range(feat.shape[0]):
             label = labels[i].item()
             f = feat[i:i+1]
-            
             outer = f.t() @ f
             
             if label not in self.temp_phi:
@@ -177,9 +161,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def compress_stats(self):
-        """
-        [HÀM MỚI]: Nén dữ liệu trong temp và XÓA TEMP để giải phóng VRAM.
-        """
+        """ [Hàm Mới] Nén SVD và xóa temp để giải phóng VRAM """
         COMPRESS_RANK = 256
         for label in sorted(self.temp_phi.keys()):
             raw_phi = self.temp_phi[label]
@@ -205,14 +187,16 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, P_drift=None, known_classes_boundary=0, init_mode=False):
-        """
-        [THAY ĐỔI]: HÀM NÀY GIỜ CHỈ LÀM NHIỆM VỤ CẬP NHẬT TRỌNG SỐ (UPDATE).
-        Giải hệ phương trình Analytic từ các thống kê đã gom và nén.
-        """
+        """ [Thay đổi] Giải phương trình Analytic (Update Weight) """
         device = self.device
-        num_total_classes = len(self._compressed_stats)
         
-        # Mở rộng weight
+        # Tính tổng số class (cũ + mới đang gom)
+        num_existing = len(self._compressed_stats)
+        num_new = 0
+        if self.temp_phi: num_new = max(self.temp_phi.keys()) + 1
+        num_total_classes = max(num_existing, num_new)
+        
+        # Mở rộng weight nếu cần
         if num_total_classes > self.weight.shape[1]:
             new_cols = num_total_classes - self.weight.shape[1]
             tail = torch.zeros((self.buffer_size, new_cols), device=device)
@@ -225,8 +209,8 @@ class MiNbaseNet(nn.Module):
 
         if P_drift is not None: P_drift = P_drift.to(device)
 
-        # 1. Tái tạo và Hiệu chỉnh (Drift Correction)
-        for c in range(num_total_classes):
+        # 1. Tái tạo từ stats cũ
+        for c in range(len(self._compressed_stats)):
             V, S = self._compressed_stats[c]
             V, S = V.to(device), S.to(device)
             phi_c = (V @ torch.diag(S)) @ V.t()
@@ -238,8 +222,7 @@ class MiNbaseNet(nn.Module):
                 phi_c = P_dual.t() @ phi_c @ P_dual
                 mu_c = mu_c @ P_dual
                 
-                # Lưu lại trạng thái đã nắn chỉnh
-                if not init_mode:
+                if not init_mode: # Re-compress
                     try:
                         S_n, V_n = torch.linalg.eigh(phi_c)
                         self._compressed_stats[c] = (V_n[:, -256:].cpu(), S_n[-256:].cpu())
@@ -250,11 +233,10 @@ class MiNbaseNet(nn.Module):
             total_q[:, c] = mu_c * self._class_counts[c]
             del V, S, phi_c, mu_c
 
-        # 2. Nếu đang Init Fit (chưa nén hết), cộng thêm phần temp
-        if init_mode:
-            for label in self.temp_phi:
-                total_phi += self.temp_phi[label]
-                total_q[:, label] = self.temp_mu[label]
+        # 2. Cộng stats mới (nếu đang gom dở ở Init Mode)
+        for label in self.temp_phi:
+            total_phi += self.temp_phi[label]
+            total_q[:, label] = self.temp_mu[label]
 
         # 3. Giải hệ phương trình
         reg_phi = total_phi + self.gamma * torch.eye(self.buffer_size, device=device)
@@ -263,47 +245,35 @@ class MiNbaseNet(nn.Module):
         except:
             W = torch.inverse(reg_phi) @ total_q
             
-        # 4. Cập nhật Model
+        # 4. Cập nhật
         if init_mode:
-            # Init mode: Cập nhật normal_fc
-            self.normal_fc.weight.data = W.t().to(self.normal_fc.weight.dtype)
+            # Nếu normal_fc chưa đủ lớn, ta chỉ copy phần tương ứng
+            min_dim = min(self.normal_fc.weight.shape[0], W.shape[1])
+            self.normal_fc.weight.data[:min_dim] = W.t()[:min_dim].to(self.normal_fc.weight.dtype)
         else:
-            # Final mode: Cập nhật weight chính thức
             self.weight.data = F.normalize(W, p=2, dim=0)
             
-        # Dọn dẹp
-        self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
+        # Clear nếu xong
+        if not init_mode:
+            self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
         torch.cuda.empty_cache()
-
-    def forward(self, x, new_forward: bool = False):
-        if new_forward:
-            hyper_features = self.backbone(x, new_forward=True)
-        else:
-            hyper_features = self.backbone(x)
-        
-        hyper_features = hyper_features.to(self.weight.dtype)
-        logits = self.forward_fc(self.buffer(hyper_features))
-        return {'logits': logits}
-
-    def extract_feature(self, x):
-        return self.backbone(x)
-
-    def forward_normal_fc(self, x, new_forward: bool = False):
-        if new_forward:
-            hyper_features = self.backbone(x, new_forward=True)
-        else:
-            hyper_features = self.backbone(x)
-        
-        hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
-        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
-        logits = self.normal_fc(hyper_features)['logits']
-        return {"logits": logits}
 
     def collect_projections(self, mode='threshold', val=0.95):
         print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
-            
+
     def apply_gpm_to_grads(self, scale=1.0):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+
+    def forward(self, x, new_forward=False):
+        h = self.backbone(x, new_forward=new_forward)
+        logits = self.forward_fc(self.buffer(h))
+        return {'logits': logits}
+
+    def forward_normal_fc(self, x, new_forward=False):
+        h = self.buffer(self.backbone(x, new_forward=new_forward).to(self.buffer.weight.dtype))
+        return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
+
+    def extract_feature(self, x): return self.backbone(x)
