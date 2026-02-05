@@ -57,7 +57,7 @@ class MinNet(object):
         
         # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
-
+        self._old_network = None # [FIX]: Đã thêm lại biến này
     def _clear_gpu(self):
         gc.collect()
         if torch.cuda.is_available():
