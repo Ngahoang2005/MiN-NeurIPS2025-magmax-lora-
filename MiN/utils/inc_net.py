@@ -1,146 +1,361 @@
 import copy
+import logging
+import math
+import numpy as np
 import torch
-from torch import nn
+from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
-from torch.amp import autocast 
+# Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
+from torch.cuda.amp import autocast 
+
+class BaseIncNet(nn.Module):
+    def __init__(self, args: dict):
+        super(BaseIncNet, self).__init__()
+        self.args = args
+        self.backbone = get_pretrained_backbone(args)
+        self.feature_dim = self.backbone.out_dim
+        self.fc = None
+
+    def update_fc(self, nb_classes):
+        fc = self.generate_fc(self.feature_dim, nb_classes)
+        if self.fc is not None:
+            nb_output = self.fc.out_features
+            weight = copy.deepcopy(self.fc.weight.data)
+            bias = copy.deepcopy(self.fc.bias.data)
+            fc.weight.data[:nb_output] = weight
+            fc.bias.data[:nb_output] = bias
+
+        del self.fc
+        self.fc = fc
+
+    @staticmethod
+    def generate_fc(in_dim, out_dim):
+        fc = SimpleLinear(in_dim, out_dim)
+        return fc
+
+    def forward(self, x):
+        hyper_features = self.backbone(x)
+        logits = self.fc(hyper_features)['logits']
+        return {
+            'features': hyper_features,
+            'logits': logits
+        }
+
 
 class RandomBuffer(torch.nn.Linear):
+    """
+    Lớp mở rộng đặc trưng ngẫu nhiên (Random Projection).
+    """
     def __init__(self, in_features: int, buffer_size: int, device):
         super(torch.nn.Linear, self).__init__()
         self.bias = None
-        self.in_features, self.out_features = in_features, buffer_size
+        self.in_features = in_features
+        self.out_features = buffer_size
+        
+        # [QUAN TRỌNG] Sử dụng float32 để đảm bảo độ chính xác khi tính RLS
         factory_kwargs = {"device": device, "dtype": torch.float32}
-        self.register_buffer("weight", torch.empty((self.in_features, self.out_features), **factory_kwargs))
-        nn.init.normal_(self.weight, std=0.02)
+        
+        self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
+        self.register_buffer("weight", self.W)
+
+        self.reset_parameters()
 
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # Ép kiểu input X về cùng kiểu với weight (float32)
         X = X.to(self.weight.dtype)
-        return F.relu(X @ self.weight)
+        return F.relu(X @ self.W)
+
 
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
-        self.args, self.device = args, args['device']
-        self.backbone = get_pretrained_backbone(args).to(self.device)
-        self.gamma, self.buffer_size = args['gamma'], args['buffer_size']
+        self.args = args
+        self.backbone = get_pretrained_backbone(args)
+        self.device = args['device']
+        
+        # Các tham số cho Analytic Learning (RLS)
+        self.gamma = args['gamma']
+        self.buffer_size = args['buffer_size']
         self.feature_dim = self.backbone.out_dim 
 
-        self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
-        
-        # [KHÔI PHỤC RLS GỐC]: Dùng ma trận R để đảm bảo Acc 99.3%
+        # Random Buffer
+        self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
+
+        # Khởi tạo ma trận trọng số và ma trận hiệp phương sai cho RLS
+        # Dùng float32 để tránh lỗi singular matrix khi tính nghịch đảo
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
+
+        weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
+        self.register_buffer("weight", weight) # Trọng số của Analytic Classifier
+
         self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
 
-        # [DPCR ADD-ON]: Bộ nhớ nén để xử lý Task sau
-        self._compressed_stats = {} 
-        self._mu_list = {}          
-        self._class_counts = {}     
-        self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
-
+        # --- LẮP THÊM DPCR STORAGE ---
+        self._compressed_stats = {} # Lưu (V, S) sau khi nén
+        self._mu_list = {}          # Lưu mean vector per class
+        self._class_counts = {}     # Lưu số lượng sample per class
+        self.temp_phi = {}          # Lưu Phi tạm thời trước khi nén
+        self.temp_mu = {}
+        self.temp_count = {}
+        # Normal FC: Dùng để train Gradient Descent cho Noise Generator
         self.normal_fc = None
-        self.cur_task, self.known_class = -1, 0
+        self.cur_task = -1
+        self.known_class = 0
 
     def update_fc(self, nb_classes):
+        """
+        Cập nhật lớp Normal FC (cho việc training Noise).
+        Lớp Analytic FC (self.weight) sẽ tự động mở rộng trong hàm fit().
+        """
         self.cur_task += 1
         self.known_class += nb_classes
-        new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=(self.cur_task==0)).to(self.device)
-        if self.normal_fc is not None:
-            new_fc.weight.data[:self.normal_fc.out_features] = self.normal_fc.weight.data
-            if new_fc.bias is not None and self.normal_fc.bias is not None:
-                new_fc.bias.data[:self.normal_fc.out_features] = self.normal_fc.bias.data
-        self.normal_fc = new_fc
-
-    @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """HÀM FIT RLS GỐC 100% - Đảm bảo Acc 99.3% cho Task 0"""
-        with autocast('cuda', enabled=False):
-            X = X.to(self.device).float()
-            X = self.buffer(self.backbone(X).float())
-            Y = Y.to(self.device).float()
-
-            # Tự động mở rộng weight như bản gốc (Tránh lỗi Index)
-            num_targets = Y.shape[1]
-            if num_targets > self.weight.shape[1]:
-                tail = torch.zeros((self.weight.shape[0], num_targets - self.weight.shape[1]), device=self.device)
-                self.weight = torch.cat((self.weight, tail), dim=1)
-
-            # [RLS MATH GỐC]: Cập nhật R và Weight trực tuyến
-            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
-            K = torch.linalg.solve(term + 1e-6*torch.eye(term.shape[0], device=self.device), X @ self.R).T
+        
+        # Tạo mới Normal FC cho task hiện tại
+        if self.cur_task > 0:
+            # Task sau: Không dùng Bias để tránh bias vào lớp mới quá nhiều
+            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
+        else:
+            # Task đầu: Có bias
+            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
+            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
-            self.R -= K @ X @ self.R
-            self.weight += K @ (Y - X @ self.weight)
+        if self.normal_fc is not None:
+            # Sequential Init: Copy trọng số cũ
+            old_nb_output = self.normal_fc.out_features
+            with torch.no_grad():
+                # Copy phần cũ
+                new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
+                # Init phần mới về 0
+                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
+            
+            del self.normal_fc
+            self.normal_fc = new_fc
+        else:
+            # Task đầu tiên
+            nn.init.constant_(new_fc.weight, 0.)
+            if new_fc.bias is not None:
+                nn.init.constant_(new_fc.bias, 0.)
+            self.normal_fc = new_fc
 
-            # [DPCR ACCUMULATE]: Lưu thống kê để phục vụ nén
-            labels = torch.argmax(Y, dim=1)
-            for i in range(X.shape[0]):
-                l = labels[i].item()
-                if l not in self.temp_phi:
-                    self.temp_phi[l] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
-                    self.temp_mu[l] = torch.zeros(self.buffer_size, device=self.device)
-                    self.temp_count[l] = 0
-                f = X[i:i+1]
-                self.temp_phi[l] += (f.t() @ f).detach()
-                self.temp_mu[l] += f.squeeze(0).detach()
-                self.temp_count[l] += 1
-
-    @torch.no_grad()
-    def compress_stats(self):
-        """DPCR compression: Chỉ gọi sau khi kết thúc Task để nén data cũ"""
-        RANK = 256
-        for label in sorted(list(self.temp_phi.keys())):
-            S, V = torch.linalg.eigh(self.temp_phi[label])
-            S_top, V_top = (S[-RANK:], V[:, -RANK:]) if S.shape[0] > RANK else (S, V)
-            self._compressed_stats[label] = (V_top, S_top)
-            self._mu_list[label] = (self.temp_mu[label] / self.temp_count[label])
-            self._class_counts[label] = self.temp_count[label]
-            del self.temp_phi[label], self.temp_mu[label]
-        torch.cuda.empty_cache()
-
-    @torch.no_grad()
-    def solve_with_drift(self, P_drift=None, boundary=0):
-        """DPCR Drift Correction: Dùng để cập nhật weight khi sang Task mới"""
-        total_phi = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
-        total_q = torch.zeros(self.buffer_size, self.weight.shape[1], device=self.device)
-
-        for c, (V, S) in self._compressed_stats.items():
-            phi_c = (V @ torch.diag(S)) @ V.t()
-            mu_c = self._mu_list[c]
-            if P_drift is not None and c < boundary:
-                phi_c = P_drift.t() @ (V @ V.t()).t() @ phi_c @ (V @ V.t()) @ P_drift
-                mu_c = mu_c @ (V @ V.t()) @ P_drift
-            total_phi += phi_c
-            total_q[:, c] = mu_c * self._class_counts[c]
-
-        W = torch.linalg.solve(total_phi + self.gamma * torch.eye(self.buffer_size, device=self.device), total_q)
-        self.weight.data = F.normalize(W, p=2, dim=0)
-
-    def forward(self, x, new_forward=False):
-        ref_dtype = next(self.backbone.parameters()).dtype
-        h = self.buffer(self.backbone(x.to(dtype=ref_dtype), new_forward=new_forward))
-        return {'logits': h.to(self.weight.dtype) @ self.weight}
-
-    def forward_normal_fc(self, x, new_forward=False):
-        ref_dtype = next(self.backbone.parameters()).dtype
-        h = self.buffer(self.backbone(x.to(dtype=ref_dtype), new_forward=new_forward))
-        return {"logits": self.normal_fc(h.to(self.normal_fc.weight.dtype))['logits']}
-
-    # Noise/GPM giữ nguyên
+    # =========================================================================
+    # [MAGMAX & NOISE CONTROL SECTION]
+    # =========================================================================
+    
     def update_noise(self):
-        for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
+        """
+        Gọi khi bắt đầu Task mới.
+        Kích hoạt chế độ Sequential Initialization trong PiNoise.
+        """
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].update_noise()
+
+
     def unfreeze_noise(self):
-        for j in range(len(self.backbone.noise_maker)): self.backbone.noise_maker[j].unfreeze_incremental()
+        """Gọi cho Task > 0: Chỉ unfreeze Noise thưa"""
+        for j in range(len(self.backbone.noise_maker)):
+            self.backbone.noise_maker[j].unfreeze_incremental()
+
     def init_unfreeze(self):
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_task_0()
-            for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
-            for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
+            
+            # Giữ LayerNorm trainable ở Task 0 để ổn định base
+            if hasattr(self.backbone.blocks[j], 'norm1'):
+                for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
+            if hasattr(self.backbone.blocks[j], 'norm2'):
+                for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
+                
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
+    # =========================================================================
+    # [ANALYTIC LEARNING (RLS) SECTION]
+    # =========================================================================
+
+    def forward_fc(self, features):
+        """Forward qua Analytic Classifier"""
+        # Đảm bảo features cùng kiểu với trọng số RLS (float32)
+        features = features.to(self.weight.dtype) 
+        return features @ self.weight
+    @torch.no_grad()
+    def accumulate_stats(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        self.eval()
+        # Đảm bảo input khớp thiết bị và kiểu dữ liệu (FP32 cho thống kê)
+        ref_p = next(self.backbone.parameters())
+        X = X.to(device=self.device, dtype=ref_p.dtype)
+        
+        # Trích xuất đặc trưng và đưa về FP32 để tính toán ma trận hiệp phương sai
+        feat = self.buffer(self.backbone(X)).float()
+        labels = torch.argmax(Y, dim=1)
+        
+        for i in range(feat.shape[0]):
+            label = labels[i].item()
+            f = feat[i:i+1]
+            if label not in self.temp_phi:
+                self.temp_phi[label] = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
+                self.temp_mu[label] = torch.zeros(self.buffer_size, device=self.device)
+                self.temp_count[label] = 0
+            self.temp_phi[label] += (f.t() @ f).detach()
+            self.temp_mu[label] += f.squeeze(0).detach()
+            self.temp_count[label] += 1
+    @torch.no_grad()
+    def compress_stats(self):
+        RANK = 256 # Rank nén của DPCR
+        torch.cuda.empty_cache()
+        for label in sorted(list(self.temp_phi.keys())):
+            # Phân tích trị riêng để nén
+            S, V = torch.linalg.eigh(self.temp_phi[label])
+            S_top, V_top = (S[-RANK:], V[:, -RANK:]) if S.shape[0] > RANK else (S, V)
+            
+            # Lưu vào bộ nhớ nén (có thể đẩy sang CPU nếu GPU quá đầy, ở đây tao để GPU)
+            self._compressed_stats[label] = (V_top.detach(), S_top.detach())
+            self._mu_list[label] = (self.temp_mu[label] / self.temp_count[label]).detach()
+            self._class_counts[label] = self.temp_count[label]
+            
+            # Xóa dữ liệu thô
+            del self.temp_phi[label], self.temp_mu[label]
+        self.temp_phi, self.temp_mu, self.temp_count = {}, {}, {}
+        torch.cuda.empty_cache()
+    
+    @torch.no_grad()
+    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+        """
+        Phiên bản RLS tối ưu bộ nhớ (Memory-Efficient RLS)
+        """
+        # Tắt Autocast để tính toán chính xác FP32 (tránh lỗi Singular Matrix)
+        try:
+            from torch.amp import autocast
+        except ImportError:
+            from torch.cuda.amp import autocast
+
+        with autocast('cuda', enabled=False):
+            # 1. Feature Extraction & Expansion
+            X = self.backbone(X).float() 
+            X = self.buffer(X) 
+            
+            # Đảm bảo cùng device
+            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+
+            # 2. Mở rộng chiều của classifier nếu có lớp mới
+            num_targets = Y.shape[1]
+            if num_targets > self.weight.shape[1]:
+                increment_size = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+            elif num_targets < self.weight.shape[1]:
+                # Trường hợp hiếm: Padding Y cho khớp weight cũ
+                increment_size = self.weight.shape[1] - num_targets
+                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
+                Y = torch.cat((Y, tail), dim=1)
+
+            # 3. RLS Update (Tối ưu OOM)
+            # Công thức: P = (I + X R X^T)^-1
+            # term kích thước [Batch x Batch]. Nếu Batch lớn (Buffer), cái này rất nặng.
+            
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
+            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            
+            # Dùng linalg.solve nhanh và ổn định hơn torch.inverse
+            try:
+                # K = (X R X^T + I)^-1 @ (X R)
+                # Kích thước [Batch x Buffer Dim]
+                K = torch.linalg.solve(term + jitter, X @ self.R)
+                K = K.T # Transpose về [Buffer Dim x Batch]
+            except:
+                # Fallback nếu lỗi
+                K = self.R @ X.T @ torch.inverse(term + jitter)
+
+            # Cập nhật R và Weight
+            self.R -= K @ X @ self.R
+            self.weight += K @ (Y - X @ self.weight)
+            
+            # [QUAN TRỌNG] Xóa ngay lập tức để giải phóng VRAM cho batch sau
+            del term, jitter, K, X, Y    
+    @torch.no_grad()
+    def solve_analytic(self, P_drift=None, boundary=0, init_mode=False):
+        # Tính toán số lượng class hiện có
+        all_keys = list(self._compressed_stats.keys()) + list(self.temp_phi.keys())
+        num_total = max(all_keys) + 1 if all_keys else 0
+        
+        # Mở rộng ma trận trọng số
+        if num_total > self.weight.shape[1]:
+            new_w = torch.zeros((self.buffer_size, num_total), device=self.device)
+            new_w[:, :self.weight.shape[1]] = self.weight
+            self.register_buffer("weight", new_w)
+
+        total_phi = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
+        total_q = torch.zeros(self.buffer_size, num_total, device=self.device)
+
+        # Hồi phục từ dữ liệu nén
+        for c, (V, S) in self._compressed_stats.items():
+            phi_c = (V @ torch.diag(S)) @ V.t()
+            mu_c = self._mu_list[c]
+            
+            # Áp dụng Drift Correction cho các class cũ (Task < hiện tại)
+            if P_drift is not None and c < boundary:
+                P_drift = P_drift.to(self.device)
+                P_cs = V @ V.t()
+                phi_c = P_drift.t() @ P_cs.t() @ phi_c @ P_cs @ P_drift
+                mu_c = mu_c @ P_cs @ P_drift
+                
+            total_phi += phi_c
+            total_q[:, c] = mu_c * self._class_counts[c]
+
+        # Giải hệ phương trình tuyến tính
+        reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
+        W = torch.linalg.solve(total_phi + reg, total_q)
+        
+        if init_mode:
+            self.normal_fc.weight.data[:W.shape[1]] = W.t().to(self.normal_fc.weight.dtype)
+        else:
+            self.weight.data = F.normalize(W, p=2, dim=0)
+    # =========================================================================
+    # [FORWARD PASSES]
+    # =========================================================================
+
+    def forward(self, x, new_forward: bool = False):
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        # [SỬA]: Đảm bảo đặc trưng đồng nhất kiểu dữ liệu trước khi vào Buffer
+        hyper_features = hyper_features.to(self.weight.dtype)
+        
+        # Buffer trả về ReLU(X @ W), forward_fc thực hiện X @ Weight
+        logits = self.forward_fc(self.buffer(hyper_features))
+        
+        return {'logits': logits}
+    def extract_feature(self, x):
+        """Chỉ trích xuất đặc trưng từ Backbone"""
+        return self.backbone(x)
+
+    def forward_normal_fc(self, x, new_forward: bool = False):
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        # [SỬA]: Buffer thường chứa trọng số FP32, ép hyper_features lên FP32 
+        # để phép nhân trong Buffer diễn ra chính xác trước khi đưa vào Classifier
+        hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
+        
+        # Sau đó ép về kiểu của normal_fc (thường là Half nếu dùng autocast)
+        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
+        
+        logits = self.normal_fc(hyper_features)['logits']
+        return {"logits": logits}
     def collect_projections(self, mode='threshold', val=0.95):
-        for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+        """
+        Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
+        """
+        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
     def apply_gpm_to_grads(self, scale=1.0):
-        for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+        """
+        Thực hiện chiếu trực giao gradient cho mu và sigma.
+        """
+        for j in range(self.backbone.layer_num):
+            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
