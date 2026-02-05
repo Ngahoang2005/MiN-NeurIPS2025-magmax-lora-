@@ -141,7 +141,6 @@ class MiNbaseNet(nn.Module):
         for i in range(feat.shape[0]):
             label = labels[i].item()
             f = feat[i:i+1]
-            # [FIX OOM]: .detach()
             outer = (f.t() @ f).detach()
             
             if label not in self.temp_phi:
@@ -152,26 +151,19 @@ class MiNbaseNet(nn.Module):
             self.temp_phi[label] += outer
             self.temp_mu[label] += f.squeeze(0).detach()
             self.temp_count[label] += 1
-            
-            # Xóa biến tạm ngay
             del outer
 
     @torch.no_grad()
     def compress_stats(self):
-        """
-        [FIX OOM]: Nén trên GPU dùng eigh, xóa dữ liệu thô ngay lập tức.
-        """
         COMPRESS_RANK = 256
         torch.cuda.empty_cache()
         
         for label in sorted(list(self.temp_phi.keys())):
             raw_phi = self.temp_phi[label]
             
-            # Sử dụng eigh trên GPU (Nhẹ hơn SVD)
-            # Trả về (eigenvalues, eigenvectors)
+            # [GPU ONLY]: Dùng eigh
             S, V = torch.linalg.eigh(raw_phi) 
 
-            # Lấy đuôi (lớn nhất)
             if S.shape[0] > COMPRESS_RANK:
                 S_top = S[-COMPRESS_RANK:]
                 V_top = V[:, -COMPRESS_RANK:]
@@ -179,12 +171,10 @@ class MiNbaseNet(nn.Module):
                 S_top = S
                 V_top = V
 
-            # Lưu kết quả về CPU để trống VRAM cho class tiếp theo
             self._compressed_stats.append((V_top.cpu(), S_top.cpu()))
             self._mu_list.append((self.temp_mu[label] / self.temp_count[label]).cpu())
             self._class_counts.append(self.temp_count[label])
             
-            # Xóa ngay lập tức khỏi GPU
             del self.temp_phi[label]
             del self.temp_mu[label]
             del raw_phi
@@ -215,7 +205,6 @@ class MiNbaseNet(nn.Module):
 
         for c in range(len(self._compressed_stats)):
             V, S = self._compressed_stats[c]
-            # Load từng cái lên GPU
             V, S = V.to(device), S.to(device)
             
             phi_c = (V @ torch.diag(S)) @ V.t()
@@ -236,7 +225,6 @@ class MiNbaseNet(nn.Module):
 
             total_phi += phi_c
             total_q[:, c] = mu_c * self._class_counts[c]
-            # Xóa ngay
             del V, S, phi_c, mu_c
 
         for label in self.temp_phi:

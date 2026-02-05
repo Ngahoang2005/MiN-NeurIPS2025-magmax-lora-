@@ -55,6 +55,7 @@ class MinNet(object):
         self._old_network = None 
 
     def _clear_gpu(self):
+        # [DỌN RÁC MẠNH TAY]
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -210,8 +211,6 @@ class MinNet(object):
                         self._network.accumulate_stats(inputs, targets)
                 
                 self._network.compress_stats()
-                
-                # [QUAN TRỌNG]: Dọn rác VRAM sau mỗi class
                 self._clear_gpu()
 
             self._network.fit(init_mode=False)
@@ -297,9 +296,15 @@ class MinNet(object):
             if epoch % 5 == 0: self._clear_gpu()
         self.logger.info(info)
         
-        # [CỰC KỲ QUAN TRỌNG]: Xóa optimizer để giải phóng VRAM cho bước Fit
+        # [QUAN TRỌNG]: DỌN RÁC NGAY SAU KHI TRAIN XONG
+        # Xóa optimizer và scheduler để giải phóng bộ nhớ (chúng chiếm rất nhiều VRAM)
         del optimizer
         del scheduler
+        
+        # Xóa sạch gradient còn sót lại trong model
+        self._network.zero_grad(set_to_none=True)
+        
+        # Gọi GC để dọn bộ nhớ Python và Empty Cache để trả VRAM cho CUDA
         self._clear_gpu()
 
     def compute_adaptive_scale(self, current_loader): return 0.85
