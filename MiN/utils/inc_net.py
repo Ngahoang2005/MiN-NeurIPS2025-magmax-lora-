@@ -65,7 +65,7 @@ class RandomBuffer(torch.nn.Linear):
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         # Ép kiểu input X về cùng kiểu với weight (float32)
         X = X.to(self.weight.dtype)
-        return X @ self.W
+        return F.relu(X @ self.W)
 
 
 class MiNbaseNet(nn.Module):
@@ -98,9 +98,6 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-        self._saved_mean = {}
-        self._saved_cov = {}
-        self._saved_count = {}
 
     def update_fc(self, nb_classes):
         """
@@ -288,98 +285,3 @@ class MiNbaseNet(nn.Module):
         """
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
-    # =========================================================================
-    # [DPCR CORE FUNCTIONS ADDED HERE]
-    # =========================================================================
-    
-    @torch.no_grad()
-    def update_backbone_stats(self, inputs, targets):
-        """Bản sửa lỗi: Dùng float64 để tính Stats và kẹp giá trị chống nổ"""
-        features = self.backbone(inputs).detach().to(torch.float64) # Ép lên float64
-        
-        for c in torch.unique(targets):
-            c = c.item()
-            mask = (targets == c)
-            feats_batch = features[mask]
-            n_batch = feats_batch.shape[0]
-            if n_batch == 0: continue
-
-            mean_batch = feats_batch.mean(dim=0)
-            centered = feats_batch - mean_batch
-            m2_batch = centered.T @ centered
-
-            if c not in self._saved_count:
-                self._saved_count[c] = n_batch
-                self._saved_mean[c] = mean_batch
-                self._saved_cov[c] = m2_batch
-            else:
-                n_old = self._saved_count[c]
-                mean_old = self._saved_mean[c]
-                m2_old = self._saved_cov[c]
-                n_new = n_old + n_batch
-                
-                delta = mean_batch - mean_old
-                mean_new = mean_old + delta * (n_batch / n_new)
-                # Kẹp delta để tránh outer product bùng nổ
-                m2_addition = torch.outer(delta, delta) * (n_old * n_batch / n_new)
-                
-                self._saved_count[c] = n_new
-                self._saved_mean[c] = mean_new
-                # Cập nhật và ép kiểu về float64 để cực kỳ chính xác
-                self._saved_cov[c] = m2_old + m2_batch + m2_addition
-
-    def solve_dpcr(self, P_drift, boundary):
-        """Bản sửa lỗi: Ép P_drift về float64 để tính toán stats an toàn"""
-        HTH_old = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
-        HTY_old = torch.zeros(self.buffer_size, boundary, device=self.device)
-        
-        # Chuyển ma trận trôi sang float64
-        P_drift = P_drift.detach().to(torch.float64)
-        
-        for c in range(boundary):
-            count = self._saved_count[c]
-            mean_old = self._saved_mean[c] # Đã là float64
-            # Chia lấy Covariance và kẹp giá trị
-            cov_old = (self._saved_cov[c] / (count - 1 if count > 1 else 1)).clamp(-1e5, 1e5)
-            
-            # TSSP thực hiện trên float64
-            mean_new = (mean_old @ P_drift).to(torch.float32)
-            cov_new = (P_drift.t() @ cov_old @ P_drift).to(torch.float32)
-            
-            # Khử nhiễu ma trận đối xứng
-            cov_new = 0.5 * (cov_new + cov_new.t())
-            
-            # CIP: Sinh mẫu (Dùng float32 tại đây cho nhẹ nhưng data đã sạch)
-            try:
-                L = torch.linalg.cholesky(cov_new + 1e-4 * torch.eye(self.feature_dim, device=self.device))
-            except:
-                e, v = torch.linalg.eigh(cov_new + 1e-4 * torch.eye(self.feature_dim, device=self.device))
-                L = v @ torch.diag(torch.sqrt(e.clamp(min=1e-7)))
-
-            sampled_z = mean_new + torch.randn(min(count, 200), self.feature_dim, device=self.device) @ L.t()
-            
-            # Quay lại pipeline của bạn
-            features_proj = self.buffer(sampled_z)
-            HTH_old += features_proj.t() @ features_proj
-            
-            y_onehot = torch.zeros(features_proj.shape[0], boundary, device=self.device)
-            y_onehot[:, c] = 1.0
-            HTY_old += features_proj.t() @ y_onehot
-            
-        return HTH_old, HTY_old
-    
-    def simple_ridge_solve(self, HTH, HTY, lambda_reg=0.1):
-        """Giải Ridge Regression: W = (HTH + lambda*I)^-1 * HTY"""
-        I = torch.eye(HTH.shape[0], device=self.device)
-        try:
-            W = torch.linalg.solve(HTH + lambda_reg * I, HTY)
-        except:
-            W = torch.inverse(HTH + lambda_reg * I) @ HTY
-        return W
-
-    def category_normalization(self, W):
-        """CN: Chuẩn hóa norm của weight vector từng class"""
-        norms = torch.norm(W, p=2, dim=0, keepdim=True)
-        # Tránh chia cho 0
-        norms = torch.where(norms == 0, torch.ones_like(norms), norms)
-        return W / norms

@@ -65,9 +65,7 @@ import torch
 import torch.nn as nn
 import copy
 import gc
-import torch.nn.functional as F
-import math
-import numpy as np  
+
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -77,8 +75,7 @@ class PiNoise(nn.Module):
         nn.init.xavier_uniform_(self.w_down)
         
         self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        # nn.init.xavier_uniform_(self.w_up)
-        nn.init.normal_(self.w_up, std=1e-5)
+        nn.init.xavier_uniform_(self.w_up)
         
         self.hidden_dim = hidden_dim
         
@@ -97,7 +94,7 @@ class PiNoise(nn.Module):
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         
         self.feature_cache = [] 
-        self.debug_printed = False
+
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
@@ -109,9 +106,7 @@ class PiNoise(nn.Module):
 
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
-
+        for param in self.parameters(): param.requires_grad = True
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
 
@@ -151,9 +146,6 @@ class PiNoise(nn.Module):
 
     def forward(self, hyper_features, new_forward=False):
         # 1. Down Projection
-        if not self.debug_printed and self.training:
-            print("--> [DEBUG] PiNoise.forward() IS EXECUTING!")
-            self.debug_printed = True
         x_down = hyper_features @ self.w_down 
         
         # 2. Caching for GPM
@@ -261,6 +253,7 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
