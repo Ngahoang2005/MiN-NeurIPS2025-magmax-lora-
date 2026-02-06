@@ -346,56 +346,66 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def solve_dpcr(self, P_drift, boundary):
         """
-        Thực hiện TSSP (Transform Stat) và CIP (Replay)
-        P_drift: Ma trận trôi [dim, dim]
-        boundary: Số class cũ
+        Phiên bản Robust: Chống lỗi NaN khi Covariance Matrix mất tính PSD.
         """
         HTH_old = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
         HTY_old = torch.zeros(self.buffer_size, boundary, device=self.device)
         
         P_drift = P_drift.to(self.device).float()
         
-        print(f"--> [DPCR] Replaying stats for {boundary} classes using Drift Matrix...")
+        print(f"--> [DPCR] Replaying stats with Robust Sampling (SVD Fallback)...")
         
         for c in range(boundary):
             mean_old = self._saved_mean[c]
-          
             count = self._saved_count[c]
+            
+            # 1. Lấy Covariance thực (Unbiased)
             if count > 1:
-                cov_real = self._saved_cov[c] / (count - 1) 
+                cov_real = self._saved_cov[c] / (count - 1)
             else:
-                cov_real = torch.eye(self.feature_dim, device=self.device) * 1e-6
-
-            # Gán vào biến cũ để logic phía dưới không phải sửa
-            cov_old = cov_real
-            # 1. TSSP: Transform Stats by P
-            # mean_new = mean_old @ P
-            # cov_new = P.T @ cov_old @ P
+                cov_real = torch.eye(self.feature_dim, device=self.device) * 1e-4
+            
+            # 2. TSSP: Transform Stats
             mean_new = mean_old @ P_drift
-            cov_new = P_drift.t() @ cov_old @ P_drift
+            cov_new = P_drift.t() @ cov_real @ P_drift
             
-            # 2. CIP: Sampling from transformed distribution
-            # Sinh ra features đại diện
+            # [FIX QUAN TRỌNG]: Ép đối xứng ma trận để giảm sai số
+            cov_new = 0.5 * (cov_new + cov_new.t())
+            
+            # 3. CIP: Robust Sampling (Thủ công thay vì dùng MultivariateNormal)
+            num_samples = min(count, 200)
+            
+            # Thêm Jitter để ổn định (Noise injection)
+            jitter = 1e-4 * torch.eye(self.feature_dim, device=self.device)
+            cov_final = cov_new + jitter
+            
             try:
-                dist = torch.distributions.MultivariateNormal(mean_new, covariance_matrix=cov_new + 1e-4*torch.eye(self.feature_dim, device=self.device))
-                sampled_z = dist.sample((min(count, 200), )) # Sample 200 samples/class representative
-            except:
-                sampled_z = mean_new.unsqueeze(0).repeat(min(count, 200), 1)
+                # Cách 1: Thử Cholesky (Nhanh nhưng dễ lỗi)
+                L = torch.linalg.cholesky(cov_final)
+            except RuntimeError:
+                # Cách 2: SVD / Eigendecomposition (Chậm hơn nhưng an toàn tuyệt đối)
+                # print(f"    [Warning] Class {c}: Cholesky failed. Fallback to SVD.")
+                e, v = torch.linalg.eigh(cov_final)
+                # Cắt bỏ eigenvalue âm (Nguyên nhân gây NaN)
+                e = torch.clamp(e, min=1e-6)
+                # Tái tạo lại L sao cho L @ L.T = Cov
+                L = v @ torch.diag(torch.sqrt(e))
+
+            # Reparameterization Trick: Z = mu + epsilon * L
+            # epsilon ~ N(0, I)
+            epsilon = torch.randn(num_samples, self.feature_dim, device=self.device)
+            sampled_z = mean_new.unsqueeze(0) + epsilon @ L.t()
             
-            # 3. Qua Buffer (Random Projection)
+            # 4. Qua Buffer & Tích lũy (Giữ nguyên)
             features_proj = self.buffer(sampled_z) # [N, Buffer_Dim]
             
-            # 4. Tích lũy vào HTH và HTY
-            # HTH += Phi^T * Phi
             HTH_old += features_proj.t() @ features_proj
             
-            # HTY += Phi^T * Y (One-hot)
             y_onehot = torch.zeros(features_proj.shape[0], boundary, device=self.device)
             y_onehot[:, c] = 1.0
             HTY_old += features_proj.t() @ y_onehot
             
         return HTH_old, HTY_old
-
     def simple_ridge_solve(self, HTH, HTY, lambda_reg=0.1):
         """Giải Ridge Regression: W = (HTH + lambda*I)^-1 * HTY"""
         I = torch.eye(HTH.shape[0], device=self.device)
