@@ -7,7 +7,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
-# Import autocast để tắt nó trong quá trình tính toán ma trận chính xác cao
+# Import autocast
 try:
     from torch.amp import autocast
 except ImportError:
@@ -78,13 +78,12 @@ class MiNbaseNet(nn.Module):
         # Random Buffer
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
-        # RLS Parameters
+        # [RLS GỐC] Các tham số cho Analytic Learning cũ (dùng cho hàm fit)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
         self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
 
-        # --- DPCR STORAGE (BACKBONE SPACE - 768 dim) ---
-        # Lưu Mean và Covariance ở không gian Backbone để Replay chính xác
+        # --- [DPCR STORAGE] Lưu trữ thống kê Backbone (768-dim) ---
         self._saved_mean = {} 
         self._saved_cov = {}
         self._saved_count = {}
@@ -139,11 +138,10 @@ class MiNbaseNet(nn.Module):
         features = features.to(self.weight.dtype) 
         return features @ self.weight
 
-    # --- [ORIGINAL RLS FIT] ---
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Dùng cho Task 0 và fit_fc. Giữ nguyên RLS gốc để đạt Acc cao nhất.
+        [RLS GỐC - KHÔNG SỬA]: Giữ nguyên để dùng cho bước Warm-up / Task 0.
         """
         with autocast('cuda', enabled=False):
             X_input = X.to(self.device).float()
@@ -153,7 +151,6 @@ class MiNbaseNet(nn.Module):
             
             Y = Y.to(self.weight.device).float()
 
-            # Expand Classifier if needed
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
@@ -163,7 +160,7 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((Y.shape[0], self.weight.shape[1] - num_targets), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # RLS Update
+            # RLS Update (Recursive)
             term = torch.eye(feat.shape[0], device=feat.device) + feat @ self.R @ feat.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             try:
@@ -177,16 +174,16 @@ class MiNbaseNet(nn.Module):
             del term, jitter, K, X_input, Y, feat
             torch.cuda.empty_cache()
 
-    # --- [DPCR BACKBONE SPACE METHODS] ---
+    # --- [DPCR IMPLEMENTATION: TSSP -> CIP -> RECONSTRUCTION] ---
 
     @torch.no_grad()
     def update_backbone_stats(self, X: torch.Tensor, Y: torch.Tensor):
-        """Gom thống kê Mean/Cov ở không gian Backbone (768-d)"""
+        """Gom thống kê Mean/Cov (768-d) để dùng cho DPCR sau này."""
         self.eval()
         ref_p = next(self.backbone.parameters())
         X = X.to(device=self.device, dtype=ref_p.dtype)
         
-        # Chỉ lấy feature backbone (Chưa qua Buffer)
+        # Lấy feature BACKBONE (chưa qua Buffer)
         features = self.backbone(X).float() 
         
         if Y.dim() > 1: labels = torch.argmax(Y, dim=1)
@@ -203,50 +200,50 @@ class MiNbaseNet(nn.Module):
                 self._saved_cov[l] = torch.zeros(self.feature_dim, self.feature_dim, device=self.device)
                 self._saved_count[l] = 0
             
-            # Cộng dồn Mean và Covariance
             self._saved_mean[l] += f_sub.sum(dim=0)
             self._saved_cov[l] += f_sub.t() @ f_sub
             self._saved_count[l] += f_sub.shape[0]
 
     @torch.no_grad()
-    def solve_using_backbone_stats(self, P_drift=None, boundary=0):
-        """Replay bằng cách Sampling từ Backbone Stats -> Drift -> Buffer -> RLS components"""
+    def solve_dpcr(self, P_drift=None, boundary=0):
+        """
+        Thực hiện quy trình DPCR: TSSP (Drift) -> CIP (Sampling) -> Replay Data.
+        """
         if not self._saved_mean:
             return (torch.zeros(self.buffer_size, self.buffer_size, device=self.device),
                     torch.zeros(self.buffer_size, 0, device=self.device))
 
         num_total_known = max(list(self._saved_mean.keys())) + 1
         
-        # Mở rộng classifier
+        # Mở rộng classifier nếu cần (để khớp size)
         if num_total_known > self.weight.shape[1]:
             new_w = torch.zeros((self.buffer_size, num_total_known), device=self.device)
             new_w[:, :self.weight.shape[1]] = self.weight
             self.register_buffer("weight", new_w)
 
-        # Ma trận hệ số tích lũy cho RLS: (H^T H) và (H^T Y)
         HTH = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
         HTY = torch.zeros(self.buffer_size, num_total_known, device=self.device)
 
         if P_drift is not None: P_drift = P_drift.to(self.device)
-        
-        # Hệ số Shrinkage để ổn định Gaussian Sampling
         LAMBDA_SHRINK = 0.05 
 
         for c, count in self._saved_count.items():
+            # 1. Load Stats cũ
             mean_vec = self._saved_mean[c] / count
             sec_mom = self._saved_cov[c] / count
             cov_mat = sec_mom - torch.outer(mean_vec, mean_vec)
             
-            # [SHRINKAGE]
+            # Shrinkage (tăng ổn định cho CIP sampling)
             eye = torch.eye(cov_mat.shape[0], device=self.device)
             cov_mat = (1 - LAMBDA_SHRINK) * cov_mat + LAMBDA_SHRINK * eye
 
-            # [DRIFT CORRECTION]
+            # 2. [TSSP]: Áp dụng Global Drift P
             if P_drift is not None and c < boundary:
                 mean_vec = mean_vec @ P_drift
                 cov_mat = P_drift.t() @ cov_mat @ P_drift
             
-            # [SAMPLING]
+            # 3. [CIP]: Sampling từ Covariance đã sửa
+            # Đây là cách CIP hoạt động trên mạng phi tuyến: dùng Covariance định hình Subspace
             num_sample = min(count, 500) 
             try:
                 dist = torch.distributions.MultivariateNormal(mean_vec, covariance_matrix=cov_mat)
@@ -254,12 +251,11 @@ class MiNbaseNet(nn.Module):
             except:
                 z = torch.randn(num_sample, mean_vec.shape[0], device=self.device) * 0.1 + mean_vec
 
-            # [PROJECTION THROUGH BUFFER] -> Feature phi tuyến chuẩn
+            # 4. Projection qua Buffer (Non-linear)
             h_pseudo = self.buffer(z.float()) 
             
-            # Scale factor để cân bằng trọng số
+            # 5. Tích lũy cho Ridge Regression
             scale_factor = count / num_sample
-            
             HTH += (h_pseudo.t() @ h_pseudo) * scale_factor
             
             Y_pseudo = torch.zeros(num_sample, num_total_known, device=self.device)
@@ -268,18 +264,23 @@ class MiNbaseNet(nn.Module):
 
         return HTH, HTY
 
-    # Các hàm forward pass
-    def forward(self, x, new_forward: bool = False):
-        if new_forward: hyper_features = self.backbone(x, new_forward=True)
-        else: hyper_features = self.backbone(x)
-        
-        hyper_features = hyper_features.to(self.weight.dtype)
-        logits = self.forward_fc(self.buffer(hyper_features))
-        return {'logits': logits}
+    @torch.no_grad()
+    def simple_ridge_solve(self, HTH, HTY):
+        """Giải Ridge Regression (Eq. 19 trong bài báo)"""
+        reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
+        W = torch.linalg.solve(HTH + reg, HTY)
+        return W
 
-    def extract_feature(self, x):
-        return self.backbone(x)
+    @torch.no_grad()
+    def category_normalization(self, weight):
+        """[CN] Category-wise Normalization (Eq. 22 trong bài báo)"""
+        norms = torch.norm(weight, p=2, dim=0) # [Num_Classes]
+        mean_norm = norms.mean()
+        norms[norms == 0] = 1.0
+        normalized_weight = weight * (mean_norm / norms)
+        return normalized_weight
 
+    # Forward Passes
     def forward_normal_fc(self, x, new_forward: bool = False):
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
         else: hyper_features = self.backbone(x)
@@ -288,6 +289,9 @@ class MiNbaseNet(nn.Module):
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
+
+    def extract_feature(self, x):
+        return self.backbone(x)
 
     def collect_projections(self, mode='threshold', val=0.95):
         print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")

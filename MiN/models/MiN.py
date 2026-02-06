@@ -11,13 +11,8 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
-# Import Mixed Precision
 from torch.amp import autocast, GradScaler
 
 class MinNet(object):
@@ -27,9 +22,8 @@ class MinNet(object):
         self.logger = loger
         self._network = MiNbaseNet(args)
         self.device = args['device']
-        
-        # [FIX OOM 1]: Giới hạn worker để tránh tràn RAM
-        self.num_workers = min(args["num_workers"], 4)
+        # [FIX]: Set num_workers=0 để tránh lỗi DataLoader worker killed
+        self.num_workers = 0 
 
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
@@ -78,7 +72,6 @@ class MinNet(object):
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        
         del test_set
 
     def save_check_point(self, path_name):
@@ -93,7 +86,7 @@ class MinNet(object):
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
+        self.logger.info(f"task_list: {train_list_name}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
@@ -117,12 +110,12 @@ class MinNet(object):
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
         
-        # 2. FIT CLASSIFIER (RLS)
+        # 2. FIT (Train Classifier bằng RLS gốc - 3 Epoch)
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
-        self.fit_fc(train_loader_buf, test_loader)
+        self.fit_fc(train_loader_buf)
 
-        # 3. RE-FIT & SAVE STATS (Quan trọng cho DPCR Task sau)
+        # 3. RE-FIT (Lưu stats chuẩn bị cho DPCR Task sau)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
@@ -131,7 +124,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, test_loader)
+        self.re_fit(train_loader_no_aug)
         
         del train_set, test_set, train_set_no_aug
         self._clear_gpu()
@@ -139,43 +132,42 @@ class MinNet(object):
     def increment_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
+        self.logger.info(f"task_list: {train_list_name}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        
-        # [FIX OOM 2]: Lưu model cũ sang CPU để tiết kiệm VRAM cho quá trình RUN
+        # Lưu Old Model (Trên CPU để tiết kiệm VRAM)
         self._old_network = copy.deepcopy(self._network).eval().cpu()
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        # 1. Fit classifier teacher
-        self.fit_fc(train_loader, test_loader)
-
-        # 2. Update network
+        # 1. FIT (Warm-up / Teacher Classifier bằng RLS gốc)
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+                                  num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+                                 num_workers=self.num_workers)
+        
+        self.fit_fc(train_loader) 
         self._network.update_fc(self.increment)
 
-        # 3. Train Backbone (RUN)
-        # Vì _old_network đã ở CPU nên GPU trống trải, train không bị OOM
+        # 2. RUN (Train Backbone)
         train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                   num_workers=self.num_workers)
         self._network.update_noise()
         self._clear_gpu()
+        
+        print(f"--> Start Training Backbone Task {self.cur_task}...")
         self.run(train_loader_run)
+        
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
-
         del train_loader_run
 
-        # 4. RE-FIT & DPCR
+        # 3. RE-FIT (DPCR Update: TSSP -> CIP -> CN)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
         train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
@@ -184,127 +176,156 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader_no_aug, test_loader)
+        self.re_fit(train_loader_no_aug)
         
+        # Cleanup
+        self._old_network = None
         del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
-    def fit_fc(self, train_loader, test_loader):
-        """RLS thuần túy để train classifier mạnh nhất cho task hiện tại"""
-        self._network.eval()
-        self._network.to(self.device)
-
-        prog_bar = tqdm(range(self.fit_epoch))
-        for _, epoch in enumerate(prog_bar):
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                targets = torch.nn.functional.one_hot(targets)
-                self._network.fit(inputs, targets)
-            
-            info = "Task {} --> Update Analytical Classifier!".format(self.cur_task)
-            prog_bar.set_description(info)
-            self._clear_gpu()
-
     def calculate_drift(self, clean_loader):
-        """Tính Drift P trên Backbone Space (768-d)"""
+        """Tính Drift P trên Backbone Space (768-d) + CHECK DRIFT"""
         self._network.eval()
         
-        # Đưa old_network lên GPU để tính toán, sau đó lại trả về CPU hoặc xóa
+        # Đưa old_network lên GPU
         self._old_network.to(self.device)
         self._old_network.eval()
         
         dim = self._network.feature_dim
-        XtX = torch.zeros(dim, dim, device=self.device)
-        XtY = torch.zeros(dim, dim, device=self.device)
+        # Dùng double precision để tính toán chính xác nhất
+        XtX = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
+        XtY = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
         ref_dtype = next(self._network.backbone.parameters()).dtype
+        
+        # Biến để monitor độ trôi
+        diff_sum = 0.0
+        count = 0
         
         with torch.no_grad():
             for _, inputs, _ in clean_loader:
                 inputs = inputs.to(self.device, dtype=ref_dtype)
-                f_old = self._old_network.backbone(inputs).float()
-                f_new = self._network.backbone(inputs).float()
+                
+                # [QUAN TRỌNG]: Đảm bảo backbone trả về feature ĐÃ CÓ NOISE
+                # Nếu backbone code của bạn cần tham số 'with_noise=True', hãy thêm vào đây
+                f_old = self._old_network.backbone(inputs).double()
+                f_new = self._network.backbone(inputs).double()
+                
+                # Monitor drift thực tế trên batch này
+                diff = (f_new - f_old).norm(p=2, dim=1).mean()
+                diff_sum += diff.item()
+                count += 1
+                
                 XtX += f_old.t() @ f_old
                 XtY += f_old.t() @ f_new
         
-        # Regularization (0.1) cho backbone space
-        reg = 0.1 * torch.eye(dim, device=self.device) 
+        # Regularization (Ridge)
+        reg = 0.1 * torch.eye(dim, device=self.device, dtype=torch.float64) 
         P = torch.linalg.solve(XtX + reg, XtY)
         
+        # [CHECK POINT]: Kiểm tra xem P có phải Identity không
+        P_float = P.float()
+        identity = torch.eye(dim, device=self.device)
+        deviation = torch.norm(P_float - identity)
+        
+        print("\n" + "="*40)
+        print(f"--> [DPCR MONITOR] Task {self.cur_task}")
+        print(f"    + Average Feature Shift Norm: {diff_sum/count:.4f}")
+        print(f"    + P Matrix Deviation (||P-I||): {deviation:.4f}")
+        
+        if deviation < 0.01:
+            print("    [CẢNH BÁO ĐỎ] ⚠️ Drift gần như bằng 0!")
+            print("    Lý do: Backbone Frozen và Noise không thay đổi hoặc không được kích hoạt.")
+            print("    Giải pháp: Kiểm tra lại hàm forward của backbone xem có cộng Noise không?")
+        else:
+            print("    [OK] ✅ DPCR đã phát hiện Semantic Shift. P Matrix hợp lệ.")
+        print("="*40 + "\n")
+
         del XtX, XtY
-        # Đẩy old_network về CPU hoặc xóa để tiết kiệm
         self._old_network.cpu() 
         self._clear_gpu()
-        return P
-    def re_fit(self, train_loader, test_loader):
-        """Quy trình Backbone Space DPCR (Đã fix lỗi unpack)"""
+        
+        return P_float
+    def fit_fc(self, train_loader):
+        """
+        Dùng hàm fit gốc (RLS) để train classifier.
+        Dùng cho Task 0 và bước Warm-up ở các Task sau.
+        """
         self._network.eval()
         self._network.to(self.device)
 
-        # [CASE 1]: Task 0 - Chỉ lưu stats backbone
+        prog_bar = tqdm(range(self.fit_epoch), desc=f"RLS Fit Task {self.cur_task}")
+        for _, epoch in enumerate(prog_bar):
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                targets = torch.nn.functional.one_hot(targets)
+                self._network.fit(inputs, targets) # Gọi hàm fit RLS gốc
+            
+            self._clear_gpu()
+
+    def re_fit(self, train_loader):
+        """
+        [DPCR Update]: TSSP -> CIP -> Ridge Regression -> CN
+        """
+        self._network.eval()
+        self._network.to(self.device)
+
+        # [CASE 1]: Task 0 - Chỉ cần lưu stats, ko cần DPCR
         if self.cur_task == 0:
-            self.logger.info("--> Task 0: Saving Backbone Statistics...")
+            self.logger.info("--> Task 0: Collecting Backbone Statistics...")
             self._network._saved_mean = {}
             self._network._saved_cov = {}
             self._network._saved_count = {}
             
-            # [FIX 1]: Thêm ngoặc ( ) để unpack đúng tuple từ enumerate
-            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Collecting Task 0 Stats")):
+            # [FIX LỖI UNPACK]: Thêm ngoặc ( ) để unpack đúng
+            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 # Lưu stats 768d
                 self._network.update_backbone_stats(inputs, targets)
-                # Đồng bộ RLS
-                y_oh = torch.nn.functional.one_hot(targets)
-                self._network.fit(inputs, y_oh)
-                
+            
             self._clear_gpu()
             return
 
-        # [CASE 2]: Task > 0 - Replay + Drift Correction
+        # [CASE 2]: Task > 0 - Full DPCR Pipeline
+        # 1. Tính TSSP (Drift P) [cite: 167]
         P = self.calculate_drift(train_loader)
         boundary = self.known_class - self.increment
         
-        # 1. Sinh Replay Features (Sampling từ stats cũ)
-        self.logger.info("--> Generating Replay Features...")
-        HTH_old, HTY_old = self._network.solve_using_backbone_stats(P_drift=P, boundary=boundary)
+        # 2. CIP Replay: Sinh dữ liệu cũ đã bù Drift + Subspace [cite: 181]
+        self.logger.info("--> DPCR: CIP Replay & Drift Correction...")
+        HTH_old, HTY_old = self._network.solve_dpcr(P_drift=P, boundary=boundary)
         
-        # 2. Gom dữ liệu thực tế (Real Data)
+        # 3. Gom dữ liệu mới
         HTH_curr = torch.zeros_like(HTH_old)
         
         current_total_class = self._network.known_class
         HTY_curr = torch.zeros(self.buffer_size, current_total_class, device=self.device)
         
-        prog_bar = tqdm(train_loader, desc="Collecting Current Task")
-        
-        # [FIX 2]: Sửa cú pháp unpack cho đúng cấu trúc (index_loader, images, labels)
+        prog_bar = tqdm(train_loader, desc="DPCR: Collecting New Task")
         for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
+            y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class).float()
             
-            # Nếu targets vượt quá số lượng class hiện tại (phòng hờ), kẹp lại hoặc pad
-            # Ở đây ta dùng one_hot với num_classes chuẩn
-            y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class)
-            
-            # Tính feature qua Buffer
             feat = self._network.buffer(self._network.backbone(inputs)).float()
-            
             HTH_curr += feat.t() @ feat
-            HTY_curr += feat.t() @ y_oh.float()
+            HTY_curr += feat.t() @ y_oh
             
-            # Lưu Stats Backbone cho tương lai
+            # Lưu stats backbone cho task này
             self._network.update_backbone_stats(inputs, targets)
 
-        # 3. Tổng hợp và Giải
-        # Pad HTY_old nếu nó nhỏ hơn HTY_curr
+        # Pad HTY_old nếu class tăng lên
         if HTY_old.shape[1] < HTY_curr.shape[1]:
             pad = torch.zeros(self.buffer_size, HTY_curr.shape[1] - HTY_old.shape[1], device=self.device)
             HTY_old = torch.cat([HTY_old, pad], dim=1)
 
+        # 4. Giải Ridge Regression (Classifier Reconstruction) [cite: 236]
         HTH_total = HTH_old + HTH_curr
         HTY_total = HTY_old + HTY_curr
+        W = self._network.simple_ridge_solve(HTH_total, HTY_total)
         
-        reg = self.gamma * torch.eye(self.buffer_size, device=self.device)
-        W = torch.linalg.solve(HTH_total + reg, HTY_total)
+        # 5. Áp dụng Category-wise Normalization (CN) [cite: 252]
+        W = self._network.category_normalization(W)
         
-        # Cập nhật Weight
+        # 6. Cập nhật Weight
         if self._network.weight.shape[1] < W.shape[1]:
              new_w = torch.zeros((self.buffer_size, W.shape[1]), device=self.device)
              new_w[:, :self._network.weight.shape[1]] = self._network.weight
@@ -314,6 +335,8 @@ class MinNet(object):
         
         del P, HTH_old, HTY_old, HTH_curr, HTY_curr, HTH_total, HTY_total
         self._clear_gpu()
+
+    # (Các hàm khác giữ nguyên như cũ)
     def compute_adaptive_scale(self, current_loader):
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
