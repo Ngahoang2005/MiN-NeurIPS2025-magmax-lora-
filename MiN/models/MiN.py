@@ -109,10 +109,12 @@ class MinNet(object):
         return targets
 
     def init_train(self, data_manger):
+        # ==========================================
+        # TASK 0 FLOW: RUN -> FIT_FC -> RE_FIT
+        # ==========================================
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
+        self.logger.info(f"task_list: {train_list_name}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
@@ -121,105 +123,96 @@ class MinNet(object):
 
         train_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
-
+        
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = True
+            for param in self._network.backbone.parameters(): param.requires_grad = True
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
-        
         self._clear_gpu()
         
+        # 1. RUN (Train Backbone + Noise)
+        print("--> [Task 0] Step 1: Running Backbone Training...")
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        
         self._clear_gpu()
         
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-        self.fit_fc(train_loader, test_loader)
+        # 2. FIT_FC (Train Classifier using Original RLS - 3 Epochs)
+        print("--> [Task 0] Step 2: Fit FC (Original RLS)...")
+        train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+                                      num_workers=self.num_workers)
+        self.fit_fc(train_loader_buf)
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
+        # 3. RE_FIT (Preparation for DPCR - Saving Stats)
+        print("--> [Task 0] Step 3: Re-Fit (Saving Stats for DPCR)...")
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
+                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        del train_set, test_set
+        self.re_fit(train_loader_no_aug)
+        
+        del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
     def increment_train(self, data_manger):
+        # ==========================================
+        # TASK > 0 FLOW: FIT_FC -> RUN -> RE_FIT
+        # ==========================================
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
-        self.logger.info("task_list: {}".format(train_list_name))
-        self.logger.info("task_order: {}".format(train_list))
+        self.logger.info(f"task_list: {train_list_name}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                  num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                 num_workers=self.num_workers)
-
-        self.test_loader = test_loader
         # Lưu Old Model để tính Drift
         self._old_network = copy.deepcopy(self._network).eval().cpu()
-        
+
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.fit_fc(train_loader, test_loader)
-
+        # 1. FIT_FC (Teacher/Warmup using Original RLS)
+        print(f"--> [Task {self.cur_task}] Step 1: Fit FC (Warm-up)...")
+        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+                                  num_workers=self.num_workers)
+        
+        self.fit_fc(train_loader) 
         self._network.update_fc(self.increment)
 
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
+        # 2. RUN (Train Backbone + Noise)
+        print(f"--> [Task {self.cur_task}] Step 2: Running Backbone Training...")
+        train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
+                                      num_workers=self.num_workers)
         self._network.update_noise()
-        
         self._clear_gpu()
-
-        self.run(train_loader)
+        
+        self.run(train_loader_run)
+        
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
-        
         self._clear_gpu()
+        del train_loader_run
 
-
-        del train_set
-
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                    num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
+        # 3. RE_FIT (DPCR Logic: TSSP -> CIP -> CN)
+        print(f"--> [Task {self.cur_task}] Step 3: Re-Fit (DPCR Execution)...")
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
+                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
-            for param in self._network.backbone.parameters():
-                param.requires_grad = False
+            for param in self._network.backbone.parameters(): param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
+        self.re_fit(train_loader_no_aug)
+        
+        # Cleanup
         self._old_network = None
-        del train_set, test_set
+        del train_set, test_set, train_set_no_aug
         self._clear_gpu()
     def calculate_drift(self, clean_loader):
         """Tính Drift P & DEBUG xem Noise có hoạt động không"""
