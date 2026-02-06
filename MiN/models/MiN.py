@@ -16,9 +16,8 @@ from utils.toolkit import tensor2numpy, count_parameters
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
-# Import Mixed Precision
-from torch.cuda.amp import autocast, GradScaler
+# [FIX]: Dùng thư viện chuẩn mới của PyTorch để hỗ trợ 'cuda' string
+from torch.amp import autocast, GradScaler
 EPSILON = 1e-8
 
 class MinNet(object):
