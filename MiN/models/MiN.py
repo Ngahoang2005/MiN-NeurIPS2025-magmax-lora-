@@ -441,7 +441,7 @@ class MinNet(object):
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
 
-        # Freeze/Unfreeze Logic
+        # 1. Freeze / Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -450,18 +450,15 @@ class MinNet(object):
         else: 
             self._network.unfreeze_noise()
             
-        # [DEBUG 1]: Kiểm tra số lượng tham số được train
+        # [DEBUG] Kiểm tra tham số train
         params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
-        print(f"\n--> [DEBUG TASK {self.cur_task}] Số lượng Tensor tham số được train: {len(params)}")
+        print(f"\n--> [DEBUG TASK {self.cur_task}] Params to train: {len(params)}")
         if len(params) == 0:
-            print("❌ LỖI: Không có tham số nào được set requires_grad=True! Kiểm tra lại unfreeze_noise.")
+            print("❌ LỖI: Optimizer rỗng! Kiểm tra lại hàm unfreeze_noise.")
             return
 
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-
-        # [DEBUG 2]: In ra Learning Rate thực tế
-        print(f"--> [DEBUG TASK {self.cur_task}] Initial LR: {optimizer.param_groups[0]['lr']}")
 
         prog_bar = tqdm(range(epochs))
         self._network.train()
@@ -471,15 +468,15 @@ class MinNet(object):
         for _, epoch in enumerate(prog_bar):
             losses, correct, total = 0.0, 0, 0
             
-            # Biến theo dõi gradient
-            grad_norm_sum = 0.0
-            batch_count = 0
-
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                optimizer.zero_grad(set_to_none=True) 
                 
-                with autocast('cuda'):
+                # [FIX 1] Xóa set_to_none=True để an toàn hơn khi debug
+                optimizer.zero_grad() 
+                
+                # [FIX 2] TẮT AUTOCAST (Dùng FP32 thuần túy)
+                # with autocast('cuda'): <--- ĐÃ BỎ
+                if True:
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
@@ -491,33 +488,40 @@ class MinNet(object):
                     
                     loss = F.cross_entropy(logits_final, targets.long())
 
-                self.scaler.scale(loss).backward()
+                # [FIX 3] BACKWARD TRỰC TIẾP (Không dùng Scaler)
+                loss.backward()
                 
+                # GPM Projection (nếu cần)
                 if self.cur_task > 0:
                     if epoch >= WARMUP_EPOCHS:
-                        self.scaler.unscale_(optimizer)
+                        # Không cần unscale vì đang dùng FP32
                         self._network.apply_gpm_to_grads(scale=0.85)
                 
-                # [DEBUG 3]: Check Gradient trước khi step
-                if self.cur_task > 0 and i == 0: # Chỉ check batch đầu của task > 0
-                    self.scaler.unscale_(optimizer) # Unscale để soi grad thật
+                # [DEBUG QUAN TRỌNG] Check Gradient Batch đầu tiên
+                if self.cur_task > 0 and i == 0: 
                     total_norm = 0.0
                     for p in params:
                         if p.grad is not None:
                             total_norm += p.grad.data.norm(2).item() ** 2
                     total_norm = total_norm ** 0.5
-                    grad_norm_sum = total_norm
+                    
                     print(f"    [Ep {epoch} Batch 0] Gradient Norm: {total_norm:.6f}")
-                    if total_norm == 0:
-                        print("    ⚠️ CẢNH BÁO: Gradient = 0! Noise không học được gì.")
+                    if math.isnan(total_norm):
+                        print("    ❌ LỖI CHẾT NGƯỜI: Gradient vẫn bị NaN!")
+                        # Clip grad để chống crash tạm thời (nhưng cần sửa init)
+                        torch.nn.utils.clip_grad_norm_(params, 1.0)
+                    elif total_norm == 0:
+                        print("    ⚠️ CẢNH BÁO: Gradient = 0! Noise không học.")
 
-                self.scaler.step(optimizer)
-                self.scaler.update()
+                # [FIX 4] STEP TRỰC TIẾP
+                optimizer.step()
                 
                 losses += loss.item()
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
+                
+                # Clean memory
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
@@ -528,7 +532,9 @@ class MinNet(object):
             )
             self.logger.info(info)
             prog_bar.set_description(info)
+            
             if epoch % 5 == 0: self._clear_gpu()
+    
     def compute_test_acc(self, test_loader):
         model = self._network.eval()
         correct, total = 0, 0
