@@ -417,7 +417,19 @@ class MinNet(object):
             self.logger.info(info)
             prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
-
+    def compute_test_acc(self, test_loader):
+        model = self._network.eval()
+        correct, total = 0, 0
+        device = self.device
+        with torch.no_grad(), autocast('cuda'):
+            for i, (_, inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(device)
+                outputs = model(inputs)
+                logits = outputs["logits"]
+                predicts = torch.max(logits, dim=1)[1]
+                correct += (predicts.cpu() == targets).sum()
+                total += len(targets)
+        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []

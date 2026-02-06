@@ -279,7 +279,22 @@ class MiNbaseNet(nn.Module):
         norms[norms == 0] = 1.0
         normalized_weight = weight * (mean_norm / norms)
         return normalized_weight
-
+    def forward(self, x, new_forward: bool = False):
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        # [SỬA]: Đảm bảo đặc trưng đồng nhất kiểu dữ liệu trước khi vào Buffer
+        hyper_features = hyper_features.to(self.weight.dtype)
+        
+        # Buffer trả về ReLU(X @ W), forward_fc thực hiện X @ Weight
+        logits = self.forward_fc(self.buffer(hyper_features))
+        
+        return {'logits': logits}
+    def extract_feature(self, x):
+        """Chỉ trích xuất đặc trưng từ Backbone"""
+        return self.backbone(x)
     # Forward Passes
     def forward_normal_fc(self, x, new_forward: bool = False):
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
