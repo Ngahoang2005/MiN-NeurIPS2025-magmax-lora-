@@ -65,15 +65,19 @@ import torch
 import torch.nn as nn
 import copy
 import gc
-
+import torch.nn.functional as F
+import math
+import numpy as np  
+factory_kwargs = {'device': 'cpu', 'dtype': torch.float32}
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
-        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        factory_kwargs = {'device': device, 'dtype': torch.float32}
         # --- Shared Fixed Parts (LoRA-style) ---
-        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.w_down = torch.empty((in_dim, hidden_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_down)
-        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
+        self.w_up = torch.empty((hidden_dim, out_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_up)
         
         self.hidden_dim = hidden_dim
