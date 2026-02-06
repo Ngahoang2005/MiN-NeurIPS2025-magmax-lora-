@@ -150,6 +150,9 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].update_noise()
 
     def unfreeze_noise(self):
+        if not hasattr(self.backbone, 'noise_maker'):
+             print("⚠️ Cảnh báo: Backbone không có noise_maker!")
+             return
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_incremental()
 
