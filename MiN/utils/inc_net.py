@@ -254,7 +254,7 @@ class MiNbaseNet(nn.Module):
         # Dùng pinverse để tránh singular matrix
         self.common_corr_inv = torch.linalg.pinv(Sigma_hat)
 
-    def predict_combined(self, x, beta=1.5):
+    def predict_combined(self, x, beta=1.0):
         """
         Combine Analytic Logits (RLS) + FeCAM Scores (Mahalanobis)
         """
