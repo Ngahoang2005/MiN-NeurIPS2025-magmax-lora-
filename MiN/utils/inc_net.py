@@ -84,7 +84,6 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
         # Khởi tạo ma trận trọng số và ma trận hiệp phương sai cho RLS
-        # Dùng float32 để tránh lỗi singular matrix khi tính nghịch đảo
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
@@ -94,221 +93,255 @@ class MiNbaseNet(nn.Module):
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R) # Ma trận hiệp phương sai đảo (Inverse Covariance Matrix)
 
-        # Normal FC: Dùng để train Gradient Descent cho Noise Generator
+        # Normal FC
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-        # --- [NEW] FeCAM STORAGE ---
-        # Lưu Mean của từng class (Backbone Space)
+        
+        # --- [FeCAM STORAGE] ---
+        # 1. Class Means (Transformed space)
         self.register_buffer("class_means", torch.zeros(0, self.feature_dim)) 
-        # Lưu Common Covariance Inverse (Backbone Space)
-        self.register_buffer("common_cov_inv", torch.eye(self.feature_dim))
         
-        self.fecam_shrinkage = 0.5 # Hệ số co (Shrinkage) chuẩn thường dùng
-    def update_fecam_stats(self, train_loader):
-        """
-        Tính toán Class Means và Common Covariance theo phong cách FeCAM.
-        Gọi hàm này sau khi finish task (ví dụ trong after_train hoặc cuối increment_train).
-        """
-        self.eval()
-        print("--> [FeCAM] Updating Statistics (Common Covariance + Shrinkage)...")
+        # 2. Common Covariance (Accumulated Weighted Average)
+        self.register_buffer("common_cov", torch.zeros(self.feature_dim, self.feature_dim))
         
-        all_feats = []
-        all_labels = []
+        # 3. Inference Matrix (Correlation Normalized Inverse)
+        self.register_buffer("common_corr_inv", torch.eye(self.feature_dim))
+        self.register_buffer("diag_std", torch.ones(self.feature_dim)) # Để normalize feature lúc inference
         
-        # 1. Extract Features (Backbone Level)
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                # Lấy feature backbone (chưa qua buffer)
-                feats = self.backbone(inputs) 
-                # FeCAM chuẩn: L2 Normalize feature trước khi tính
-                feats = F.normalize(feats, p=2, dim=1)
-                
-                all_feats.append(feats.cpu())
-                all_labels.append(targets.cpu())
-                
-        all_feats = torch.cat(all_feats, dim=0).to(self.device) # [N, D]
-        all_labels = torch.cat(all_labels, dim=0).to(self.device)
-        
-        # 2. Update Class Means
-        # Mở rộng buffer lưu means nếu cần
-        current_classes = all_labels.unique()
-        max_cls = int(current_classes.max().item()) + 1
-        
-        if max_cls > self.class_means.shape[0]:
-            # Padding thêm cho các class mới
-            pad_size = max_cls - self.class_means.shape[0]
-            self.class_means = torch.cat([self.class_means, torch.zeros(pad_size, self.feature_dim).to(self.device)], dim=0)
-            
-        # Tính Mean cho từng class (kể cả cũ và mới để refresh drift)
-        for c in current_classes:
-            idxs = (all_labels == c)
-            # Mean của normalized features
-            mean_c = all_feats[idxs].mean(dim=0)
-            mean_c = F.normalize(mean_c, p=2, dim=0) # Normalize mean lần nữa (theo FeCAM code)
-            self.class_means[int(c.item())] = mean_c
-            
-        # 3. Compute Common Covariance
-        # Cov = Sum_c ( (X_c - mu_c)^T (X_c - mu_c) ) / N
-        # Centering data based on class means
-        centered_feats = torch.empty_like(all_feats)
-        for c in current_classes:
-            idxs = (all_labels == c)
-            centered_feats[idxs] = all_feats[idxs] - self.class_means[int(c.item())]
-            
-        # Tính ma trận hiệp phương sai chung
-        N = all_feats.shape[0]
-        common_cov = (centered_feats.t() @ centered_feats) / (N - 1 + 1e-6)
-        
-        # 4. Shrinkage & Regularization (Quan trọng)
-        # Sigma_shrunk = (1 - rho) * Sigma + rho * trace(Sigma)/D * I
-        rho = self.fecam_shrinkage
-        trace_v = torch.trace(common_cov) / self.feature_dim
-        eye = torch.eye(self.feature_dim).to(self.device)
-        
-        common_cov_shrunk = (1 - rho) * common_cov + rho * trace_v * eye
-        
-        # 5. Lưu Inverse để Inference nhanh
-        # Dùng pinverse để ổn định số học
-        self.common_cov_inv = torch.linalg.pinv(common_cov_shrunk)
-        print(f"--> [FeCAM] Done. Means shape: {self.class_means.shape}")
-    def predict_combined(self, x, beta=0.5):
-        """
-        Inference kết hợp: Analytic Logits + FeCAM Scores
-        beta: Trọng số của FeCAM (nên nhỏ vì Logits RLS biên độ lớn)
-        """
-        # 1. Analytic Logits (High-dim RLS)
-        with torch.no_grad():
-            f_backbone = self.backbone(x)
-            # RLS cần float32
-            f_buffer = self.buffer(f_backbone.to(torch.float32))
-            logits_rls = self.forward_fc(f_buffer) # [B, C]
-            
-        # 2. FeCAM Scores (Backbone Space)
-        # Normalize test features
-        f_norm = F.normalize(f_backbone, p=2, dim=1) # [B, D]
-        
-        # Mahalanobis Distance: (x - mu)^T Sigma^-1 (x - mu)
-        # = diag( (X-mu) @ Inv @ (X-mu)^T )
-        # Để tính nhanh cho tất cả class:
-        # Dist = x^T Inv x + mu^T Inv mu - 2 x^T Inv mu
-        # Nhưng vì dùng Common Cov, ta có thể optimize.
-        
-        # [B, D] @ [D, D] = [B, D] (Projected X)
-        x_proj = f_norm @ self.common_cov_inv 
-        
-        # Term 1: x^T Inv x (Giống nhau cho mọi class -> Có thể bỏ qua khi so sánh softmax, 
-        # nhưng giữ lại để chính xác distance)
-        # term_x = torch.sum(x_proj * f_norm, dim=1, keepdim=True) # [B, 1]
-        
-        # Term 2: mu^T Inv mu (Precompute được nhưng class ít thì tính luôn)
-        # [C, D]
-        means = self.class_means[:self.known_class] 
-        means_proj = means @ self.common_cov_inv # [C, D]
-        term_mu = torch.sum(means_proj * means, dim=1).unsqueeze(0) # [1, C]
-        
-        # Term 3: -2 x^T Inv mu
-        # [B, D] @ [D, C] (means^T) -> Sai. Phải là x_proj @ means.T
-        term_cross = x_proj @ means.t() # [B, C]
-        
-        # Squared Mahalanobis Distance
-        # dists = term_x + term_mu - 2 * term_cross
-        # FeCAM Score = -Distance
-        # Bỏ term_x vì nó là hằng số đối với phép argmax theo class
-        scores_fecam = 2 * term_cross - term_mu 
-        
-        # 3. Combine
-        # Logits RLS có biên độ khoảng +/- 10. FeCAM score cũng tầm đó sau khi normalize.
-        # Cần tune beta.
-        final_logits = logits_rls + beta * scores_fecam
-        
-        return {
-            'logits': final_logits,
-            'logits_rls': logits_rls,
-            'logits_fecam': scores_fecam
-        }
+        # Biến đếm số lượng class cũ để tính trọng số update Covariance
+        self.fecam_known_classes = 0 
 
-    # Override hàm forward mặc định để hỗ trợ eval
-    def forward(self, x, new_forward=False, use_fecam=False):
-        if use_fecam and not self.training:
-            return self.predict_combined(x)
-        
-        # Code forward cũ
-        if new_forward:
-            hyper_features = self.backbone(x, new_forward=True)
-        else:
-            hyper_features = self.backbone(x)
-        hyper_features = hyper_features.to(self.weight.dtype)
-        logits = self.forward_fc(self.buffer(hyper_features))
-        return {'logits': logits}
     def update_fc(self, nb_classes):
-        """
-        Cập nhật lớp Normal FC (cho việc training Noise).
-        Lớp Analytic FC (self.weight) sẽ tự động mở rộng trong hàm fit().
-        """
         self.cur_task += 1
         self.known_class += nb_classes
         
         # Tạo mới Normal FC cho task hiện tại
         if self.cur_task > 0:
-            # Task sau: Không dùng Bias để tránh bias vào lớp mới quá nhiều
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
-            # Task đầu: Có bias
-            # [FIX LỖI TẠI ĐÂY]: Đổi fc thành new_fc
             new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
             
         if self.normal_fc is not None:
-            # Sequential Init: Copy trọng số cũ
             old_nb_output = self.normal_fc.out_features
             with torch.no_grad():
-                # Copy phần cũ
                 new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
-                # Init phần mới về 0
                 nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
-            
             del self.normal_fc
             self.normal_fc = new_fc
         else:
-            # Task đầu tiên
             nn.init.constant_(new_fc.weight, 0.)
             if new_fc.bias is not None:
                 nn.init.constant_(new_fc.bias, 0.)
             self.normal_fc = new_fc
 
     # =========================================================================
+    # [FeCAM IMPLEMENTATION]
+    # =========================================================================
+
+    def _tukey_transform(self, x):
+        """Eq.9: Power transform (Square root)"""
+        return torch.sqrt(torch.clamp(x, min=1e-8))
+
+    def update_fecam_stats(self, train_loader):
+        """
+        FeCAM Update Logic:
+        1. Tukey Transform
+        2. Compute Task Common Covariance
+        3. Weighted Update Global Covariance
+        4. Shrinkage & Normalization
+        """
+        self.eval()
+        print(f"--> [FeCAM] Updating Stats for Task {self.cur_task}...")
+        
+        all_feats = []
+        all_labels = []
+        
+        # 1. Collect & Transform Features
+        with torch.no_grad():
+            for _, inputs, targets in train_loader:
+                inputs = inputs.to(self.device)
+                
+                # Raw backbone features
+                raw_feats = self.backbone(inputs)
+                
+                # Tukey Transform (Eq.9)
+                trans_feats = self._tukey_transform(raw_feats)
+                
+                all_feats.append(trans_feats)
+                all_labels.append(targets.to(self.device))
+                
+        all_feats = torch.cat(all_feats, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
+        
+        # 2. Update Class Means
+        current_classes = all_labels.unique()
+        max_cls = int(current_classes.max().item()) + 1
+        
+        # Mở rộng buffer class_means nếu cần
+        if max_cls > self.class_means.shape[0]:
+            pad_size = max_cls - self.class_means.shape[0]
+            self.class_means = torch.cat([self.class_means, torch.zeros(pad_size, self.feature_dim).to(self.device)], dim=0)
+            
+        for c in current_classes:
+            idxs = (all_labels == c)
+            # Mean calculated on transformed features
+            self.class_means[int(c.item())] = all_feats[idxs].mean(dim=0)
+            
+        # 3. Compute Task Common Covariance (Sigma^t)
+        # Center features theo mean của chính nó
+        centered_feats = torch.empty_like(all_feats)
+        for c in current_classes:
+            idxs = (all_labels == c)
+            centered_feats[idxs] = all_feats[idxs] - self.class_means[int(c.item())]
+            
+        N = all_feats.shape[0]
+        # Covariance của task hiện tại
+        task_cov = (centered_feats.t() @ centered_feats) / (N - 1 + 1e-6)
+        
+        # 4. Incremental Update Global Covariance
+        # Weighted average based on number of classes
+        # Formula: Sigma_new = (N_old * Sigma_old + N_new * Sigma_new) / N_total
+        # Lưu ý: FeCAM dùng số lượng class để weight
+        
+        num_new_classes = len(current_classes)
+        total_classes = self.fecam_known_classes + num_new_classes
+        
+        if self.fecam_known_classes == 0:
+            self.common_cov = task_cov
+        else:
+            w_old = self.fecam_known_classes / total_classes
+            w_new = num_new_classes / total_classes
+            self.common_cov = self.common_cov * w_old + task_cov * w_new
+            
+        self.fecam_known_classes = total_classes
+        
+        # 5. Compute Inference Matrix (Shrinkage + Norm)
+        self._compute_inference_matrix()
+        print(f"--> [FeCAM] Update Complete. Total classes tracked: {self.fecam_known_classes}")
+
+    def _compute_inference_matrix(self):
+        """
+        Shrinkage (Eq.8) & Correlation Normalization (Eq.7)
+        """
+        Sigma = self.common_cov
+        D = self.feature_dim
+        
+        # --- Shrinkage (Eq.8) ---
+        # V1: Average diagonal variance
+        V1 = torch.trace(Sigma) / D
+        
+        # V2: Average off-diagonal covariance
+        mask = ~torch.eye(D, dtype=torch.bool, device=self.device)
+        V2 = Sigma[mask].mean()
+        
+        # Gamma coefficients (Paper recommends 1.0 for many-shot)
+        gamma1, gamma2 = 1.0, 1.0
+        
+        Identity = torch.eye(D, device=self.device)
+        Sigma_s = Sigma + gamma1 * V1 * Identity + gamma2 * V2 * (1 - Identity)
+        
+        # --- Correlation Normalization (Eq.7) ---
+        # Chuẩn hóa covariance thành correlation matrix
+        # Điều này giúp distance comparable giữa các task
+        diag_std = torch.sqrt(torch.diag(Sigma_s)) # [D]
+        self.diag_std = diag_std # Lưu lại để normalize feature input
+        
+        outer_std = torch.outer(diag_std, diag_std)
+        Sigma_hat = Sigma_s / (outer_std + 1e-8)
+        
+        # Inverse & Save
+        # Dùng pinverse để tránh singular matrix
+        self.common_corr_inv = torch.linalg.pinv(Sigma_hat)
+
+    def predict_combined(self, x, beta=0.8):
+        """
+        Combine Analytic Logits (RLS) + FeCAM Scores (Mahalanobis)
+        """
+        # --- 1. Analytic Logits (RLS) ---
+        with torch.no_grad():
+            f_raw = self.backbone(x)
+            f_buf = self.buffer(f_raw.to(torch.float32))
+            logits_rls = self.forward_fc(f_buf) # [B, known_class]
+            
+            # --- 2. FeCAM Scores ---
+            # Transform input y hệt lúc train
+            f_trans = self._tukey_transform(f_raw) # [B, D]
+            
+            # Normalize feature theo Correlation Matrix logic (chia cho std dev)
+            # x_norm = x / sigma
+            f_norm = f_trans / (self.diag_std + 1e-8) # [B, D]
+            
+            # Lấy Means của các class đã học
+            active_classes = self.known_class
+            means = self.class_means[:active_classes] # [C, D]
+            
+            # Normalize means
+            means_norm = means / (self.diag_std + 1e-8) # [C, D]
+            
+            # Tính Mahalanobis (Optimized)
+            # Inv = self.common_corr_inv
+            # Score = 2 * x^T Inv mu - mu^T Inv mu
+            
+            # Pre-compute mu terms
+            # [C, D] @ [D, D]
+            mu_proj = means_norm @ self.common_corr_inv
+            # [C]
+            term_mu = torch.sum(mu_proj * means_norm, dim=1).unsqueeze(0) # [1, C]
+            
+            # Compute Cross term
+            # [B, D] @ [D, D] @ [D, C] -> [B, D] @ [D, C]
+            term_cross = (f_norm @ self.common_corr_inv) @ means_norm.t() # [B, C]
+            
+            scores_fecam = 2 * term_cross - term_mu
+            
+            # --- 3. Combine ---
+            # Đảm bảo logits_rls khớp size (phòng khi buffer lớn hơn)
+            curr_logits_rls = logits_rls[:, :active_classes]
+            
+            final_logits = curr_logits_rls + beta * scores_fecam
+            
+            return {
+                'logits': final_logits,
+                'logits_rls': curr_logits_rls,
+                'logits_fecam': scores_fecam
+            }
+
+    def forward(self, x, new_forward=False, use_fecam=False, beta=0.8):
+        # Chế độ Inference với FeCAM
+        if use_fecam and not self.training:
+            return self.predict_combined(x, beta=beta)
+        
+        # Chế độ Train/Eval thường
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
+        
+        hyper_features = hyper_features.to(self.weight.dtype)
+        logits = self.forward_fc(self.buffer(hyper_features))
+        return {'logits': logits}
+
+    # =========================================================================
     # [MAGMAX & NOISE CONTROL SECTION]
     # =========================================================================
     
     def update_noise(self):
-        """
-        Gọi khi bắt đầu Task mới.
-        Kích hoạt chế độ Sequential Initialization trong PiNoise.
-        """
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
 
     def after_task_magmax_merge(self):
-        """
-        Gọi sau khi kết thúc Task.
-        Kích hoạt việc LƯU (Save) và TRỘN (Merge) tham số theo MagMax.
-        """
         print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
         for j in range(self.backbone.layer_num):
-            # Hàm này nằm trong PiNoise
             self.backbone.noise_maker[j].after_task_training()
 
     def unfreeze_noise(self):
-        """Gọi cho Task > 0: Chỉ unfreeze Noise thưa"""
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_incremental()
 
     def init_unfreeze(self):
         for j in range(len(self.backbone.noise_maker)):
             self.backbone.noise_maker[j].unfreeze_task_0()
-            
-            # Giữ LayerNorm trainable ở Task 0 để ổn định base
             if hasattr(self.backbone.blocks[j], 'norm1'):
                 for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
             if hasattr(self.backbone.blocks[j], 'norm2'):
@@ -316,88 +349,52 @@ class MiNbaseNet(nn.Module):
                 
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
+
     # =========================================================================
     # [ANALYTIC LEARNING (RLS) SECTION]
     # =========================================================================
 
     def forward_fc(self, features):
-        """Forward qua Analytic Classifier"""
-        # Đảm bảo features cùng kiểu với trọng số RLS (float32)
         features = features.to(self.weight.dtype) 
         return features @ self.weight
-# Trong class MiNbaseNet
+
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        Phiên bản RLS tối ưu bộ nhớ (Memory-Efficient RLS)
-        """
-        # Tắt Autocast để tính toán chính xác FP32 (tránh lỗi Singular Matrix)
         try:
             from torch.amp import autocast
         except ImportError:
             from torch.cuda.amp import autocast
 
         with autocast('cuda', enabled=False):
-            # 1. Feature Extraction & Expansion
             X = self.backbone(X).float() 
             X = self.buffer(X) 
-            
-            # Đảm bảo cùng device
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-            # 2. Mở rộng chiều của classifier nếu có lớp mới
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.weight.shape[1]:
-                # Trường hợp hiếm: Padding Y cho khớp weight cũ
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # 3. RLS Update (Tối ưu OOM)
-            # Công thức: P = (I + X R X^T)^-1
-            # term kích thước [Batch x Batch]. Nếu Batch lớn (Buffer), cái này rất nặng.
-            
             term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             
-            # Dùng linalg.solve nhanh và ổn định hơn torch.inverse
             try:
-                # K = (X R X^T + I)^-1 @ (X R)
-                # Kích thước [Batch x Buffer Dim]
                 K = torch.linalg.solve(term + jitter, X @ self.R)
-                K = K.T # Transpose về [Buffer Dim x Batch]
+                K = K.T
             except:
-                # Fallback nếu lỗi
                 K = self.R @ X.T @ torch.inverse(term + jitter)
 
-            # Cập nhật R và Weight
             self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
             
-            # [QUAN TRỌNG] Xóa ngay lập tức để giải phóng VRAM cho batch sau
-            del term, jitter, K, X, Y    # =========================================================================
-    # [FORWARD PASSES]
-    # =========================================================================
+            del term, jitter, K, X, Y
 
-    # def forward(self, x, new_forward: bool = False):
-    #     if new_forward:
-    #         hyper_features = self.backbone(x, new_forward=True)
-    #     else:
-    #         hyper_features = self.backbone(x)
-        
-    #     # [SỬA]: Đảm bảo đặc trưng đồng nhất kiểu dữ liệu trước khi vào Buffer
-    #     hyper_features = hyper_features.to(self.weight.dtype)
-        
-    #     # Buffer trả về ReLU(X @ W), forward_fc thực hiện X @ Weight
-    #     logits = self.forward_fc(self.buffer(hyper_features))
-        
-    #     return {'logits': logits}
     def extract_feature(self, x):
-        """Chỉ trích xuất đặc trưng từ Backbone"""
         return self.backbone(x)
 
     def forward_normal_fc(self, x, new_forward: bool = False):
@@ -406,25 +403,16 @@ class MiNbaseNet(nn.Module):
         else:
             hyper_features = self.backbone(x)
         
-        # [SỬA]: Buffer thường chứa trọng số FP32, ép hyper_features lên FP32 
-        # để phép nhân trong Buffer diễn ra chính xác trước khi đưa vào Classifier
         hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
-        
-        # Sau đó ép về kiểu của normal_fc (thường là Half nếu dùng autocast)
         hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
-        
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
+
     def collect_projections(self, mode='threshold', val=0.95):
-        """
-        Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
-        """
         print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+
     def apply_gpm_to_grads(self, scale=1.0):
-        """
-        Thực hiện chiếu trực giao gradient cho mu và sigma.
-        """
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
