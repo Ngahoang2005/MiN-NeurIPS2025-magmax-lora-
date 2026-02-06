@@ -71,12 +71,11 @@ class PiNoise(nn.Module):
         super(PiNoise, self).__init__()
         
         # --- Shared Fixed Parts (LoRA-style) ---
-        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.w_down)
+        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_down)
+        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_up)
         
-        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        # nn.init.xavier_uniform_(self.w_up)
-        nn.init.normal_(self.w_up, mean=0.0, std=0.001)
         self.hidden_dim = hidden_dim
         
         # --- Trainable Parts (MagMax targets) ---
@@ -107,14 +106,11 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
+       
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
         self.update_noise()
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
+       
 
     def after_task_training(self):
         # Snapshot
