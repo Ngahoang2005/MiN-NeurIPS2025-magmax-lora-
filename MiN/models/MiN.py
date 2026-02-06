@@ -270,11 +270,22 @@ class MinNet(object):
         self._network.eval()
         self._network.to(self.device)
         prog_bar = tqdm(range(self.fit_epoch), desc=f"Fit FC (RLS)")
+        
         for _, epoch in enumerate(prog_bar):
-            for i, (inputs, targets) in enumerate(train_loader):
+            # [FIX LỖI UNPACK] Thay vì enumerate(train_loader), ta duyệt trực tiếp
+            for batch_data in train_loader:
+                # Xử lý linh hoạt dù loader trả về 2 hay 3 giá trị
+                if len(batch_data) == 3:
+                    _, inputs, targets = batch_data # Bỏ qua index
+                elif len(batch_data) == 2:
+                    inputs, targets = batch_data
+                else:
+                    continue # Bỏ qua nếu dữ liệu lỗi
+
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets) 
+            
             self._clear_gpu()
 
     def re_fit(self, train_loader):
@@ -285,12 +296,23 @@ class MinNet(object):
             self._network._saved_mean = {}
             self._network._saved_cov = {}
             self._network._saved_count = {}
-            for i, (inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
+            
+            # [FIX LỖI UNPACK CHO TASK 0]
+            for batch_data in tqdm(train_loader, desc="Task 0 Stats"):
+                if len(batch_data) == 3:
+                    _, inputs, targets = batch_data
+                elif len(batch_data) == 2:
+                    inputs, targets = batch_data
+                else:
+                    continue
+
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 self._network.update_backbone_stats(inputs, targets)
+            
             self._clear_gpu()
             return
 
+        # Task > 0: DPCR Pipeline
         P = self.calculate_drift(train_loader)
         boundary = self.known_class - self.increment
         HTH_old, HTY_old = self._network.solve_dpcr(P_drift=P, boundary=boundary)
@@ -300,7 +322,16 @@ class MinNet(object):
         HTY_curr = torch.zeros(self.buffer_size, current_total_class, device=self.device)
         
         prog_bar = tqdm(train_loader, desc="DPCR: Collecting New Data")
-        for i, (inputs, targets) in enumerate(prog_bar):
+        
+        # [FIX LỖI UNPACK CHO TASK > 0]
+        for batch_data in prog_bar:
+            if len(batch_data) == 3:
+                _, inputs, targets = batch_data
+            elif len(batch_data) == 2:
+                inputs, targets = batch_data
+            else:
+                continue
+
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class).float()
             
@@ -327,7 +358,6 @@ class MinNet(object):
         
         del P, HTH_old, HTY_old, HTH_curr, HTY_curr, HTH_total, HTY_total
         self._clear_gpu()
-
     def compute_adaptive_scale(self, current_loader):
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
