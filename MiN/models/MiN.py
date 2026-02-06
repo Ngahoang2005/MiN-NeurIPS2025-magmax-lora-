@@ -1,4 +1,4 @@
-import math
+iimport math
 import random
 import numpy as np
 from tqdm import tqdm
@@ -18,8 +18,7 @@ from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 # Import Mixed Precision
-from torch.amp import autocast, GradScaler
-
+from torch.cuda.amp import autocast, GradScaler
 EPSILON = 1e-8
 
 class MinNet(object):
@@ -136,8 +135,7 @@ class MinNet(object):
         
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
+       
         
         self._clear_gpu()
         
@@ -159,7 +157,8 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
+        fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
+        self._network.update_fecam_stats(fecam_loader)
         del train_set, test_set
         self._clear_gpu()
 
@@ -204,8 +203,6 @@ class MinNet(object):
         # Giải phóng bộ nhớ snapshot
         del self.old_network
         self._network.collect_projections(mode='threshold', val=0.95)
-        #self._network.after_task_magmax_merge()
-        #self.analyze_model_sparsity()
         
         self._clear_gpu()
 
@@ -225,7 +222,8 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
+        fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
+        self._network.update_fecam_stats(fecam_loader)
         del train_set, test_set
         self._clear_gpu()
 
@@ -293,10 +291,6 @@ class MinNet(object):
         self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
         return scale
     def run(self, train_loader):
-        # [TỐI ƯU 1]: Import nên để đầu file, nhưng nếu để đây cũng ko sao.
-        # scaler = GradScaler() -> [SAI]: Đừng tạo mới mỗi task!
-        # Hãy dùng self.scaler đã tạo trong __init__
-
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
@@ -432,7 +426,7 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                outputs = model(inputs)
+                outputs = model(inputs, use_fecam=True)
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
