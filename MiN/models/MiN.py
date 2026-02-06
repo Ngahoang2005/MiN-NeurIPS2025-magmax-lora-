@@ -295,7 +295,7 @@ class MinNet(object):
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
         # [TỐI ƯU 2]: Tính scale một lần đầu task
-        current_scale = 0.85 
+        current_scale = 0.8 
         if self.cur_task > 0:
             # Đảm bảo bạn đã thêm hàm compute_adaptive_scale vào class MinNet nhé
             current_scale = self.compute_adaptive_scale(train_loader)
@@ -348,7 +348,7 @@ class MinNet(object):
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
                         # Áp dụng Adaptive Scale
-                        self._network.apply_gpm_to_grads(scale=0.85)
+                        self._network.apply_gpm_to_grads(scale=0.8)
                     else:
                         # Warm-up: Thả trôi gradient để học nhanh
                         pass
