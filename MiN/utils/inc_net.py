@@ -94,7 +94,7 @@ class MiNbaseNet(nn.Module):
             return x
 
         # Gán đè hàm của object (MethodType bind hàm vào instance)
-        self.backbone.forward_features = types.MethodType(forward_features_with_noise, self.backbone)
+        self.backbone.forward_features = type.MethodType(forward_features_with_noise, self.backbone)
         print("--> [SYSTEM] Backbone 'forward_features' has been MONKEY PATCHED to support Noise!")
         # =========================================================================------------
         self.device = args['device']
