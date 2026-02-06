@@ -69,6 +69,34 @@ class MiNbaseNet(nn.Module):
         super(MiNbaseNet, self).__init__()
         self.args = args
         self.backbone = get_pretrained_backbone(args)
+        def forward_features_with_noise(self_bb, x, new_forward=False):
+            # 1. Patch Embedding & Positional Embedding
+            x = self_bb.patch_embed(x)
+            x = self_bb._pos_embed(x)
+            x = self_bb.patch_drop(x)
+            x = self_bb.norm_pre(x)
+
+            # 2. Loop qua từng Block + Noise
+            for i in range(len(self_bb.blocks)):
+                # Chạy qua Block Transformer gốc
+                x = self_bb.blocks[i](x)
+                
+                # [QUAN TRỌNG] Chạy qua Noise (nếu có)
+                if hasattr(self_bb, 'noise_maker'):
+                    # Tương thích với logic của PiNoise (forward_new hoặc call thường)
+                    if new_forward and hasattr(self_bb.noise_maker[i], 'forward_new'):
+                        x = self_bb.noise_maker[i].forward_new(x)
+                    else:
+                        x = self_bb.noise_maker[i](x)
+            
+            # 3. Final Norm
+            x = self_bb.norm(x)
+            return x
+
+        # Gán đè hàm của object (MethodType bind hàm vào instance)
+        self.backbone.forward_features = types.MethodType(forward_features_with_noise, self.backbone)
+        print("--> [SYSTEM] Backbone 'forward_features' has been MONKEY PATCHED to support Noise!")
+        # =========================================================================------------
         self.device = args['device']
         
         self.gamma = args['gamma']
