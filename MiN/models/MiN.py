@@ -239,7 +239,12 @@ class MinNet(object):
                 # Forward qua backbone
                 f_old = self._old_network.backbone(inputs, new_forward=False).double()
                 f_new = self._network.backbone(inputs, new_forward=True).double()
-                
+                print("Feature shift:", (f_new - f_old).norm(dim=1).mean().item())
+
+                print("Noise param diff:",
+                    sum((p1 - p2).norm().item()
+                        for p1, p2 in zip(self._network.backbone.noise_maker[0].parameters(),
+                                            self._old_network.backbone.noise_maker[0].parameters())))
                 # Tính độ lệch feature trên batch này
                 batch_diff = (f_new - f_old).norm(p=2, dim=1).mean().item()
                 diff_sum += batch_diff
