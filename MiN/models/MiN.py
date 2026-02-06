@@ -230,8 +230,8 @@ class MinNet(object):
                 inputs = inputs.to(self.device, dtype=ref_dtype)
                 
                 # Forward qua backbone
-                f_old = self._old_network.backbone(inputs).double()
-                f_new = self._network.backbone(inputs).double()
+                f_old = self._old_network.backbone(inputs, new_forward=False).double()
+                f_new = self._network.backbone(inputs, new_forward=True).double()
                 
                 # Tính độ lệch feature trên batch này
                 batch_diff = (f_new - f_old).norm(p=2, dim=1).mean().item()
@@ -267,7 +267,7 @@ class MinNet(object):
         self._network.to(self.device)
         prog_bar = tqdm(range(self.fit_epoch), desc=f"Fit FC (RLS)")
         for _, epoch in enumerate(prog_bar):
-            for i, (inputs, targets) in enumerate(train_loader):
+            for i, (idx, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets) 
@@ -282,7 +282,7 @@ class MinNet(object):
             self._network._saved_mean = {}
             self._network._saved_cov = {}
             self._network._saved_count = {}
-            for i, (inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
+            for i, (idx, inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 self._network.update_backbone_stats(inputs, targets)
             self._clear_gpu()
@@ -302,7 +302,7 @@ class MinNet(object):
         HTY_curr = torch.zeros(self.buffer_size, current_total_class, device=self.device)
         
         prog_bar = tqdm(train_loader, desc="DPCR: Collecting New Data")
-        for i, (inputs, targets) in enumerate(prog_bar):
+        for i, (idx, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class).float()
             
