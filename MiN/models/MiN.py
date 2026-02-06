@@ -183,68 +183,145 @@ class MinNet(object):
         del train_set, test_set, train_set_no_aug
         self._clear_gpu()
 
+    # def calculate_drift(self, clean_loader):
+    #     """Tính Drift P trên Backbone Space (768-d) + CHECK DRIFT"""
+    #     self._network.eval()
+        
+    #     # Đưa old_network lên GPU
+    #     self._old_network.to(self.device)
+    #     self._old_network.eval()
+        
+    #     dim = self._network.feature_dim
+    #     # Dùng double precision để tính toán chính xác nhất
+    #     XtX = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
+    #     XtY = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
+    #     ref_dtype = next(self._network.backbone.parameters()).dtype
+        
+    #     # Biến để monitor độ trôi
+    #     diff_sum = 0.0
+    #     count = 0
+        
+    #     with torch.no_grad():
+    #         for _, inputs, _ in clean_loader:
+    #             inputs = inputs.to(self.device, dtype=ref_dtype)
+                
+    #             # [QUAN TRỌNG]: Đảm bảo backbone trả về feature ĐÃ CÓ NOISE
+    #             # Nếu backbone code của bạn cần tham số 'with_noise=True', hãy thêm vào đây
+    #             f_old = self._old_network.backbone(inputs).double()
+    #             f_new = self._network.backbone(inputs).double()
+                
+    #             # Monitor drift thực tế trên batch này
+    #             diff = (f_new - f_old).norm(p=2, dim=1).mean()
+    #             diff_sum += diff.item()
+    #             count += 1
+                
+    #             XtX += f_old.t() @ f_old
+    #             XtY += f_old.t() @ f_new
+        
+    #     # Regularization (Ridge)
+    #     reg = 0.1 * torch.eye(dim, device=self.device, dtype=torch.float64) 
+    #     P = torch.linalg.solve(XtX + reg, XtY)
+        
+    #     # [CHECK POINT]: Kiểm tra xem P có phải Identity không
+    #     P_float = P.float()
+    #     identity = torch.eye(dim, device=self.device)
+    #     deviation = torch.norm(P_float - identity)
+        
+    #     print("\n" + "="*40)
+    #     print(f"--> [DPCR MONITOR] Task {self.cur_task}")
+    #     print(f"    + Average Feature Shift Norm: {diff_sum/count:.4f}")
+    #     print(f"    + P Matrix Deviation (||P-I||): {deviation:.4f}")
+        
+    #     if deviation < 0.01:
+    #         print("    [CẢNH BÁO ĐỎ] ⚠️ Drift gần như bằng 0!")
+    #         print("    Lý do: Backbone Frozen và Noise không thay đổi hoặc không được kích hoạt.")
+    #         print("    Giải pháp: Kiểm tra lại hàm forward của backbone xem có cộng Noise không?")
+    #     else:
+    #         print("    [OK] ✅ DPCR đã phát hiện Semantic Shift. P Matrix hợp lệ.")
+    #     print("="*40 + "\n")
+
+    #     del XtX, XtY
+    #     self._old_network.cpu() 
+    #     self._clear_gpu()
+        
+    #     return P_float
+    
+    #thêm log
     def calculate_drift(self, clean_loader):
-        """Tính Drift P trên Backbone Space (768-d) + CHECK DRIFT"""
-        self._network.eval()
+        """Tính Drift P & DEBUG xem Noise có hoạt động không"""
+        print("\n" + "="*20 + " DEBUG DRIFT " + "="*20)
+        
+        # 1. Ép chuyển sang train() để kích hoạt Noise (nếu nó hoạt động như Dropout)
+        self._network.train()
+        self._old_network.train()
         
         # Đưa old_network lên GPU
         self._old_network.to(self.device)
-        self._old_network.eval()
         
+        # [DEBUG 1]: Kiểm tra xem trọng số Noise của Mới và Cũ có khác nhau không?
+        # Nếu diff = 0 nghĩa là quá trình train (run) vừa rồi vô dụng -> Cần xem lại optimizer
+        noise_weight_diff = 0.0
+        try:
+            params_new = list(self._network.backbone.noise_maker.parameters())
+            params_old = list(self._old_network.backbone.noise_maker.parameters())
+            for p1, p2 in zip(params_new, params_old):
+                noise_weight_diff += (p1 - p2).norm().item()
+            print(f"--> [CHECK WEIGHT] Total Noise Param Diff (New - Old): {noise_weight_diff:.6f}")
+        except:
+            print("--> [CHECK WEIGHT] Không thể truy cập noise_maker parameters.")
+
         dim = self._network.feature_dim
-        # Dùng double precision để tính toán chính xác nhất
         XtX = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
         XtY = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
         ref_dtype = next(self._network.backbone.parameters()).dtype
         
-        # Biến để monitor độ trôi
         diff_sum = 0.0
         count = 0
         
+        # [DEBUG 2]: Kiểm tra feature đầu ra
         with torch.no_grad():
-            for _, inputs, _ in clean_loader:
+            for i, (idx, inputs, target) in enumerate(clean_loader):
                 inputs = inputs.to(self.device, dtype=ref_dtype)
                 
-                # [QUAN TRỌNG]: Đảm bảo backbone trả về feature ĐÃ CÓ NOISE
-                # Nếu backbone code của bạn cần tham số 'with_noise=True', hãy thêm vào đây
+                # Forward qua backbone
                 f_old = self._old_network.backbone(inputs).double()
                 f_new = self._network.backbone(inputs).double()
                 
-                # Monitor drift thực tế trên batch này
-                diff = (f_new - f_old).norm(p=2, dim=1).mean()
-                diff_sum += diff.item()
+                # Tính độ lệch feature trên batch này
+                batch_diff = (f_new - f_old).norm(p=2, dim=1).mean().item()
+                diff_sum += batch_diff
                 count += 1
                 
+                # Chỉ in debug batch đầu tiên
+                if i == 0:
+                    print(f"--> [CHECK FEATURE] Batch 0 Feature Shift Norm: {batch_diff:.6f}")
+                    if batch_diff == 0:
+                        print("    [CẢNH BÁO] Feature Old và New giống hệt nhau!")
+                        print("    -> Backbone frozen + Noise không có tác dụng.")
+                    
                 XtX += f_old.t() @ f_old
                 XtY += f_old.t() @ f_new
         
-        # Regularization (Ridge)
-        reg = 0.1 * torch.eye(dim, device=self.device, dtype=torch.float64) 
+        # Regularization
+        reg = 0.01 * torch.eye(dim, device=self.device, dtype=torch.float64) 
         P = torch.linalg.solve(XtX + reg, XtY)
         
-        # [CHECK POINT]: Kiểm tra xem P có phải Identity không
         P_float = P.float()
-        identity = torch.eye(dim, device=self.device)
-        deviation = torch.norm(P_float - identity)
+        deviation = torch.norm(P_float - torch.eye(dim, device=self.device))
         
-        print("\n" + "="*40)
-        print(f"--> [DPCR MONITOR] Task {self.cur_task}")
-        print(f"    + Average Feature Shift Norm: {diff_sum/count:.4f}")
-        print(f"    + P Matrix Deviation (||P-I||): {deviation:.4f}")
-        
-        if deviation < 0.01:
-            print("    [CẢNH BÁO ĐỎ] ⚠️ Drift gần như bằng 0!")
-            print("    Lý do: Backbone Frozen và Noise không thay đổi hoặc không được kích hoạt.")
-            print("    Giải pháp: Kiểm tra lại hàm forward của backbone xem có cộng Noise không?")
-        else:
-            print("    [OK] ✅ DPCR đã phát hiện Semantic Shift. P Matrix hợp lệ.")
-        print("="*40 + "\n")
+        print(f"--> [RESULT] Avg Feature Shift: {diff_sum/count:.6f}")
+        print(f"--> [RESULT] P Matrix Deviation: {deviation:.4f}")
+        print("="*55 + "\n")
 
         del XtX, XtY
         self._old_network.cpu() 
         self._clear_gpu()
         
+        # Trả lại trạng thái eval
+        self._network.eval()
+        
         return P_float
+    
     def fit_fc(self, train_loader):
         """
         Dùng hàm fit gốc (RLS) để train classifier.
@@ -360,9 +437,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
         current_scale = 0.85 
-        if self.cur_task > 0:
-            current_scale = self.compute_adaptive_scale(train_loader)
-
+       
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
