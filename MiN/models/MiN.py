@@ -418,10 +418,13 @@ class MinNet(object):
         mag_ratio = (new_mag / (old_mag + 1e-8)).item()
 
         self.logger.info(f"\n>>> DRIFT ANALYSIS (Batch-level) for Task {self.cur_task}:")
+        print(f"\n>>> DRIFT ANALYSIS (Batch-level) for Task {self.cur_task}:")
         self.logger.info(f"    - Avg Cosine Similarity: {cos_sim:.4f} (Trạng thái giữ vững biểu diễn)")
+        print(f"    - Avg Cosine Similarity: {cos_sim:.4f}")
         self.logger.info(f"    - Avg L2 Distance:       {l2_drift:.4f} (Độ lệch tuyệt đối)")
+        print(f"    - Avg L2 Distance:       {l2_drift:.4f}")
         self.logger.info(f"    - Magnitude Ratio:      {mag_ratio:.4f} (Sự bùng nổ/suy giảm năng lượng)")
-
+       
         return cos_sim, l2_drift
     def eval_task(self, test_loader):
         model = self._network.eval()
