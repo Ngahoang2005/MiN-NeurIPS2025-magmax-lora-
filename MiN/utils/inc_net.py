@@ -7,6 +7,7 @@ from torch import nn, Tensor
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
+import types
 # Import autocast
 try:
     from torch.amp import autocast
@@ -93,8 +94,8 @@ class MiNbaseNet(nn.Module):
             x = self_bb.norm(x)
             return x
 
-        # Gán đè hàm của object (MethodType bind hàm vào instance)
-        self.backbone.forward_features = type(self.backbone.forward_features, forward_features_with_noise, self.backbone).__get__(self.backbone)
+        # Gán đè hàm của object
+        self.backbone.forward_features = types.MethodType(forward_features_with_noise, self.backbone)
         print("--> [SYSTEM] Backbone 'forward_features' has been MONKEY PATCHED to support Noise!")
         # =========================================================================------------
         self.device = args['device']
