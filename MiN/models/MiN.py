@@ -226,9 +226,16 @@ class MinNet(object):
         
         # [DEBUG 2]: Kiểm tra feature đầu ra và tính P
         with torch.no_grad():
-            for i, (inputs, target) in enumerate(clean_loader): # Sửa unpack tùy dataloader
+            for i, batch_data in enumerate(clean_loader): 
+                if len(batch_data) == 3:
+                    _, inputs, target = batch_data # Unpack 3
+                elif len(batch_data) == 2:
+                    inputs, target = batch_data    # Unpack 2
+                else:
+                    raise ValueError(f"DataLoader trả về {len(batch_data)} giá trị, không biết xử lý sao!")
+            # --------------------------------------------------------------------
+
                 inputs = inputs.to(self.device, dtype=ref_dtype)
-                
                 # Forward qua backbone
                 f_old = self._old_network.backbone(inputs, new_forward=False).double()
                 f_new = self._network.backbone(inputs, new_forward=True).double()
