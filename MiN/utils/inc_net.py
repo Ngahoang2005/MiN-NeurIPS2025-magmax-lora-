@@ -87,10 +87,10 @@ class MiNbaseNet(nn.Module):
                     # Tương thích với logic của PiNoise (forward_new hoặc call thường)
                     if new_forward and hasattr(self_bb.noise_maker[i], 'forward_new'):
                         x = self_bb.noise_maker[i].forward_new(x)
-                        print("-> Using NEW forward for Noise Maker")
+                        
                     else:
                         x = self_bb.noise_maker[i](x)
-                        print("-> Using NORMAL forward for Noise Maker")
+                    
             # 3. Final Norm
             x = self_bb.norm(x)
             return x

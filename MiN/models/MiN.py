@@ -436,17 +436,32 @@ class MinNet(object):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+        
         current_scale = 0.85 
-       
+        if self.cur_task > 0:
+            current_scale = self.compute_adaptive_scale(train_loader)
+
+        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
+        if self.cur_task == 0: 
+            self._network.init_unfreeze()
+        else: 
+            self._network.unfreeze_noise()
             
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        # [DEBUG 1]: Kiểm tra số lượng tham số được train
+        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
+        print(f"\n--> [DEBUG TASK {self.cur_task}] Số lượng Tensor tham số được train: {len(params)}")
+        if len(params) == 0:
+            print("❌ LỖI: Không có tham số nào được set requires_grad=True! Kiểm tra lại unfreeze_noise.")
+            return
+
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+
+        # [DEBUG 2]: In ra Learning Rate thực tế
+        print(f"--> [DEBUG TASK {self.cur_task}] Initial LR: {optimizer.param_groups[0]['lr']}")
 
         prog_bar = tqdm(range(epochs))
         self._network.train()
@@ -455,17 +470,25 @@ class MinNet(object):
 
         for _, epoch in enumerate(prog_bar):
             losses, correct, total = 0.0, 0, 0
+            
+            # Biến theo dõi gradient
+            grad_norm_sum = 0.0
+            batch_count = 0
+
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 optimizer.zero_grad(set_to_none=True) 
+                
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
+                        # Forward pass
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                         logits_final = logits2 + logits1
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                    
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
@@ -475,6 +498,19 @@ class MinNet(object):
                         self.scaler.unscale_(optimizer)
                         self._network.apply_gpm_to_grads(scale=0.85)
                 
+                # [DEBUG 3]: Check Gradient trước khi step
+                if self.cur_task > 0 and i == 0: # Chỉ check batch đầu của task > 0
+                    self.scaler.unscale_(optimizer) # Unscale để soi grad thật
+                    total_norm = 0.0
+                    for p in params:
+                        if p.grad is not None:
+                            total_norm += p.grad.data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    grad_norm_sum = total_norm
+                    print(f"    [Ep {epoch} Batch 0] Gradient Norm: {total_norm:.6f}")
+                    if total_norm == 0:
+                        print("    ⚠️ CẢNH BÁO: Gradient = 0! Noise không học được gì.")
+
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
@@ -486,6 +522,7 @@ class MinNet(object):
 
             scheduler.step()
             train_acc = 100. * correct / total
+            
             info = "Task {} | Ep {}/{} | Loss {:.3f} | Acc {:.2f} | Scale {:.2f}".format(
                 self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc, current_scale
             )
