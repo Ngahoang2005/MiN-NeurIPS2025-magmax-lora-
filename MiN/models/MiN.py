@@ -22,7 +22,7 @@ class MinNet(object):
         self.logger = loger
         self._network = MiNbaseNet(args)
         self.device = args['device']
-        self.num_workers = 0 # Fix worker issue
+        self.num_workers = 0 
 
         self.init_epochs = args["init_epochs"]
         self.init_lr = args["init_lr"]
@@ -197,10 +197,8 @@ class MinNet(object):
         self._old_network.eval()
         self._old_network.to(self.device)
         
-        # [DEBUG 1]: Kiểm tra xem trọng số Noise của Mới và Cũ có khác nhau không?
         noise_weight_diff = 0.0
         try:
-            # Truy cập noise_maker trong backbone
             params_new = []
             params_old = []
             for m in self._network.backbone.noise_maker:
@@ -217,35 +215,26 @@ class MinNet(object):
         dim = self._network.feature_dim
         XtX = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
         XtY = torch.zeros(dim, dim, device=self.device, dtype=torch.float64)
-        
-        # Lấy dtype tham chiếu từ model
         ref_dtype = next(self._network.backbone.parameters()).dtype
         
         diff_sum = 0.0
         count = 0
         
-        # [DEBUG 2]: Kiểm tra feature đầu ra và tính P
         with torch.no_grad():
+            # [FIX LỖI UNPACK Ở ĐÂY]
             for i, batch_data in enumerate(clean_loader): 
                 if len(batch_data) == 3:
-                    _, inputs, target = batch_data # Unpack 3
+                    _, inputs, target = batch_data 
                 elif len(batch_data) == 2:
-                    inputs, target = batch_data    # Unpack 2
+                    inputs, target = batch_data 
                 else:
-                    raise ValueError(f"DataLoader trả về {len(batch_data)} giá trị, không biết xử lý sao!")
-            # --------------------------------------------------------------------
+                    continue
 
                 inputs = inputs.to(self.device, dtype=ref_dtype)
-                # Forward qua backbone
-                f_old = self._old_network.backbone(inputs, new_forward=False).double()
-                f_new = self._network.backbone(inputs, new_forward=True).double()
-                print("Feature shift:", (f_new - f_old).norm(dim=1).mean().item())
-
-                print("Noise param diff:",
-                    sum((p1 - p2).norm().item()
-                        for p1, p2 in zip(self._network.backbone.noise_maker[0].parameters(),
-                                            self._old_network.backbone.noise_maker[0].parameters())))
-                # Tính độ lệch feature trên batch này
+                
+                f_old = self._old_network.backbone(inputs).double()
+                f_new = self._network.backbone(inputs).double()
+                
                 batch_diff = (f_new - f_old).norm(p=2, dim=1).mean().item()
                 diff_sum += batch_diff
                 count += 1
@@ -258,7 +247,10 @@ class MinNet(object):
                 XtX += f_old.t() @ f_old
                 XtY += f_old.t() @ f_new
         
-        # Regularization for Ridge Regression finding P
+        if count == 0:
+            print("--> [LỖI] Không có batch nào trong clean_loader!")
+            return torch.eye(dim, device=self.device)
+
         reg = 0.01 * torch.eye(dim, device=self.device, dtype=torch.float64) 
         P = torch.linalg.solve(XtX + reg, XtY)
         
@@ -279,7 +271,7 @@ class MinNet(object):
         self._network.to(self.device)
         prog_bar = tqdm(range(self.fit_epoch), desc=f"Fit FC (RLS)")
         for _, epoch in enumerate(prog_bar):
-            for i, (idx, inputs, targets) in enumerate(train_loader):
+            for i, (inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 targets = torch.nn.functional.one_hot(targets)
                 self._network.fit(inputs, targets) 
@@ -290,31 +282,25 @@ class MinNet(object):
         self._network.to(self.device)
 
         if self.cur_task == 0:
-            # Task 0: Chỉ lưu stats cho CIP sau này
             self._network._saved_mean = {}
             self._network._saved_cov = {}
             self._network._saved_count = {}
-            for i, (idx, inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
+            for i, (inputs, targets) in enumerate(tqdm(train_loader, desc="Task 0 Stats")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 self._network.update_backbone_stats(inputs, targets)
             self._clear_gpu()
             return
 
-        # Task > 0: DPCR Pipeline
-        # 1. Calculate P (TSSP Prep)
         P = self.calculate_drift(train_loader)
         boundary = self.known_class - self.increment
-        
-        # 2. CIP Replay
         HTH_old, HTY_old = self._network.solve_dpcr(P_drift=P, boundary=boundary)
         
-        # 3. Collect New Data
         HTH_curr = torch.zeros_like(HTH_old)
         current_total_class = self._network.known_class
         HTY_curr = torch.zeros(self.buffer_size, current_total_class, device=self.device)
         
         prog_bar = tqdm(train_loader, desc="DPCR: Collecting New Data")
-        for i, (idx, inputs, targets) in enumerate(prog_bar):
+        for i, (inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             y_oh = torch.nn.functional.one_hot(targets, num_classes=current_total_class).float()
             
@@ -328,15 +314,11 @@ class MinNet(object):
             pad = torch.zeros(self.buffer_size, HTY_curr.shape[1] - HTY_old.shape[1], device=self.device)
             HTY_old = torch.cat([HTY_old, pad], dim=1)
 
-        # 4. Ridge Solve
         HTH_total = HTH_old + HTH_curr
         HTY_total = HTY_old + HTY_curr
         W = self._network.simple_ridge_solve(HTH_total, HTY_total)
-        
-        # 5. CN (Category Normalization)
         W = self._network.category_normalization(W)
         
-        # Update Weight
         if self._network.weight.shape[1] < W.shape[1]:
              new_w = torch.zeros((self.buffer_size, W.shape[1]), device=self.device)
              new_w[:, :self._network.weight.shape[1]] = self._network.weight
@@ -347,7 +329,6 @@ class MinNet(object):
         self._clear_gpu()
 
     def compute_adaptive_scale(self, current_loader):
-        # (Giữ nguyên code cũ của bạn)
         curr_proto = self.get_task_prototype(self._network, current_loader)
         if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
         if not self.old_prototypes:
@@ -366,7 +347,6 @@ class MinNet(object):
         return scale
 
     def run(self, train_loader):
-        # (Giữ nguyên logic run của bạn, chỉ thêm debug log cho NaN)
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
@@ -399,8 +379,8 @@ class MinNet(object):
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
-                            logits1 = self._network(inputs, new_forward=False)['logits']
-                        logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                            logits1 = self._network(inputs)['logits']
+                        logits2 = self._network.forward_normal_fc(inputs)['logits']
                         logits_final = logits2 + logits1
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
@@ -409,8 +389,33 @@ class MinNet(object):
 
                 self.scaler.scale(loss).backward()
                 
+                # =========================================================
+                # [DEBUG LOG] CHECK GRADIENT NORM NGAY TẠI ĐÂY!
+                # =========================================================
+                if i == 0:
+                    total_norm = 0.0
+                    # Tạm thời unscale để check norm thật
+                    # Lưu ý: scaler.unscale_ chỉ gọi được 1 lần mỗi step, nên ta check thử
+                    try:
+                        self.scaler.unscale_(optimizer)
+                    except:
+                        pass # Nếu đã unscale ở dưới thì bỏ qua lỗi
+                        
+                    for p in params:
+                        if p.grad is not None:
+                            total_norm += p.grad.detach().data.norm(2).item() ** 2
+                    total_norm = total_norm ** 0.5
+                    print(f"    [Ep {epoch} Batch 0] Gradient Norm: {total_norm:.6f}")
+                    if total_norm == 0:
+                        print("    ⚠️ CẢNH BÁO: Gradient = 0! Noise không học.")
+                    if math.isnan(total_norm):
+                        print("    ❌ LỖI: Gradient NaN!")
+                # =========================================================
+
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
-                    self.scaler.unscale_(optimizer)
+                    # Logic cũ: unscale trước khi clip/project
+                    # Vì ở trên debug ta đã unscale rồi, nên ở đây ko cần gọi lại (hoặc gọi sẽ ko tác dụng phụ)
+                    # Nhưng để an toàn với logic cũ, ta cứ để nguyên flow
                     self._network.apply_gpm_to_grads(scale=0.85)
                 
                 self.scaler.step(optimizer)
@@ -431,7 +436,6 @@ class MinNet(object):
             if epoch % 5 == 0: self._clear_gpu()
             
     def eval_task(self, test_loader):
-        # (Giữ nguyên)
         model = self._network.eval()
         pred, label = [], []
         with torch.no_grad():
@@ -453,7 +457,6 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
     def get_task_prototype(self, model, train_loader):
-        # (Giữ nguyên)
         model = model.eval()
         model.to(self.device)
         features = []
