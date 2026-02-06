@@ -165,6 +165,9 @@ class MinNet(object):
 
     def increment_train(self, data_manger):
         self.cur_task += 1
+        
+        self.old_network = copy.deepcopy(self._network)
+        self.old_network.to(self.device)
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
@@ -194,8 +197,12 @@ class MinNet(object):
         self._network.update_noise()
         
         self._clear_gpu()
-
+        
         self.run(train_loader)
+        self.measure_batch_drift(self.test_loader)
+        
+        # Giải phóng bộ nhớ snapshot
+        del self.old_network
         self._network.collect_projections(mode='threshold', val=0.95)
         #self._network.after_task_magmax_merge()
         #self.analyze_model_sparsity()
@@ -377,6 +384,45 @@ class MinNet(object):
             # Clear cache định kỳ
             if epoch % 5 == 0:
                 self._clear_gpu()
+    def measure_batch_drift(self, data_loader):
+        """
+        So sánh đầu ra của 1 batch dữ liệu giữa mô hình cũ (trước task) 
+        và mô hình mới (sau khi học task).
+        """
+        self._network.eval()
+        self.old_network.eval() # Bản sao đã lưu trước khi train
+        
+        # Lấy 1 batch từ data_loader
+        _, inputs, _ = next(iter(data_loader))
+        inputs = inputs.to(self.device)
+
+        with torch.no_grad():
+            # 1. Feature từ mô hình CŨ
+            # Chúng ta lấy đặc trưng trước khi vào Classifier
+            old_features = self.old_network.extract_feature(inputs)
+            
+            # 2. Feature từ mô hình MỚI (sau training)
+            new_features = self._network.extract_feature(inputs)
+
+        # --- TÍNH TOÁN CÁC CHỈ SỐ DRIFT ---
+        
+        # Khoảng cách Euclidean (L2 Norm) - càng nhỏ càng ít drift
+        l2_drift = torch.norm(old_features - new_features, p=2, dim=1).mean().item()
+        
+        # Cosine Similarity - càng gần 1.0 càng giữ được cấu trúc ngữ nghĩa
+        cos_sim = F.cosine_similarity(old_features, new_features, dim=1).mean().item()
+        
+        # Tỷ lệ thay đổi cường độ (Magnitude Ratio)
+        old_mag = torch.norm(old_features, p=2, dim=1).mean()
+        new_mag = torch.norm(new_features, p=2, dim=1).mean()
+        mag_ratio = (new_mag / (old_mag + 1e-8)).item()
+
+        self.logger.info(f"\n>>> DRIFT ANALYSIS (Batch-level) for Task {self.cur_task}:")
+        self.logger.info(f"    - Avg Cosine Similarity: {cos_sim:.4f} (Trạng thái giữ vững biểu diễn)")
+        self.logger.info(f"    - Avg L2 Distance:       {l2_drift:.4f} (Độ lệch tuyệt đối)")
+        self.logger.info(f"    - Magnitude Ratio:      {mag_ratio:.4f} (Sự bùng nổ/suy giảm năng lượng)")
+
+        return cos_sim, l2_drift
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
