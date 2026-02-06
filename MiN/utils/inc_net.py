@@ -294,111 +294,72 @@ class MiNbaseNet(nn.Module):
     
     @torch.no_grad()
     def update_backbone_stats(self, inputs, targets):
-        """
-        Cập nhật Mean và Covariance Matrix theo phương pháp ổn định (Welford-like).
-        Lưu ý: self._saved_cov bây giờ sẽ lưu 'M2' (Tổng bình phương sai số), 
-        chưa chia cho N để tránh sai số tích lũy.
-        """
-        features = self.backbone(inputs).detach()
+        """Bản sửa lỗi: Dùng float64 để tính Stats và kẹp giá trị chống nổ"""
+        features = self.backbone(inputs).detach().to(torch.float64) # Ép lên float64
         
         for c in torch.unique(targets):
             c = c.item()
             mask = (targets == c)
-            feats_batch = features[mask] # Batch dữ liệu mới (B)
-            
+            feats_batch = features[mask]
             n_batch = feats_batch.shape[0]
             if n_batch == 0: continue
 
-            # Tính thống kê của batch hiện tại
             mean_batch = feats_batch.mean(dim=0)
-            # Tính Unbiased Covariance của batch * (N-1) hoặc Biased * N
-            # Ở đây ta cần tổng sai số bình phương: sum((x - mu_batch)(x - mu_batch)^T)
-            centered_batch = feats_batch - mean_batch
-            m2_batch = centered_batch.T @ centered_batch # [Dim x Dim]
+            centered = feats_batch - mean_batch
+            m2_batch = centered.T @ centered
 
             if c not in self._saved_count:
-                # Lần đầu tiên gặp class này
                 self._saved_count[c] = n_batch
                 self._saved_mean[c] = mean_batch
-                self._saved_cov[c] = m2_batch # Lưu tổng M2, chưa chia
+                self._saved_cov[c] = m2_batch
             else:
-                # Cập nhật online (Stable Batched Welford Algorithm)
                 n_old = self._saved_count[c]
                 mean_old = self._saved_mean[c]
                 m2_old = self._saved_cov[c]
-                
                 n_new = n_old + n_batch
                 
-                # 1. Cập nhật Mean
-                # delta = mean_batch - mean_old
-                # mean_new = mean_old + delta * n_batch / n_new
                 delta = mean_batch - mean_old
                 mean_new = mean_old + delta * (n_batch / n_new)
+                # Kẹp delta để tránh outer product bùng nổ
+                m2_addition = torch.outer(delta, delta) * (n_old * n_batch / n_new)
                 
-                # 2. Cập nhật Covariance Sum (M2)
-                # M2_new = M2_old + M2_batch + delta^2 * (n_old * n_batch / n_new)
-                m2_new = m2_old + m2_batch + torch.outer(delta, delta) * (n_old * n_batch / n_new)
-                
-                # Lưu lại
                 self._saved_count[c] = n_new
                 self._saved_mean[c] = mean_new
-                self._saved_cov[c] = m2_new
-    @torch.no_grad()
+                # Cập nhật và ép kiểu về float64 để cực kỳ chính xác
+                self._saved_cov[c] = m2_old + m2_batch + m2_addition
+
     def solve_dpcr(self, P_drift, boundary):
-        """
-        Phiên bản Robust: Chống lỗi NaN khi Covariance Matrix mất tính PSD.
-        """
+        """Bản sửa lỗi: Ép P_drift về float64 để tính toán stats an toàn"""
         HTH_old = torch.zeros(self.buffer_size, self.buffer_size, device=self.device)
         HTY_old = torch.zeros(self.buffer_size, boundary, device=self.device)
         
-        P_drift = P_drift.to(self.device).float()
-        
-        print(f"--> [DPCR] Replaying stats with Robust Sampling (SVD Fallback)...")
+        # Chuyển ma trận trôi sang float64
+        P_drift = P_drift.detach().to(torch.float64)
         
         for c in range(boundary):
-            mean_old = self._saved_mean[c]
             count = self._saved_count[c]
+            mean_old = self._saved_mean[c] # Đã là float64
+            # Chia lấy Covariance và kẹp giá trị
+            cov_old = (self._saved_cov[c] / (count - 1 if count > 1 else 1)).clamp(-1e5, 1e5)
             
-            # 1. Lấy Covariance thực (Unbiased)
-            if count > 1:
-                cov_real = self._saved_cov[c] / (count - 1)
-            else:
-                cov_real = torch.eye(self.feature_dim, device=self.device) * 1e-4
+            # TSSP thực hiện trên float64
+            mean_new = (mean_old @ P_drift).to(torch.float32)
+            cov_new = (P_drift.t() @ cov_old @ P_drift).to(torch.float32)
             
-            # 2. TSSP: Transform Stats
-            mean_new = mean_old @ P_drift
-            cov_new = P_drift.t() @ cov_real @ P_drift
-            
-            # [FIX QUAN TRỌNG]: Ép đối xứng ma trận để giảm sai số
+            # Khử nhiễu ma trận đối xứng
             cov_new = 0.5 * (cov_new + cov_new.t())
             
-            # 3. CIP: Robust Sampling (Thủ công thay vì dùng MultivariateNormal)
-            num_samples = min(count, 200)
-            
-            # Thêm Jitter để ổn định (Noise injection)
-            jitter = 1e-4 * torch.eye(self.feature_dim, device=self.device)
-            cov_final = cov_new + jitter
-            
+            # CIP: Sinh mẫu (Dùng float32 tại đây cho nhẹ nhưng data đã sạch)
             try:
-                # Cách 1: Thử Cholesky (Nhanh nhưng dễ lỗi)
-                L = torch.linalg.cholesky(cov_final)
-            except RuntimeError:
-                # Cách 2: SVD / Eigendecomposition (Chậm hơn nhưng an toàn tuyệt đối)
-                # print(f"    [Warning] Class {c}: Cholesky failed. Fallback to SVD.")
-                e, v = torch.linalg.eigh(cov_final)
-                # Cắt bỏ eigenvalue âm (Nguyên nhân gây NaN)
-                e = torch.clamp(e, min=1e-6)
-                # Tái tạo lại L sao cho L @ L.T = Cov
-                L = v @ torch.diag(torch.sqrt(e))
+                L = torch.linalg.cholesky(cov_new + 1e-4 * torch.eye(self.feature_dim, device=self.device))
+            except:
+                e, v = torch.linalg.eigh(cov_new + 1e-4 * torch.eye(self.feature_dim, device=self.device))
+                L = v @ torch.diag(torch.sqrt(e.clamp(min=1e-7)))
 
-            # Reparameterization Trick: Z = mu + epsilon * L
-            # epsilon ~ N(0, I)
-            epsilon = torch.randn(num_samples, self.feature_dim, device=self.device)
-            sampled_z = mean_new.unsqueeze(0) + epsilon @ L.t()
+            sampled_z = mean_new + torch.randn(min(count, 200), self.feature_dim, device=self.device) @ L.t()
             
-            # 4. Qua Buffer & Tích lũy (Giữ nguyên)
-            features_proj = self.buffer(sampled_z) # [N, Buffer_Dim]
-            
+            # Quay lại pipeline của bạn
+            features_proj = self.buffer(sampled_z)
             HTH_old += features_proj.t() @ features_proj
             
             y_onehot = torch.zeros(features_proj.shape[0], boundary, device=self.device)
@@ -406,6 +367,7 @@ class MiNbaseNet(nn.Module):
             HTY_old += features_proj.t() @ y_onehot
             
         return HTH_old, HTY_old
+    
     def simple_ridge_solve(self, HTH, HTY, lambda_reg=0.1):
         """Giải Ridge Regression: W = (HTH + lambda*I)^-1 * HTY"""
         I = torch.eye(HTH.shape[0], device=self.device)
