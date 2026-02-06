@@ -68,17 +68,16 @@ import gc
 import torch.nn.functional as F
 import math
 import numpy as np  
-factory_kwargs = {'device': 'cpu', 'dtype': torch.float32}
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        factory_kwargs = {'device': device, 'dtype': torch.float32}
+        
         # --- Shared Fixed Parts (LoRA-style) ---
-        self.w_down = torch.empty((in_dim, hidden_dim), **factory_kwargs)
-        self.register_buffer("weight", self.w_down)
-        self.w_up = torch.empty((hidden_dim, out_dim), **factory_kwargs)
-        self.register_buffer("weight", self.w_up)
+        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.w_down)
+        
+        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
+        nn.init.xavier_uniform_(self.w_up)
         
         self.hidden_dim = hidden_dim
         
@@ -97,7 +96,7 @@ class PiNoise(nn.Module):
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         
         self.feature_cache = [] 
-
+        self.debug_printed = False
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
@@ -110,11 +109,14 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-       
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
+
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
         self.update_noise()
-       
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
     def after_task_training(self):
         # Snapshot
@@ -146,6 +148,9 @@ class PiNoise(nn.Module):
 
     def forward(self, hyper_features, new_forward=False):
         # 1. Down Projection
+        if not self.debug_printed and self.training:
+            print("--> [DEBUG] PiNoise.forward() IS EXECUTING!")
+            self.debug_printed = True
         x_down = hyper_features @ self.w_down 
         
         # 2. Caching for GPM
@@ -253,7 +258,6 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
