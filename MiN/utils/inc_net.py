@@ -65,7 +65,7 @@ class RandomBuffer(torch.nn.Linear):
     def forward(self, X: torch.Tensor) -> torch.Tensor:
         # Ép kiểu input X về cùng kiểu với weight (float32)
         X = X.to(self.weight.dtype)
-        return F.relu(X @ self.W)
+        return X @ self.W
 
 
 class MiNbaseNet(nn.Module):
@@ -294,38 +294,55 @@ class MiNbaseNet(nn.Module):
     
     @torch.no_grad()
     def update_backbone_stats(self, inputs, targets):
-        """Lưu mean/cov của backbone feature (trước buffer) để dùng cho CIP"""
+        """
+        Cập nhật Mean và Covariance Matrix theo phương pháp ổn định (Welford-like).
+        Lưu ý: self._saved_cov bây giờ sẽ lưu 'M2' (Tổng bình phương sai số), 
+        chưa chia cho N để tránh sai số tích lũy.
+        """
         features = self.backbone(inputs).detach()
+        
         for c in torch.unique(targets):
             c = c.item()
             mask = (targets == c)
-            feats_c = features[mask]
+            feats_batch = features[mask] # Batch dữ liệu mới (B)
             
+            n_batch = feats_batch.shape[0]
+            if n_batch == 0: continue
+
+            # Tính thống kê của batch hiện tại
+            mean_batch = feats_batch.mean(dim=0)
+            # Tính Unbiased Covariance của batch * (N-1) hoặc Biased * N
+            # Ở đây ta cần tổng sai số bình phương: sum((x - mu_batch)(x - mu_batch)^T)
+            centered_batch = feats_batch - mean_batch
+            m2_batch = centered_batch.T @ centered_batch # [Dim x Dim]
+
             if c not in self._saved_count:
-                self._saved_count[c] = 0
-                self._saved_mean[c] = torch.zeros(self.feature_dim, device=self.device)
-                self._saved_cov[c] = torch.zeros(self.feature_dim, self.feature_dim, device=self.device)
-
-            n_batch = feats_c.shape[0]
-            old_n = self._saved_count[c]
-            new_n = old_n + n_batch
-            
-            # Update Mean & Cov (Welford's algorithm or simple batch update)
-            # Simple batch accumulation for simplicity
-            sum_x = feats_c.sum(dim=0)
-            sum_xx = (feats_c.T @ feats_c)
-            
-            # Reconstruct sums from saved means
-            prev_sum_x = self._saved_mean[c] * old_n
-            prev_sum_xx = (self._saved_cov[c] + torch.outer(self._saved_mean[c], self._saved_mean[c])) * old_n
-            
-            total_sum_x = prev_sum_x + sum_x
-            total_sum_xx = prev_sum_xx + sum_xx
-            
-            self._saved_mean[c] = total_sum_x / new_n
-            self._saved_cov[c] = (total_sum_xx / new_n) - torch.outer(self._saved_mean[c], self._saved_mean[c])
-            self._saved_count[c] = new_n
-
+                # Lần đầu tiên gặp class này
+                self._saved_count[c] = n_batch
+                self._saved_mean[c] = mean_batch
+                self._saved_cov[c] = m2_batch # Lưu tổng M2, chưa chia
+            else:
+                # Cập nhật online (Stable Batched Welford Algorithm)
+                n_old = self._saved_count[c]
+                mean_old = self._saved_mean[c]
+                m2_old = self._saved_cov[c]
+                
+                n_new = n_old + n_batch
+                
+                # 1. Cập nhật Mean
+                # delta = mean_batch - mean_old
+                # mean_new = mean_old + delta * n_batch / n_new
+                delta = mean_batch - mean_old
+                mean_new = mean_old + delta * (n_batch / n_new)
+                
+                # 2. Cập nhật Covariance Sum (M2)
+                # M2_new = M2_old + M2_batch + delta^2 * (n_old * n_batch / n_new)
+                m2_new = m2_old + m2_batch + torch.outer(delta, delta) * (n_old * n_batch / n_new)
+                
+                # Lưu lại
+                self._saved_count[c] = n_new
+                self._saved_mean[c] = mean_new
+                self._saved_cov[c] = m2_new
     @torch.no_grad()
     def solve_dpcr(self, P_drift, boundary):
         """
@@ -342,9 +359,15 @@ class MiNbaseNet(nn.Module):
         
         for c in range(boundary):
             mean_old = self._saved_mean[c]
-            cov_old = self._saved_cov[c]
+          
             count = self._saved_count[c]
-            
+            if count > 1:
+                cov_real = self._saved_cov[c] / (count - 1) 
+            else:
+                cov_real = torch.eye(self.feature_dim, device=self.device) * 1e-6
+
+            # Gán vào biến cũ để logic phía dưới không phải sửa
+            cov_old = cov_real
             # 1. TSSP: Transform Stats by P
             # mean_new = mean_old @ P
             # cov_new = P.T @ cov_old @ P
