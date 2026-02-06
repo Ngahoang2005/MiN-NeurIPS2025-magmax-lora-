@@ -108,6 +108,13 @@ class MinNet(object):
         # 1. RUN (Train Backbone + Noise)
         print("--> [Task 0] Step 1: Running Backbone Training...")
         self.run(train_loader)
+        # Trong init_train(), sau self.run(train_loader):
+        print("\n=== CHECK NOISE PARAMS AFTER TASK 0 ===")
+        for j, noise_layer in enumerate(self._network.backbone.noise_maker):
+            mu_norm = torch.norm(noise_layer.mu.weight).item()
+            sigma_norm = torch.norm(noise_layer.sigma.weight).item()
+            print(f"Layer {j}: mu_norm={mu_norm:.6f}, sigma_norm={sigma_norm:.6f}")
+        print("="*50 + "\n")
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
         
