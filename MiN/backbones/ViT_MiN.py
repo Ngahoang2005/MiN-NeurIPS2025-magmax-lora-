@@ -75,8 +75,8 @@ class PiNoise(nn.Module):
         nn.init.xavier_uniform_(self.w_down)
         
         self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        nn.init.xavier_uniform_(self.w_up)
-        
+        # nn.init.xavier_uniform_(self.w_up)
+        nn.init.normal_(self.w_up, mean=0.0, std=0.001)
         self.hidden_dim = hidden_dim
         
         # --- Trainable Parts (MagMax targets) ---
