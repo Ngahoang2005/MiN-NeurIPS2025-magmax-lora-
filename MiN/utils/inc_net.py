@@ -64,21 +64,25 @@ class FeCAM_Manager(nn.Module):
         self.feature_dim = feature_dim
         self.device = device
         
+        # Buffer lưu trữ Mean (nhỏ, để trên GPU ok)
         self.register_buffer("class_means", torch.zeros(0, feature_dim))
+        
+        # Dictionary lưu các ma trận nghịch đảo (mỗi ma trận ~2MB, 100 class ~200MB -> GPU chịu được)
         self.class_cov_invs = {} 
         self.class_diags = {}    
         self.known_classes = 0
 
     def update_stats(self, network, data_loader):
         """
-        [STREAMING MODE]: Tính toán Covariance theo kiểu tích lũy (Streaming).
-        Không bao giờ lưu toàn bộ feature -> Không bao giờ OOM dù chạy 100 Task.
+        [GPU STREAMING]: Tính toán trực tiếp trên GPU nhưng KHÔNG lưu feature.
+        Cơ chế: Load Batch -> Update Sum/Scatter -> DEL Batch.
+        Giữ VRAM luôn sạch sẽ.
         """
         network.eval()
-        print(f"--> [FeCAM] Updating Stats (Streaming Mode)...")
+        print(f"--> [FeCAM] Updating Stats (GPU Streaming - No Garbage)...")
         
-        # 1. Khởi tạo bộ tích lũy trên GPU (nhanh và nhẹ)
-        # Dictionary lưu: {class_id: {'sum': vector, 'scatter': matrix, 'count': n}}
+        # Dictionary tạm để tích lũy thống kê
+        # stats[c] = {'sum': ..., 'scatter': ..., 'count': ...}
         stats = {}
         
         with torch.no_grad():
@@ -86,46 +90,51 @@ class FeCAM_Manager(nn.Module):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
-                # Extract feature
-                raw_feats = network.backbone(inputs) # [B, D]
+                # 1. Forward backbone
+                raw_feats = network.backbone(inputs) # [Batch, D]
                 
+                # 2. Phân loại theo class trong batch hiện tại
                 unique_classes = targets.unique()
                 
                 for c in unique_classes:
                     c = c.item()
                     idxs = (targets == c)
-                    features_c = raw_feats[idxs] # [N_c, D]
+                    # Lấy feature của class c trong batch này
+                    features_c = raw_feats[idxs] 
                     
                     if c not in stats:
-                        # Khởi tạo bộ đếm cho class c
+                        # Khởi tạo bộ đếm trên GPU (dùng double để cộng dồn chính xác)
                         stats[c] = {
                             'sum': torch.zeros(self.feature_dim, device=self.device, dtype=torch.double),
                             'scatter': torch.zeros((self.feature_dim, self.feature_dim), device=self.device, dtype=torch.double),
                             'count': 0
                         }
                     
-                    # Tích lũy (Dùng double để tránh sai số)
+                    # 3. Tích lũy (Streaming Step)
                     # Sum: sigma x
                     stats[c]['sum'] += features_c.sum(dim=0).double()
                     # Scatter: sigma (x * x.T) = features.T @ features
+                    # Phép nhân này tốn bộ nhớ tạm thời, nhưng vì features_c nhỏ (chỉ 1 phần batch) nên an toàn
                     stats[c]['scatter'] += (features_c.t().double() @ features_c.double())
                     stats[c]['count'] += features_c.shape[0]
                 
-                # [QUAN TRỌNG]: Xóa feature batch ngay lập tức
-                del raw_feats, inputs, targets
+                # [QUAN TRỌNG]: Dọn rác ngay lập tức sau mỗi batch
+                del raw_feats, inputs, targets, features_c
+                # Ép giải phóng bộ nhớ đệm nếu cần (tùy chọn, có thể làm chậm nhưng an toàn)
+                # torch.cuda.empty_cache() 
         
-        # 2. Tính toán Mean và Covariance từ bộ tích lũy
+        # 4. Tính toán Mean và Covariance từ bộ tích lũy
         current_classes = sorted(list(stats.keys()))
         max_cls = max(current_classes) + 1 if current_classes else 0
         
-        # Mở rộng buffer mean
+        # Expand buffer
         if max_cls > self.class_means.shape[0]:
             pad_size = max_cls - self.class_means.shape[0]
             self.class_means = torch.cat([self.class_means, torch.zeros(pad_size, self.feature_dim).to(self.device)], dim=0)
             
         for c in current_classes:
             N = stats[c]['count']
-            sum_x = stats[c]['sum'].float()
+            sum_x = stats[c]['sum'].float()     # Chuyển về float32
             scatter_x = stats[c]['scatter'].float()
             
             # Mean = Sum / N
@@ -135,6 +144,7 @@ class FeCAM_Manager(nn.Module):
             # Covariance = (Scatter - N * mean * mean.T) / (N - 1)
             # Công thức này tương đương với centered covariance
             if N > 1:
+                # outer_mean cũng nhỏ (768x768)
                 outer_mean = torch.outer(mean, mean)
                 cov = (scatter_x - N * outer_mean) / (N - 1)
             else:
@@ -142,15 +152,20 @@ class FeCAM_Manager(nn.Module):
                 
             # Shrinkage & Norm
             inv_c, diag_c = self._shrink_and_normalize(cov)
+            
             self.class_cov_invs[c] = inv_c
             self.class_diags[c] = diag_c
             
-            # Xóa biến tạm
-            del cov, inv_c, diag_c
+            # Dọn rác biến tạm
+            del cov, inv_c, diag_c, sum_x, scatter_x
             
         self.known_classes = max(self.known_classes, max_cls)
-        torch.cuda.empty_cache()
-        print(f"--> [FeCAM] Update done. Total classes: {self.known_classes}")
+        
+        # Xóa toàn bộ stats
+        del stats
+        torch.cuda.empty_cache() # Dọn sạch sẽ để chuẩn bị cho task sau
+        
+        print(f"--> [FeCAM] Update done on GPU. Total classes: {self.known_classes}")
 
     def _shrink_and_normalize(self, sigma):
         D = self.feature_dim
@@ -164,10 +179,12 @@ class FeCAM_Manager(nn.Module):
         
         diag_std = torch.sqrt(torch.diag(Sigma_s)) 
         diag_std = torch.clamp(diag_std, min=1e-6)
+        
         outer_std = torch.outer(diag_std, diag_std)
         Sigma_hat = Sigma_s / outer_std 
         
         inv_matrix = torch.linalg.pinv(Sigma_hat)
+        
         return inv_matrix, diag_std
 
     def compute_scores(self, raw_features, active_classes, boundary_idx=0):
@@ -199,7 +216,6 @@ class FeCAM_Manager(nn.Module):
             dist_old = distances_stack[:, :boundary_idx]
             dist_new = distances_stack[:, boundary_idx:]
             
-            # Kiểm tra rỗng để tránh lỗi min() trên tensor rỗng
             if dist_old.numel() > 0 and dist_new.numel() > 0:
                 min_dist_old = dist_old.min(dim=1)[0].mean().item()
                 min_dist_new = dist_new.min(dim=1)[0].mean().item()
@@ -221,12 +237,10 @@ class MiNbaseNet(nn.Module):
 
         self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
-        
-        # [MEMORY OPTIMIZATION]: Lưu R trên CPU, không dùng register_buffer để tránh auto-load lên GPU
-        self.R_cpu = torch.eye(self.buffer_size, dtype=torch.float32) / self.gamma
-        
+        # R vẫn để trên GPU vì user yêu cầu, nhưng nên cẩn thận
+        self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
+
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -251,7 +265,7 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
         self.normal_fc = new_fc
 
-    def update_fecam(self, train_loader):
+    def update_fecam_stats(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
     def predict_combined(self, x, beta=0.5):
@@ -277,7 +291,6 @@ class MiNbaseNet(nn.Module):
             norm_fecam = (scores_fecam - fecam_mean) / fecam_std
             
             final_logits = norm_rls * (1 - beta) + beta * norm_fecam
-            
             return {'logits': final_logits}
 
     def forward(self, x, new_forward=False, use_fecam=False, beta=0.5):
@@ -314,8 +327,8 @@ class MiNbaseNet(nn.Module):
         try: from torch.amp import autocast
         except ImportError: from torch.cuda.amp import autocast
         
-        # [MEMORY SAFE]: Đưa R từ CPU lên GPU chỉ khi cần
-        R_gpu = self.R_cpu.to(self.device)
+        # Xóa cache trước khi tính toán nặng
+        if torch.cuda.is_available(): torch.cuda.empty_cache()
         
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
@@ -332,18 +345,17 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
 
-            term = torch.eye(X.shape[0], device=X.device) + X @ R_gpu @ X.T
+            # Phép tính này rất nặng, đảm bảo xóa biến ngay
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            try: K = torch.linalg.solve(term + jitter, X @ R_gpu); K = K.T
-            except: K = R_gpu @ X.T @ torch.inverse(term + jitter)
+            try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
+            except: K = self.R @ X.T @ torch.inverse(term + jitter)
             
-            R_gpu -= K @ X @ R_gpu
+            self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
             
-            # Cập nhật lại CPU R và giải phóng GPU
-            self.R_cpu = R_gpu.cpu()
-            
-            del term, jitter, K, X, Y, R_gpu
+            # [QUAN TRỌNG] Dọn rác
+            del term, jitter, K, X, Y
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
     def extract_feature(self, x): return self.backbone(x)
