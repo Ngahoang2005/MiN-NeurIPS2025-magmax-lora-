@@ -1,7 +1,9 @@
 import json
 import argparse
 from trainer.BaseTrainer import train
-
+import os
+# Ép PyTorch không chia nhỏ bộ nhớ quá mức (giảm phân mảnh)
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 
 def main():
     args = setup_parser().parse_args()
