@@ -143,7 +143,7 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats Streaming
+        # [FeCAM]: Update Stats (Fix name)
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -205,7 +205,7 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats Streaming
+        # [FeCAM]: Update Stats cho Task mới (Fix name)
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -269,7 +269,7 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 2
+        WARMUP_EPOCHS = 5
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
