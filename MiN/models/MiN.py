@@ -326,7 +326,7 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                outputs = model(inputs, use_fecam=True, beta=0.6)
+                outputs = model(inputs, use_fecam=True, beta=0.5)
                 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
