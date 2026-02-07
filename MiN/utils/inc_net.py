@@ -88,9 +88,6 @@ class FeCAM_Manager(nn.Module):
         if self.beta == 0:
             return torch.log(x)
         else:
-            # Lưu ý: ViT có thể ra số âm -> NaN nếu mũ 0.5. 
-            # Code gốc dùng ResNet (ReLU) nên luôn dương.
-            # Fix cho ViT: sign(x) * |x|^beta
             return torch.sign(x) * torch.pow(torch.abs(x), self.beta)
 
     def update_stats(self, network, data_loader):
@@ -115,13 +112,8 @@ class FeCAM_Manager(nn.Module):
         all_feats = torch.cat(all_feats, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         
-        # [Tiểu tiết]: Tukey Transform áp dụng ngay trên toàn bộ tập feature (nếu config=True)
-        # Xem fecam.py dòng 130: if self.args["tukey"]: vectors = self._tukeys_transform(vectors)
-        # Tuy nhiên base.py lại áp dụng TUKEY trong lúc tính distance (_maha_dist).
-        # Để chính xác nhất khi tính Covariance, ta nên transform trước.
+        # Tukey Transform
         if self.use_tukey:
-            # Chuyển về GPU để transform cho nhanh (nếu RAM đủ chứa) hoặc transform từng phần
-            # Ở đây làm trên CPU cho an toàn OOM
             all_feats = self._tukeys_transform(all_feats)
         
         current_classes = all_labels.unique()
@@ -144,7 +136,6 @@ class FeCAM_Manager(nn.Module):
             self.class_means[c_idx] = class_mean
             
             # Covariance (Centered)
-            # base.py dùng np.cov(vecs.T), tương đương torch.cov hoặc thủ công
             x_minus_mu = vectors - class_mean
             N = vectors.shape[0]
             
@@ -170,6 +161,7 @@ class FeCAM_Manager(nn.Module):
             
         self.known_classes = max(self.known_classes, max_cls)
         
+        # Dọn rác CPU
         del all_feats, all_labels
         if torch.cuda.is_available(): torch.cuda.empty_cache()
         print(f"--> [FeCAM] Update done. Total classes: {self.known_classes}")
@@ -197,16 +189,13 @@ class FeCAM_Manager(nn.Module):
         """base.py line 168"""
         sd = torch.sqrt(torch.diagonal(cov)) 
         sd = torch.clamp(sd, min=1e-6)
-        
-        # Outer product: sd.unsqueeze(1) * sd.unsqueeze(0)
         normalization_matrix = torch.matmul(sd.unsqueeze(1), sd.unsqueeze(0))
-        
         cov_norm = cov / normalization_matrix
         return cov_norm
 
-    def compute_scores(self, raw_features, active_classes):
+    def compute_scores(self, raw_features, active_classes, boundary_idx=0):
         """
-        Logic _mahalanobis trong base.py (dòng 139)
+        Logic _maha_dist và _mahalanobis trong base.py (dòng 139)
         """
         # 1. Transform input feature (nếu có tukey)
         if self.use_tukey:
@@ -215,31 +204,45 @@ class FeCAM_Manager(nn.Module):
             vectors = raw_features
             
         scores = []
+        distances = []
         
         for c_idx in range(active_classes):
             if c_idx not in self.class_cov_invs:
                 scores.append(torch.full((raw_features.shape[0],), -1e9, device=self.device))
+                distances.append(torch.full((raw_features.shape[0],), 1e9, device=self.device))
                 continue
                 
             inv_cov = self.class_cov_invs[c_idx]
             class_mean = self.class_means[c_idx]
             
             # [TIỂU TIẾT QUAN TRỌNG NHẤT]: base.py dòng 141
-            # x_minus_mu = F.normalize(vectors, p=2) - F.normalize(class_means, p=2)
-            # Code gốc dùng L2 Normalize TRƯỚC KHI trừ mean và nhân Covariance
-            
+            # L2 Normalize TRƯỚC KHI trừ mean
             vectors_norm = F.normalize(vectors, p=2, dim=-1)
             mean_norm = F.normalize(class_mean, p=2, dim=-1)
             
-            x_minus_mu = vectors_norm - mean_norm
+            x_minus_mu = vectors_norm - mean_norm 
             
             # Mahalanobis calculation
             left_term = torch.matmul(x_minus_mu, inv_cov)
             mahal_diag = torch.sum(left_term * x_minus_mu, dim=1)
             
             scores.append(-mahal_diag)
+            distances.append(mahal_diag)
             
-        return torch.stack(scores, dim=1)
+        scores_stack = torch.stack(scores, dim=1)
+        distances_stack = torch.stack(distances, dim=1)
+
+        # Log bias để debug
+        if boundary_idx > 0 and boundary_idx < active_classes:
+            dist_old = distances_stack[:, :boundary_idx]
+            dist_new = distances_stack[:, boundary_idx:]
+            
+            if dist_old.numel() > 0 and dist_new.numel() > 0:
+                min_dist_old = dist_old.min(dim=1)[0].mean().item()
+                min_dist_new = dist_new.min(dim=1)[0].mean().item()
+                print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.4f} | New: {min_dist_new:.4f} | Bias Ratio: {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
+
+        return scores_stack
 
 
 class MiNbaseNet(nn.Module):
@@ -291,17 +294,24 @@ class MiNbaseNet(nn.Module):
 
     def predict_combined(self, x, beta=0.5):
         """
-        Combine: RLS + FeCAM (with Z-Score Norm)
+        Combine: Analytic Logits (RLS) + FeCAM Scores (Z-score Norm)
         """
         with torch.no_grad():
             # RLS Path
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
+            # Sử dụng self.known_class (số ít) thay vì known_classes
             curr_logits_rls = logits_rls[:, :self.known_class]
 
-            # FeCAM Path (raw features input, manager handles tukey/norm)
-            scores_fecam = self.fecam.compute_scores(f_raw, self.known_classes)
+            # FeCAM Path (pass active classes count)
+            # Boundary index cho logging
+            boundary = 0
+            if self.cur_task > 0 and 'increment' in self.args:
+                boundary = self.known_class - self.args['increment']
+                
+            # [FIXED]: self.known_class (singular)
+            scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
             
             # Z-Score Normalization & Fusion
             rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
@@ -325,7 +335,7 @@ class MiNbaseNet(nn.Module):
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
 
-    # ... Noise & GPM & RLS Fit (Giữ nguyên phần Memory Safe của file trước) ...
+    # ... Noise & GPM & RLS Fit ...
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
     def after_task_magmax_merge(self):
