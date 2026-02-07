@@ -64,105 +64,117 @@ class FeCAM_Manager(nn.Module):
         self.feature_dim = feature_dim
         self.device = device
         
+        # Stats Storage
         self.register_buffer("class_means", torch.zeros(0, feature_dim))
+        
+        # Dictionaries for Inverses & Diagonals
         self.class_cov_invs = {} 
         self.class_diags = {}    
+        
         self.known_classes = 0
 
     def update_stats(self, network, data_loader):
         """
-        [CPU STREAMING]: Tích lũy thống kê trên CPU để tránh OOM tuyệt đối.
+        [OOM FIX]: Tính toán Stats trên CPU để tránh tràn VRAM.
+        Chỉ đưa dữ liệu từng class lên GPU khi cần thiết.
         """
         network.eval()
-        print(f"--> [FeCAM] Updating Stats (CPU Streaming Mode)...")
+        print(f"--> [FeCAM] Updating Stats (Per-Class, CPU Offload Mode)...")
         
-        stats = {}
+        all_feats = []
+        all_labels = []
         
         with torch.no_grad():
             for _, inputs, targets in data_loader:
                 inputs = inputs.to(self.device)
+                # Raw backbone features (No L2 Norm)
+                raw_feats = network.backbone(inputs)
                 
-                # Extract feature trên GPU -> Đẩy ngay về CPU
-                raw_feats = network.backbone(inputs).detach().cpu() 
-                targets = targets.cpu()
+                # [QUAN TRỌNG]: Đẩy về CPU ngay lập tức
+                all_feats.append(raw_feats.cpu())
+                all_labels.append(targets.cpu())
                 
-                unique_classes = targets.unique()
-                
-                for c in unique_classes:
-                    c = c.item()
-                    idxs = (targets == c)
-                    features_c = raw_feats[idxs] 
-                    
-                    if c not in stats:
-                        stats[c] = {
-                            'sum': torch.zeros(self.feature_dim, dtype=torch.float64),
-                            'scatter': torch.zeros((self.feature_dim, self.feature_dim), dtype=torch.float64),
-                            'count': 0
-                        }
-                    
-                    # Tích lũy trên CPU
-                    stats[c]['sum'] += features_c.sum(dim=0).double()
-                    stats[c]['scatter'] += (features_c.t().double() @ features_c.double())
-                    stats[c]['count'] += features_c.shape[0]
-                
-                del raw_feats, inputs, targets
+        # Gom lại trên RAM
+        all_feats = torch.cat(all_feats, dim=0)
+        all_labels = torch.cat(all_labels, dim=0)
         
-        # Tính toán Mean & Covariance
-        current_classes = sorted(list(stats.keys()))
-        max_cls = max(current_classes) + 1 if current_classes else 0
+        current_classes = all_labels.unique()
+        max_cls = int(current_classes.max().item()) + 1
         
         if max_cls > self.class_means.shape[0]:
             pad_size = max_cls - self.class_means.shape[0]
             self.class_means = torch.cat([self.class_means, torch.zeros(pad_size, self.feature_dim).to(self.device)], dim=0)
-            
+        
         for c in current_classes:
-            N = stats[c]['count']
-            sum_x = stats[c]['sum'].float().to(self.device) 
-            scatter_x = stats[c]['scatter'].float().to(self.device)
+            c_idx = int(c.item())
+            idxs = (all_labels == c)
             
-            mean = sum_x / N
-            self.class_means[c] = mean
+            # [QUAN TRỌNG]: Chỉ load 1 class lên GPU
+            feats_c = all_feats[idxs].to(self.device)
             
-            if N > 1:
-                outer_mean = torch.outer(mean, mean)
-                cov = (scatter_x - N * outer_mean) / (N - 1)
+            # 1. Mean Calculation (Raw)
+            mean_c = feats_c.mean(dim=0)
+            self.class_means[c_idx] = mean_c
+            
+            # 2. Covariance Calculation
+            centered = feats_c - mean_c
+            N_c = feats_c.shape[0]
+            
+            if N_c > 1:
+                cov_c = (centered.t() @ centered) / (N_c - 1 + 1e-6)
             else:
-                cov = torch.eye(self.feature_dim).to(self.device) * 1e-3
+                cov_c = torch.eye(self.feature_dim).to(self.device) * 1e-3
                 
-            inv_c, diag_c = self._shrink_and_normalize(cov)
+            # 3. Shrinkage & Correlation Normalization
+            inv_c, diag_c = self._shrink_and_normalize(cov_c)
             
-            self.class_cov_invs[c] = inv_c
-            self.class_diags[c] = diag_c
+            self.class_cov_invs[c_idx] = inv_c
+            self.class_diags[c_idx] = diag_c
             
-            del cov, inv_c, diag_c, sum_x, scatter_x
+            # Giải phóng bộ nhớ GPU ngay lập tức
+            del feats_c, centered, cov_c, inv_c, diag_c
             
         self.known_classes = max(self.known_classes, max_cls)
         
-        del stats
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
+        # Dọn dẹp RAM
+        del all_feats, all_labels
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         print(f"--> [FeCAM] Update done. Total classes: {self.known_classes}")
 
     def _shrink_and_normalize(self, sigma):
         D = self.feature_dim
+        
+        # Eq.8: Shrinkage
         V1 = torch.trace(sigma) / D
         mask = ~torch.eye(D, dtype=torch.bool, device=self.device)
         V2 = sigma[mask].mean()
         
-        gamma = 1.0 
+        gamma = 1.0 # Many-shot setting
         Identity = torch.eye(D, device=self.device)
+        
         Sigma_s = sigma + gamma * (V1 * Identity + V2 * (1 - Identity))
         
+        # Eq.7: Correlation Normalization
+        # diag_std dùng để chia feature input lúc inference
         diag_std = torch.sqrt(torch.diag(Sigma_s)) 
         diag_std = torch.clamp(diag_std, min=1e-6)
+        
         outer_std = torch.outer(diag_std, diag_std)
-        Sigma_hat = Sigma_s / outer_std 
+        Sigma_hat = Sigma_s / outer_std # Correlation matrix
         
         inv_matrix = torch.linalg.pinv(Sigma_hat)
+        
         return inv_matrix, diag_std
 
     def compute_scores(self, raw_features, active_classes, boundary_idx=0):
+        """
+        Tính Mahalanobis Score và Log khoảng cách để check Bias.
+        """
         scores = []
-        distances = []
+        distances = [] # Lưu distance để debug
+        
         for c_idx in range(active_classes):
             if c_idx not in self.class_cov_invs:
                 scores.append(torch.full((raw_features.shape[0],), -1e9, device=self.device))
@@ -173,25 +185,31 @@ class FeCAM_Manager(nn.Module):
             diag_c = self.class_diags[c_idx]
             mean_c = self.class_means[c_idx]
             
+            # --- Inference logic: Standardization (Whitening) ---
             x_norm = raw_features / diag_c.unsqueeze(0)
             mu_norm = mean_c / diag_c
+            
             diff = x_norm - mu_norm.unsqueeze(0)
             
+            # Mahalanobis Distance
             temp = diff @ inv_c
-            dist_sq = torch.sum(temp * diff, dim=1) 
-            scores.append(-dist_sq) 
+            dist_sq = torch.sum(temp * diff, dim=1) # [B]
+            
+            scores.append(-dist_sq) # Score càng lớn càng tốt
             distances.append(dist_sq)
             
-        scores_stack = torch.stack(scores, dim=1)
-        distances_stack = torch.stack(distances, dim=1)
+        scores_stack = torch.stack(scores, dim=1)     # [B, C]
+        distances_stack = torch.stack(distances, dim=1) # [B, C]
 
+        # --- BIAS DEBUGGING ---
         if boundary_idx > 0 and boundary_idx < active_classes:
             dist_old = distances_stack[:, :boundary_idx]
             dist_new = distances_stack[:, boundary_idx:]
-            if dist_old.numel() > 0 and dist_new.numel() > 0:
-                min_dist_old = dist_old.min(dim=1)[0].mean().item()
-                min_dist_new = dist_new.min(dim=1)[0].mean().item()
-                print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.2f} | New: {min_dist_new:.2f} | Bias Ratio: {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
+            
+            min_dist_old = dist_old.min(dim=1)[0].mean().item()
+            min_dist_new = dist_new.min(dim=1)[0].mean().item()
+            
+            print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.2f} | New: {min_dist_new:.2f} | Bias Ratio (Old/New): {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
 
         return scores_stack
 
@@ -209,15 +227,13 @@ class MiNbaseNet(nn.Module):
 
         self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
-        
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
-        
-        # [MEMORY SAFE]: R luôn ở CPU
-        self.R_cpu = torch.eye(self.buffer_size, dtype=torch.float32) / self.gamma
-        
+        self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
+
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
+        
         self.fecam = FeCAM_Manager(self.feature_dim, self.device)
 
     def update_fc(self, nb_classes):
@@ -239,47 +255,64 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
         self.normal_fc = new_fc
 
-    # [FIX NAME]: Đổi tên thành update_fecam cho khớp Min.py
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
     def predict_combined(self, x, beta=0.5):
+        """
+        Combine: Analytic Logits (RLS) + FeCAM Scores
+        [UPDATED]: Có chuẩn hóa Z-score trước khi cộng.
+        """
+        # 1. Analytic Logits (RLS) - High Dimension
         with torch.no_grad():
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
             
+            # 2. FeCAM Scores - Low Dimension
             active_classes = self.known_class
-            boundary = 0
-            if self.cur_task > 0 and 'increment' in self.args:
-                boundary = self.known_class - self.args['increment']
-
-            scores_fecam = self.fecam.compute_scores(f_raw, active_classes, boundary_idx=boundary)
+            scores_fecam = self.fecam.compute_scores(f_raw, active_classes)
+            
+            # Lấy đúng số lượng class hiện tại của RLS
             curr_logits_rls = logits_rls[:, :active_classes]
 
+            # --- [FIX]: Z-SCORE NORMALIZATION ---
+            # Chuẩn hóa RLS
             rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
             rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
             norm_rls = (curr_logits_rls - rls_mean) / rls_std
             
+            # Chuẩn hóa FeCAM
             fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
             fecam_std = scores_fecam.std(dim=1, keepdim=True) + 1e-8
             norm_fecam = (scores_fecam - fecam_mean) / fecam_std
             
-            final_logits = norm_rls * (1 - beta) + beta * norm_fecam
-            return {'logits': final_logits}
+            # 3. Combine
+            final_logits = norm_rls * ( 1- beta) + beta * norm_fecam
+            
+            return {
+                'logits': final_logits,
+                'logits_rls': curr_logits_rls,
+                'logits_fecam': scores_fecam
+            }
 
     def forward(self, x, new_forward=False, use_fecam=False, beta=0.5):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
-        if new_forward: hyper_features = self.backbone(x, new_forward=True)
-        else: hyper_features = self.backbone(x)
+        
+        if new_forward:
+            hyper_features = self.backbone(x, new_forward=True)
+        else:
+            hyper_features = self.backbone(x)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
 
+    # ... Noise & GPM ...
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
     def after_task_magmax_merge(self):
+        print(f"--> [IncNet] MagMax Merge...")
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].after_task_training()
     def unfreeze_noise(self):
         for j in range(len(self.backbone.noise_maker)): self.backbone.noise_maker[j].unfreeze_incremental()
@@ -301,15 +334,10 @@ class MiNbaseNet(nn.Module):
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         try: from torch.amp import autocast
         except ImportError: from torch.cuda.amp import autocast
-        
-        # Chỉ đưa R lên GPU khi cần tính toán
-        R_gpu = self.R_cpu.to(self.device)
-        
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
@@ -319,21 +347,14 @@ class MiNbaseNet(nn.Module):
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
-
-            term = torch.eye(X.shape[0], device=X.device) + X @ R_gpu @ X.T
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            try: K = torch.linalg.solve(term + jitter, X @ R_gpu); K = K.T
-            except: K = R_gpu @ X.T @ torch.inverse(term + jitter)
-            
-            R_gpu -= K @ X @ R_gpu
+            try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
+            except: K = self.R @ X.T @ torch.inverse(term + jitter)
+            self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
+            del term, jitter, K, X, Y
             
-            # Cập nhật về CPU
-            self.R_cpu = R_gpu.cpu()
-            
-            del term, jitter, K, X, Y, R_gpu
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
     def extract_feature(self, x): return self.backbone(x)
 
     def forward_normal_fc(self, x, new_forward=False):

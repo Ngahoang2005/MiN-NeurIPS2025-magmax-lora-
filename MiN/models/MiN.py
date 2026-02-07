@@ -11,8 +11,10 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
+from utils.toolkit import tensor2numpy
+from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
+from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
 try:
     from torch.amp import autocast, GradScaler
@@ -51,6 +53,8 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
+        self.class_acc = []
+        self.task_acc = []
         
         self.scaler = GradScaler('cuda')
 
@@ -124,6 +128,7 @@ class MinNet(object):
         
         self._clear_gpu()
         
+        # Analytic Learning
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
@@ -143,7 +148,8 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats (Fix name)
+        # [FeCAM]: Update Stats
+        # Gọi đúng tên hàm update_fecam (khớp với inc_net)
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -152,6 +158,8 @@ class MinNet(object):
 
     def increment_train(self, data_manger):
         self.cur_task += 1
+        
+        # [REMOVED]: Không tạo snapshot nữa để tránh OOM và vì đã bỏ đo Drift
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
@@ -185,6 +193,7 @@ class MinNet(object):
         
         self.run(train_loader)
         
+        # GPM Collect
         self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
@@ -205,7 +214,7 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats cho Task mới (Fix name)
+        # [FeCAM]: Update Stats
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -253,6 +262,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
+        # Hardcoded scale (đã bỏ adaptive)
         current_scale = 0.85
 
         for param in self._network.parameters(): param.requires_grad = False
@@ -326,7 +336,8 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                outputs = model(inputs, use_fecam=True, beta=0.5)
+                # use_fecam=True, beta=0.6 (Z-score combined)
+                outputs = model(inputs, use_fecam=True, beta=0.6)
                 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
