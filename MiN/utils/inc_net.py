@@ -252,34 +252,49 @@ class MiNbaseNet(nn.Module):
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
-    def predict_combined(self, x, beta=0.8):
+    def predict_combined(self, x, beta=1.0):
+        """
+        Combine: Analytic Logits (RLS) + FeCAM Scores
+        [UPDATED]: Có chuẩn hóa Z-score trước khi cộng.
+        """
+        # 1. Analytic Logits (RLS) - High Dimension
         with torch.no_grad():
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
             
+            # 2. FeCAM Scores - Low Dimension
             active_classes = self.known_class
+            scores_fecam = self.fecam.compute_scores(f_raw, active_classes)
             
-            # Tính boundary index (dựa vào số class cũ)
-            # Giả sử hàm này được gọi trong eval sau khi train xong
-            # Để log bias, ta cần biết đâu là ranh giới task cũ/mới.
-            # Ta có thể estimate bằng self.known_class - self.args['increment']
-            boundary = 0
-            if self.cur_task > 0:
-                boundary = self.known_class - self.args['increment']
-                
-            scores_fecam = self.fecam.compute_scores(f_raw, active_classes, boundary_idx=boundary)
-            
+            # Lấy đúng số lượng class hiện tại của RLS
             curr_logits_rls = logits_rls[:, :active_classes]
-            final_logits = curr_logits_rls + beta * scores_fecam
+
+            # --- [FIX]: Z-SCORE NORMALIZATION ---
+            # Mục đích: Đưa cả 2 về cùng thang đo (mean=0, std=1) trên từng mẫu
+            # dim=1: Chuẩn hóa dựa trên điểm số của các class cho 1 bức ảnh
+            
+            # Chuẩn hóa RLS
+            rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
+            rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
+            norm_rls = (curr_logits_rls - rls_mean) / rls_std
+            
+            # Chuẩn hóa FeCAM
+            fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
+            fecam_std = scores_fecam.std(dim=1, keepdim=True) + 1e-8
+            norm_fecam = (scores_fecam - fecam_mean) / fecam_std
+            
+            # 3. Combine
+            # Lúc này beta thực sự mang ý nghĩa "trọng số quan trọng"
+            # beta = 0.5 nghĩa là FeCAM quan trọng bằng một nửa RLS
+            final_logits = norm_rls * ( 1- beta) + beta * norm_fecam
             
             return {
                 'logits': final_logits,
-                'logits_rls': curr_logits_rls,
+                'logits_rls': curr_logits_rls, # Trả về raw để debug nếu cần
                 'logits_fecam': scores_fecam
             }
-
-    def forward(self, x, new_forward=False, use_fecam=False, beta=0.8):
+    def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
         
