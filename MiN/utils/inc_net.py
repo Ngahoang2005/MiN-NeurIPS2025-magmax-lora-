@@ -74,8 +74,12 @@ class FeCAM_Manager(nn.Module):
         self.known_classes = 0
 
     def update_stats(self, network, data_loader):
+        """
+        [OOM FIX]: Tính toán Stats trên CPU để tránh tràn VRAM.
+        Chỉ đưa dữ liệu từng class lên GPU khi cần thiết.
+        """
         network.eval()
-        print(f"--> [FeCAM] Updating Stats (Per-Class, No L2 Norm)...")
+        print(f"--> [FeCAM] Updating Stats (Per-Class, CPU Offload Mode)...")
         
         all_feats = []
         all_labels = []
@@ -85,9 +89,12 @@ class FeCAM_Manager(nn.Module):
                 inputs = inputs.to(self.device)
                 # Raw backbone features (No L2 Norm)
                 raw_feats = network.backbone(inputs)
-                all_feats.append(raw_feats)
-                all_labels.append(targets.to(self.device))
                 
+                # [QUAN TRỌNG]: Đẩy về CPU ngay lập tức
+                all_feats.append(raw_feats.cpu())
+                all_labels.append(targets.cpu())
+                
+        # Gom lại trên RAM
         all_feats = torch.cat(all_feats, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         
@@ -101,7 +108,9 @@ class FeCAM_Manager(nn.Module):
         for c in current_classes:
             c_idx = int(c.item())
             idxs = (all_labels == c)
-            feats_c = all_feats[idxs]
+            
+            # [QUAN TRỌNG]: Chỉ load 1 class lên GPU
+            feats_c = all_feats[idxs].to(self.device)
             
             # 1. Mean Calculation (Raw)
             mean_c = feats_c.mean(dim=0)
@@ -122,7 +131,16 @@ class FeCAM_Manager(nn.Module):
             self.class_cov_invs[c_idx] = inv_c
             self.class_diags[c_idx] = diag_c
             
+            # Giải phóng bộ nhớ GPU ngay lập tức
+            del feats_c, centered, cov_c, inv_c, diag_c
+            
         self.known_classes = max(self.known_classes, max_cls)
+        
+        # Dọn dẹp RAM
+        del all_feats, all_labels
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
         print(f"--> [FeCAM] Update done. Total classes: {self.known_classes}")
 
     def _shrink_and_normalize(self, sigma):
@@ -153,7 +171,6 @@ class FeCAM_Manager(nn.Module):
     def compute_scores(self, raw_features, active_classes, boundary_idx=0):
         """
         Tính Mahalanobis Score và Log khoảng cách để check Bias.
-        boundary_idx: Ranh giới giữa class cũ và mới (để log).
         """
         scores = []
         distances = [] # Lưu distance để debug
@@ -169,14 +186,12 @@ class FeCAM_Manager(nn.Module):
             mean_c = self.class_means[c_idx]
             
             # --- Inference logic: Standardization (Whitening) ---
-            # x_norm = x / sigma_i (theo Eq.7)
             x_norm = raw_features / diag_c.unsqueeze(0)
             mu_norm = mean_c / diag_c
             
             diff = x_norm - mu_norm.unsqueeze(0)
             
-            # Mahalanobis Distance: diff @ Inv @ diff.T
-            # Tối ưu: element-wise sum
+            # Mahalanobis Distance
             temp = diff @ inv_c
             dist_sq = torch.sum(temp * diff, dim=1) # [B]
             
@@ -187,22 +202,13 @@ class FeCAM_Manager(nn.Module):
         distances_stack = torch.stack(distances, dim=1) # [B, C]
 
         # --- BIAS DEBUGGING ---
-        # Chỉ in log nếu có cả class cũ và mới
         if boundary_idx > 0 and boundary_idx < active_classes:
-            # Lấy min distance (khoảng cách đến class gần nhất trong nhóm)
-            # Old classes: 0 -> boundary_idx-1
-            # New classes: boundary_idx -> active_classes-1
-            
             dist_old = distances_stack[:, :boundary_idx]
             dist_new = distances_stack[:, boundary_idx:]
             
-            # Trung bình của khoảng cách nhỏ nhất (đại diện cho độ tự tin)
             min_dist_old = dist_old.min(dim=1)[0].mean().item()
             min_dist_new = dist_new.min(dim=1)[0].mean().item()
             
-            # In ra màn hình console (hoặc dùng logger nếu cần)
-            # Format gọn để theo dõi: [FeCAM Bias] Old: 150.2 vs New: 40.5
-            # Nếu New < Old quá nhiều => Bias nặng vào New tasks
             print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.2f} | New: {min_dist_new:.2f} | Bias Ratio (Old/New): {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
 
         return scores_stack
@@ -252,7 +258,7 @@ class MiNbaseNet(nn.Module):
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
-    def predict_combined(self, x, beta=0.5):
+    def predict_combined(self, x, beta=1.0):
         """
         Combine: Analytic Logits (RLS) + FeCAM Scores
         [UPDATED]: Có chuẩn hóa Z-score trước khi cộng.
@@ -271,9 +277,6 @@ class MiNbaseNet(nn.Module):
             curr_logits_rls = logits_rls[:, :active_classes]
 
             # --- [FIX]: Z-SCORE NORMALIZATION ---
-            # Mục đích: Đưa cả 2 về cùng thang đo (mean=0, std=1) trên từng mẫu
-            # dim=1: Chuẩn hóa dựa trên điểm số của các class cho 1 bức ảnh
-            
             # Chuẩn hóa RLS
             rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
             rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
@@ -285,16 +288,15 @@ class MiNbaseNet(nn.Module):
             norm_fecam = (scores_fecam - fecam_mean) / fecam_std
             
             # 3. Combine
-            # Lúc này beta thực sự mang ý nghĩa "trọng số quan trọng"
-            # beta = 0.5 nghĩa là FeCAM quan trọng bằng một nửa RLS
             final_logits = norm_rls * ( 1- beta) + beta * norm_fecam
             
             return {
                 'logits': final_logits,
-                'logits_rls': curr_logits_rls, # Trả về raw để debug nếu cần
+                'logits_rls': curr_logits_rls,
                 'logits_fecam': scores_fecam
             }
-    def forward(self, x, new_forward=False, use_fecam=False, beta=0.5):
+
+    def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
         
@@ -306,7 +308,7 @@ class MiNbaseNet(nn.Module):
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
 
-    # ... (Giữ nguyên các hàm noise, fit RLS, GPM projection...) ...
+    # ... Noise & GPM ...
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
     def after_task_magmax_merge(self):

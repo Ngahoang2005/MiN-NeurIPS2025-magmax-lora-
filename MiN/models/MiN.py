@@ -11,13 +11,11 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
+from utils.toolkit import tensor2numpy
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
-# [FIX]: Dùng thư viện chuẩn mới của PyTorch để hỗ trợ 'cuda' string
 try:
     from torch.amp import autocast, GradScaler
 except ImportError:
@@ -58,7 +56,6 @@ class MinNet(object):
         self.class_acc = []
         self.task_acc = []
         
-        # Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
@@ -78,7 +75,7 @@ class MinNet(object):
         test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
                                  num_workers=self.num_workers)
         
-        # [EVAL]: Sử dụng FeCAM kết hợp
+        # [EVAL] Kết hợp FeCAM (beta=0.6)
         eval_res = self.eval_task(test_loader)
         
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
@@ -131,6 +128,7 @@ class MinNet(object):
         
         self._clear_gpu()
         
+        # Analytic Learning
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
@@ -151,6 +149,7 @@ class MinNet(object):
         self.re_fit(train_loader, test_loader)
         
         # [FeCAM]: Update Stats
+        # Gọi đúng tên hàm update_fecam (khớp với inc_net)
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -160,8 +159,7 @@ class MinNet(object):
     def increment_train(self, data_manger):
         self.cur_task += 1
         
-        # [REMOVED]: Không tạo snapshot self.old_network/old_backbone nữa vì bạn đã bỏ tính Drift.
-        # Điều này giúp tiết kiệm VRAM và tránh OOM.
+        # [REMOVED]: Không tạo snapshot nữa để tránh OOM và vì đã bỏ đo Drift
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
@@ -195,8 +193,7 @@ class MinNet(object):
         
         self.run(train_loader)
         
-        # [REMOVED]: measure_batch_drift
-        
+        # GPM Collect
         self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
@@ -217,7 +214,7 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats cho Task mới
+        # [FeCAM]: Update Stats
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
         self._network.update_fecam(fecam_loader)
         
@@ -265,10 +262,9 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # [UPDATED]: Hardcoded scale vì bạn đã bỏ Adaptive Scale
+        # Hardcoded scale (đã bỏ adaptive)
         current_scale = 0.85
 
-        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -306,7 +302,6 @@ class MinNet(object):
 
                 self.scaler.scale(loss).backward()
                 
-                # Logic GPM + Warmup
                 if self.cur_task > 0:
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
@@ -341,8 +336,7 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                # [FIX]: Bật cờ use_fecam cho Inference
-                # beta=0.6 là một khởi điểm tốt khi kết hợp Z-score normalizations
+                # use_fecam=True, beta=0.6 (Z-score combined)
                 outputs = model(inputs, use_fecam=True, beta=0.6)
                 
                 logits = outputs["logits"]
@@ -360,19 +354,3 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
-    def get_task_prototype(self, model, train_loader):
-        model = model.eval()
-        model.to(self.device)
-        features = []
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                with autocast('cuda'):
-                    feature = model.extract_feature(inputs)
-                features.append(feature.detach().cpu())
-        
-        all_features = torch.cat(features, dim=0)
-        prototype = torch.mean(all_features, dim=0).to(self.device)
-        self._clear_gpu()
-        return prototype
