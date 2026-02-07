@@ -163,9 +163,6 @@ class MinNet(object):
 
     def increment_train(self, data_manger):
         self.cur_task += 1
-        
-        self.old_network = copy.deepcopy(self._network)
-        self.old_network.to(self.device)
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
         self.logger.info("task_order: {}".format(train_list))
@@ -197,10 +194,6 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self.measure_batch_drift(self.test_loader)
-        
-        # Giải phóng bộ nhớ snapshot
-        del self.old_network
         self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
@@ -262,43 +255,15 @@ class MinNet(object):
             prog_bar.set_description(info)
         self._clear_gpu()
 
-    def compute_adaptive_scale(self, current_loader):
-        # 1. Tính prototype task hiện tại
-        curr_proto = self.get_task_prototype(self._network, current_loader)
-        
-        if not hasattr(self, 'old_prototypes'): self.old_prototypes = []
-        
-        if not self.old_prototypes:
-            self.old_prototypes.append(curr_proto)
-            return 0.95 # Task đầu tiên chưa cần scale, hoặc scale cao
-            
-        # 2. So sánh với quá khứ
-        max_sim = 0.0
-        curr_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
-        for old_p in self.old_prototypes:
-            old_norm = F.normalize(old_p.unsqueeze(0), p=2, dim=1)
-            sim = torch.mm(curr_norm, old_norm.t()).item()
-            if sim > max_sim: max_sim = sim
-                
-        self.old_prototypes.append(curr_proto)
-        
-        # 3. Tính Scale: Giống nhau nhiều -> Scale thấp (để học đè lên). Khác nhau -> Scale cao.
-        # Công thức: Scale chạy từ 0.5 đến 0.95
-        scale = 0.5 + 0.5 * (1.0 - max_sim)
-        scale = max(0.65, min(scale, 0.95)) # Kẹp giá trị an toàn
-        
-        self.logger.info(f"--> [ADAPTIVE] Similarity: {max_sim:.4f} => Scale: {scale:.4f}")
-        return scale
+    
+    
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
         # [TỐI ƯU 2]: Tính scale một lần đầu task
-        current_scale = 0.8 
-        if self.cur_task > 0:
-            # Đảm bảo bạn đã thêm hàm compute_adaptive_scale vào class MinNet nhé
-            current_scale = self.compute_adaptive_scale(train_loader)
+        current_scale = 0.85
 
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -348,7 +313,7 @@ class MinNet(object):
                     if epoch >= WARMUP_EPOCHS:
                         self.scaler.unscale_(optimizer)
                         # Áp dụng Adaptive Scale
-                        self._network.apply_gpm_to_grads(scale=0.8)
+                        self._network.apply_gpm_to_grads(scale=current_scale)
                     else:
                         # Warm-up: Thả trôi gradient để học nhanh
                         pass
@@ -377,48 +342,8 @@ class MinNet(object):
             # Clear cache định kỳ
             if epoch % 5 == 0:
                 self._clear_gpu()
-    def measure_batch_drift(self, data_loader):
-        """
-        So sánh đầu ra của 1 batch dữ liệu giữa mô hình cũ (trước task) 
-        và mô hình mới (sau khi học task).
-        """
-        self._network.eval()
-        self.old_network.eval() # Bản sao đã lưu trước khi train
-        
-        # Lấy 1 batch từ data_loader
-        _, inputs, _ = next(iter(data_loader))
-        inputs = inputs.to(self.device)
-
-        with torch.no_grad():
-            # 1. Feature từ mô hình CŨ
-            # Chúng ta lấy đặc trưng trước khi vào Classifier
-            old_features = self.old_network.extract_feature(inputs)
-            
-            # 2. Feature từ mô hình MỚI (sau training)
-            new_features = self._network.extract_feature(inputs)
-
-        # --- TÍNH TOÁN CÁC CHỈ SỐ DRIFT ---
-        
-        # Khoảng cách Euclidean (L2 Norm) - càng nhỏ càng ít drift
-        l2_drift = torch.norm(old_features - new_features, p=2, dim=1).mean().item()
-        
-        # Cosine Similarity - càng gần 1.0 càng giữ được cấu trúc ngữ nghĩa
-        cos_sim = F.cosine_similarity(old_features, new_features, dim=1).mean().item()
-        
-        # Tỷ lệ thay đổi cường độ (Magnitude Ratio)
-        old_mag = torch.norm(old_features, p=2, dim=1).mean()
-        new_mag = torch.norm(new_features, p=2, dim=1).mean()
-        mag_ratio = (new_mag / (old_mag + 1e-8)).item()
-
-        self.logger.info(f"\n>>> DRIFT ANALYSIS (Batch-level) for Task {self.cur_task}:")
-        print(f"\n>>> DRIFT ANALYSIS (Batch-level) for Task {self.cur_task}:")
-        self.logger.info(f"    - Avg Cosine Similarity: {cos_sim:.4f} (Trạng thái giữ vững biểu diễn)")
-        print(f"    - Avg Cosine Similarity: {cos_sim:.4f}")
-        self.logger.info(f"    - Avg L2 Distance:       {l2_drift:.4f} (Độ lệch tuyệt đối)")
-        print(f"    - Avg L2 Distance:       {l2_drift:.4f}")
-        self.logger.info(f"    - Magnitude Ratio:      {mag_ratio:.4f} (Sự bùng nổ/suy giảm năng lượng)")
-       
-        return cos_sim, l2_drift
+    
+    
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
