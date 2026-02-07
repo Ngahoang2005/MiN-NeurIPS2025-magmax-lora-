@@ -146,7 +146,6 @@ class MinNet(object):
         
         # [FeCAM]: Update Stats
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        # Sửa tên hàm cho khớp inc_net
         self._network.update_fecam_stats(fecam_loader)
         
         del train_set, test_set
@@ -209,7 +208,6 @@ class MinNet(object):
         
         # [FeCAM]: Update Stats cho Task mới
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        # Sửa tên hàm cho khớp inc_net
         self._network.update_fecam_stats(fecam_loader)
         
         del train_set, test_set
@@ -273,7 +271,7 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
 
-        WARMUP_EPOCHS = 5
+        WARMUP_EPOCHS = 2
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
