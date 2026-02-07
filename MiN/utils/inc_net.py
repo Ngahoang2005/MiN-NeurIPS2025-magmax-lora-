@@ -258,7 +258,7 @@ class MiNbaseNet(nn.Module):
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
-    def predict_combined(self, x, beta=1.0):
+    def predict_combined(self, x, beta=0.5):
         """
         Combine: Analytic Logits (RLS) + FeCAM Scores
         [UPDATED]: Có chuẩn hóa Z-score trước khi cộng.
@@ -296,7 +296,7 @@ class MiNbaseNet(nn.Module):
                 'logits_fecam': scores_fecam
             }
 
-    def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
+    def forward(self, x, new_forward=False, use_fecam=False, beta=0.5):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
         
