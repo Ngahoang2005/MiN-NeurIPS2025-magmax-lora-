@@ -14,7 +14,6 @@ from utils.inc_net import MiNbaseNet
 from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
 
-# [FIX]: Dùng thư viện chuẩn mới của PyTorch để hỗ trợ 'cuda' string
 try:
     from torch.amp import autocast, GradScaler
 except ImportError:
@@ -144,9 +143,9 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats
+        # [FeCAM]: Update Stats Streaming
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam_stats(fecam_loader)
+        self._network.update_fecam(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()
@@ -206,9 +205,9 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats cho Task mới
+        # [FeCAM]: Update Stats Streaming
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam_stats(fecam_loader)
+        self._network.update_fecam(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()
@@ -254,7 +253,6 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # Hardcoded scale (đã bỏ adaptive)
         current_scale = 0.85
 
         for param in self._network.parameters(): param.requires_grad = False
@@ -328,7 +326,6 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                # use_fecam=True, beta=0.6 (Z-score combined)
                 outputs = model(inputs, use_fecam=True, beta=0.6)
                 
                 logits = outputs["logits"]
