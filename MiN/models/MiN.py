@@ -11,11 +11,10 @@ import gc
 import os
 
 from utils.inc_net import MiNbaseNet
-from utils.toolkit import tensor2numpy
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
 
+# [FIX]: Dùng thư viện chuẩn mới của PyTorch để hỗ trợ 'cuda' string
 try:
     from torch.amp import autocast, GradScaler
 except ImportError:
@@ -53,8 +52,6 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
         
         self.scaler = GradScaler('cuda')
 
@@ -128,7 +125,6 @@ class MinNet(object):
         
         self._clear_gpu()
         
-        # Analytic Learning
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
@@ -149,17 +145,15 @@ class MinNet(object):
         self.re_fit(train_loader, test_loader)
         
         # [FeCAM]: Update Stats
-        # Gọi đúng tên hàm update_fecam (khớp với inc_net)
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam(fecam_loader)
+        # Sửa tên hàm cho khớp inc_net
+        self._network.update_fecam_stats(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()
 
     def increment_train(self, data_manger):
         self.cur_task += 1
-        
-        # [REMOVED]: Không tạo snapshot nữa để tránh OOM và vì đã bỏ đo Drift
         
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
@@ -193,7 +187,6 @@ class MinNet(object):
         
         self.run(train_loader)
         
-        # GPM Collect
         self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
@@ -214,9 +207,10 @@ class MinNet(object):
 
         self.re_fit(train_loader, test_loader)
         
-        # [FeCAM]: Update Stats
+        # [FeCAM]: Update Stats cho Task mới
         fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam(fecam_loader)
+        # Sửa tên hàm cho khớp inc_net
+        self._network.update_fecam_stats(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()

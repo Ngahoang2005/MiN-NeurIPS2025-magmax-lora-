@@ -74,12 +74,8 @@ class FeCAM_Manager(nn.Module):
         self.known_classes = 0
 
     def update_stats(self, network, data_loader):
-        """
-        [OOM FIX]: Tính toán Stats trên CPU để tránh tràn VRAM.
-        Chỉ đưa dữ liệu từng class lên GPU khi cần thiết.
-        """
         network.eval()
-        print(f"--> [FeCAM] Updating Stats (Per-Class, CPU Offload Mode)...")
+        print(f"--> [FeCAM] Updating Stats (OOM Safe Mode)...")
         
         all_feats = []
         all_labels = []
@@ -87,14 +83,15 @@ class FeCAM_Manager(nn.Module):
         with torch.no_grad():
             for _, inputs, targets in data_loader:
                 inputs = inputs.to(self.device)
-                # Raw backbone features (No L2 Norm)
+                # Raw backbone features
                 raw_feats = network.backbone(inputs)
                 
-                # [QUAN TRỌNG]: Đẩy về CPU ngay lập tức
+                # [FIX OOM]: Đẩy feature về CPU tạm thời để tránh tranh chấp VRAM với ma trận R 1GB
+                # Việc này cực nhanh và cứu sống Task 3+
                 all_feats.append(raw_feats.cpu())
                 all_labels.append(targets.cpu())
                 
-        # Gom lại trên RAM
+        # Gom dữ liệu trên RAM
         all_feats = torch.cat(all_feats, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         
@@ -109,10 +106,11 @@ class FeCAM_Manager(nn.Module):
             c_idx = int(c.item())
             idxs = (all_labels == c)
             
-            # [QUAN TRỌNG]: Chỉ load 1 class lên GPU
+            # [FIX OOM]: Chỉ đưa dữ liệu của 1 class lên GPU để tính toán covariance
+            # Sau khi tính xong thì xóa ngay
             feats_c = all_feats[idxs].to(self.device)
             
-            # 1. Mean Calculation (Raw)
+            # 1. Mean Calculation
             mean_c = feats_c.mean(dim=0)
             self.class_means[c_idx] = mean_c
             
@@ -131,7 +129,7 @@ class FeCAM_Manager(nn.Module):
             self.class_cov_invs[c_idx] = inv_c
             self.class_diags[c_idx] = diag_c
             
-            # Giải phóng bộ nhớ GPU ngay lập tức
+            # Xóa ngay lập tức khỏi GPU
             del feats_c, centered, cov_c, inv_c, diag_c
             
         self.known_classes = max(self.known_classes, max_cls)
@@ -157,23 +155,19 @@ class FeCAM_Manager(nn.Module):
         Sigma_s = sigma + gamma * (V1 * Identity + V2 * (1 - Identity))
         
         # Eq.7: Correlation Normalization
-        # diag_std dùng để chia feature input lúc inference
         diag_std = torch.sqrt(torch.diag(Sigma_s)) 
         diag_std = torch.clamp(diag_std, min=1e-6)
         
         outer_std = torch.outer(diag_std, diag_std)
-        Sigma_hat = Sigma_s / outer_std # Correlation matrix
+        Sigma_hat = Sigma_s / outer_std 
         
         inv_matrix = torch.linalg.pinv(Sigma_hat)
         
         return inv_matrix, diag_std
 
     def compute_scores(self, raw_features, active_classes, boundary_idx=0):
-        """
-        Tính Mahalanobis Score và Log khoảng cách để check Bias.
-        """
         scores = []
-        distances = [] # Lưu distance để debug
+        distances = [] 
         
         for c_idx in range(active_classes):
             if c_idx not in self.class_cov_invs:
@@ -185,23 +179,20 @@ class FeCAM_Manager(nn.Module):
             diag_c = self.class_diags[c_idx]
             mean_c = self.class_means[c_idx]
             
-            # --- Inference logic: Standardization (Whitening) ---
             x_norm = raw_features / diag_c.unsqueeze(0)
             mu_norm = mean_c / diag_c
             
             diff = x_norm - mu_norm.unsqueeze(0)
             
-            # Mahalanobis Distance
             temp = diff @ inv_c
             dist_sq = torch.sum(temp * diff, dim=1) # [B]
             
-            scores.append(-dist_sq) # Score càng lớn càng tốt
+            scores.append(-dist_sq) 
             distances.append(dist_sq)
             
-        scores_stack = torch.stack(scores, dim=1)     # [B, C]
-        distances_stack = torch.stack(distances, dim=1) # [B, C]
+        scores_stack = torch.stack(scores, dim=1)     
+        distances_stack = torch.stack(distances, dim=1)
 
-        # --- BIAS DEBUGGING ---
         if boundary_idx > 0 and boundary_idx < active_classes:
             dist_old = distances_stack[:, :boundary_idx]
             dist_new = distances_stack[:, boundary_idx:]
@@ -209,7 +200,7 @@ class FeCAM_Manager(nn.Module):
             min_dist_old = dist_old.min(dim=1)[0].mean().item()
             min_dist_new = dist_new.min(dim=1)[0].mean().item()
             
-            print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.2f} | New: {min_dist_new:.2f} | Bias Ratio (Old/New): {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
+            print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.2f} | New: {min_dist_new:.2f} | Bias Ratio: {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
 
         return scores_stack
 
@@ -255,39 +246,38 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
         self.normal_fc = new_fc
 
-    def update_fecam(self, train_loader):
+    # [FIX NAME]: Đổi tên hàm này để Min.py có thể gọi đúng
+    def update_fecam_stats(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
     def predict_combined(self, x, beta=0.5):
         """
-        Combine: Analytic Logits (RLS) + FeCAM Scores
-        [UPDATED]: Có chuẩn hóa Z-score trước khi cộng.
+        Combine: Analytic Logits (RLS) + FeCAM Scores (Z-score Norm)
         """
-        # 1. Analytic Logits (RLS) - High Dimension
         with torch.no_grad():
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
             
-            # 2. FeCAM Scores - Low Dimension
             active_classes = self.known_class
-            scores_fecam = self.fecam.compute_scores(f_raw, active_classes)
             
-            # Lấy đúng số lượng class hiện tại của RLS
+            boundary = 0
+            if self.cur_task > 0 and 'increment' in self.args:
+                boundary = self.known_class - self.args['increment']
+
+            scores_fecam = self.fecam.compute_scores(f_raw, active_classes, boundary_idx=boundary)
+            
             curr_logits_rls = logits_rls[:, :active_classes]
 
-            # --- [FIX]: Z-SCORE NORMALIZATION ---
-            # Chuẩn hóa RLS
+            # Z-SCORE NORMALIZATION
             rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
             rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
             norm_rls = (curr_logits_rls - rls_mean) / rls_std
             
-            # Chuẩn hóa FeCAM
             fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
             fecam_std = scores_fecam.std(dim=1, keepdim=True) + 1e-8
             norm_fecam = (scores_fecam - fecam_mean) / fecam_std
             
-            # 3. Combine
             final_logits = norm_rls * ( 1- beta) + beta * norm_fecam
             
             return {
