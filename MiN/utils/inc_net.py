@@ -318,32 +318,41 @@ class MiNbaseNet(nn.Module):
 
     def predict_combined(self, x, beta=0.5):
         """
-        Combine: Analytic Logits (RLS) + FeCAM Scores (Z-score Norm)
+        Combine: Analytic Logits (RLS) + FeCAM Scores
+        [UPDATED]: Dùng Min-Max Scaling thay vì Z-Score.
         """
         with torch.no_grad():
+            # 1. RLS
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
             curr_logits_rls = logits_rls[:, :self.known_class]
 
+            # 2. FeCAM
             boundary = 0
             if self.cur_task > 0 and 'increment' in self.args:
                 boundary = self.known_class - self.args['increment']
-
             scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
             
-            rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
-            rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
-            norm_rls = (curr_logits_rls - rls_mean) / rls_std
+            # --- MIN-MAX NORMALIZATION (Per Sample) ---
+            # Công thức: (x - min) / (max - min + epsilon)
             
-            fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
-            fecam_std = scores_fecam.std(dim=1, keepdim=True) + 1e-8
-            norm_fecam = (scores_fecam - fecam_mean) / fecam_std
+            # RLS Min-Max
+            rls_min = curr_logits_rls.min(dim=1, keepdim=True)[0]
+            rls_max = curr_logits_rls.max(dim=1, keepdim=True)[0]
+            norm_rls = (curr_logits_rls - rls_min) / (rls_max - rls_min + 1e-8)
             
+            # FeCAM Min-Max
+            fecam_min = scores_fecam.min(dim=1, keepdim=True)[0]
+            fecam_max = scores_fecam.max(dim=1, keepdim=True)[0]
+            norm_fecam = (scores_fecam - fecam_min) / (fecam_max - fecam_min + 1e-8)
+            
+            # 3. Combine
+            # Lưu ý: Vì đã quy về [0, 1], beta lúc này cực kỳ nhạy.
+            # beta = 0.5 nghĩa là cộng đều.
             final_logits = norm_rls * (1 - beta) + beta * norm_fecam
             
             return {'logits': final_logits}
-
     def forward(self, x, new_forward=False, use_fecam=False, beta=0.5):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)

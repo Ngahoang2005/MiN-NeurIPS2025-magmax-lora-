@@ -23,7 +23,7 @@
   "gamma": 100,
   "hidden_dim": 192,
   "tukey": true,
-  "beta": 0.5,
+  "beta": 1.0,
   "shrink": true,
   "norm_cov": true,
   "alpha1": 1.0,
