@@ -327,7 +327,7 @@ class MiNbaseNet(nn.Module):
             
             return {'logits': final_logits}
 
-    def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
+    def forward(self, x, new_forward=False, use_fecam=False, beta=0.0):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
