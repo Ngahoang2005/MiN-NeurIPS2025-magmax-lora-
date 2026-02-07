@@ -292,6 +292,9 @@ class MiNbaseNet(nn.Module):
         self.fecam.update_stats(self, train_loader)
 
     def predict_combined(self, x, beta=0.5):
+        """
+        Combine: Analytic Logits (RLS) + FeCAM Scores (Probability Fusion)
+        """
         with torch.no_grad():
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
@@ -302,18 +305,25 @@ class MiNbaseNet(nn.Module):
             if self.cur_task > 0 and 'increment' in self.args:
                 boundary = self.known_class - self.args['increment']
 
+            # scores_fecam là Negative Distance (vd: -10, -500)
             scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
             
-            # Min-Max Scaling (Sample-wise)
-            rls_min = curr_logits_rls.min(dim=1, keepdim=True)[0]
-            rls_max = curr_logits_rls.max(dim=1, keepdim=True)[0]
-            norm_rls = (curr_logits_rls - rls_min) / (rls_max - rls_min + 1e-8)
+            # --- CÁCH 1: SOFTMAX PROBABILITY FUSION ---
             
-            fecam_min = scores_fecam.min(dim=1, keepdim=True)[0]
-            fecam_max = scores_fecam.max(dim=1, keepdim=True)[0]
-            norm_fecam = (scores_fecam - fecam_min) / (fecam_max - fecam_min + 1e-8)
+            # Temperature Scaling cho FeCAM:
+            # Mahalanobis distance thường rất lớn (vd 500). Cần chia nhỏ để Softmax không bị One-hot cứng.
+            # Dùng sqrt(d) là chuẩn mực (d=768 -> sqrt=27.7)
+            T_fecam = math.sqrt(self.feature_dim)
             
-            final_logits = norm_rls * (1 - beta) + beta * norm_fecam
+            # Chuyển về xác suất
+            probs_rls = F.softmax(curr_logits_rls, dim=1)
+            probs_fecam = F.softmax(scores_fecam / T_fecam, dim=1)
+            
+            # Weighted Sum Probability
+            final_probs = probs_rls * (1 - beta) + probs_fecam * beta
+            
+            # Chuyển lại Logits (giả lập) để tính loss/eval nếu cần
+            final_logits = torch.log(final_probs + 1e-8)
             
             return {'logits': final_logits}
 
