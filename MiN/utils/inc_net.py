@@ -59,16 +59,13 @@ class RandomBuffer(torch.nn.Linear):
 
 
 class FeCAM_Manager(nn.Module):
-    """
-    Implement sát sườn base.py và fecam.py của source gốc.
-    """
     def __init__(self, feature_dim, device, args):
         super().__init__()
         self.feature_dim = feature_dim
         self.device = device
         self.args = args
         
-        # Config từ bài báo
+        # Config
         self.use_tukey = args.get("tukey", True)
         self.beta = args.get("beta", 0.5)
         self.alpha1 = args.get("alpha1", 1.0)
@@ -76,98 +73,128 @@ class FeCAM_Manager(nn.Module):
         self.use_shrink = args.get("shrink", True)
         self.use_norm_cov = args.get("norm_cov", True)
         
-        # Mean (Proto)
         self.register_buffer("class_means", torch.zeros(0, feature_dim))
-        
-        # Covariance Storage (Inversed)
         self.class_cov_invs = {} 
         self.known_classes = 0
 
     def _tukeys_transform(self, x):
-        """base.py dòng 173: Power transform"""
         if self.beta == 0:
             return torch.log(x)
         else:
             return torch.sign(x) * torch.pow(torch.abs(x), self.beta)
 
     def update_stats(self, network, data_loader):
+        """
+        [TRUE STREAMING ON GPU]: 
+        - Không gom feature vào list (tránh OOM RAM).
+        - Tính tích lũy (Sum, Scatter) trực tiếp trên GPU.
+        - Giữ nguyên logic toán học của code gốc.
+        """
         network.eval()
-        print(f"--> [FeCAM] Updating Stats (Official Logic: CPU Collect, Tukey, Shrink, Norm)...")
+        print(f"--> [FeCAM] Updating Stats (GPU Streaming Mode)...")
         
-        # 1. Collect Features to CPU (Giống _extract_vectors base.py dòng 309)
-        all_feats = []
-        all_labels = []
+        # Dictionary lưu thống kê tích lũy trên GPU
+        # stats[c] = {'sum': Tensor, 'scatter': Tensor, 'count': int}
+        # Kích thước 'scatter' là 768x768 (khoảng 2.3MB). 
+        # 100 Class chỉ tốn ~230MB VRAM -> Rất an toàn.
+        stats = {}
         
         with torch.no_grad():
             for _, inputs, targets in data_loader:
                 inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
                 
-                # Extract
+                # 1. Extract Feature (GPU)
                 raw_feats = network.backbone(inputs)
                 
-                # Move to CPU immediately (như tensor2numpy)
-                all_feats.append(raw_feats.cpu())
-                all_labels.append(targets.cpu())
+                # 2. Tukey Transform (Ngay lập tức, giống code gốc fecam.py)
+                if self.use_tukey:
+                    raw_feats = self._tukeys_transform(raw_feats)
                 
-        all_feats = torch.cat(all_feats, dim=0)
-        all_labels = torch.cat(all_labels, dim=0)
+                # 3. Tích lũy theo từng class trong batch này
+                unique_classes = targets.unique()
+                
+                for c in unique_classes:
+                    c = c.item()
+                    idxs = (targets == c)
+                    features_c = raw_feats[idxs] # [N_batch, D]
+                    
+                    if c not in stats:
+                        # Khởi tạo bộ đếm trên GPU (dùng double để cộng dồn chính xác)
+                        stats[c] = {
+                            'sum': torch.zeros(self.feature_dim, device=self.device, dtype=torch.double),
+                            'scatter': torch.zeros((self.feature_dim, self.feature_dim), device=self.device, dtype=torch.double),
+                            'count': 0
+                        }
+                    
+                    # Update Sum: sigma(x)
+                    stats[c]['sum'] += features_c.sum(dim=0).double()
+                    
+                    # Update Scatter: sigma(x * x.T)
+                    # features_c.t() @ features_c
+                    stats[c]['scatter'] += (features_c.t().double() @ features_c.double())
+                    
+                    # Update Count
+                    stats[c]['count'] += features_c.shape[0]
+                
+                # [QUAN TRỌNG]: Xóa ngay batch hiện tại để giải phóng bộ nhớ
+                del raw_feats, inputs, targets
         
-        # Tukey Transform
-        if self.use_tukey:
-            all_feats = self._tukeys_transform(all_feats)
-        
-        current_classes = all_labels.unique()
-        max_cls = int(current_classes.max().item()) + 1
+        # 4. Tái tạo Mean và Covariance từ thống kê tích lũy
+        current_classes = sorted(list(stats.keys()))
+        max_cls = max(current_classes) + 1 if current_classes else 0
         
         if max_cls > self.class_means.shape[0]:
             pad_size = max_cls - self.class_means.shape[0]
             self.class_means = torch.cat([self.class_means, torch.zeros(pad_size, self.feature_dim).to(self.device)], dim=0)
-        
-        # 2. Compute Mean & Cov per Class
+            
         for c in current_classes:
-            c_idx = int(c.item())
-            idxs = (all_labels == c)
+            N = stats[c]['count']
+            # Chuyển về float32 để tính toán tiếp
+            sum_x = stats[c]['sum'].float()
+            scatter_x = stats[c]['scatter'].float()
             
-            # Đưa 1 class lên GPU
-            vectors = all_feats[idxs].to(self.device)
+            # Mean = Sum / N
+            mean = sum_x / N
+            self.class_means[c] = mean
             
-            # Mean
-            class_mean = vectors.mean(dim=0)
-            self.class_means[c_idx] = class_mean
-            
-            # Covariance (Centered)
-            x_minus_mu = vectors - class_mean
-            N = vectors.shape[0]
-            
+            # Covariance Calculation (Reconstructed)
+            # Cov = (Sigma(xxT) - N * mu * muT) / (N-1)
             if N > 1:
-                cov = (x_minus_mu.t() @ x_minus_mu) / (N - 1)
+                outer_mean = torch.outer(mean, mean)
+                cov = (scatter_x - N * outer_mean) / (N - 1)
             else:
                 cov = torch.eye(self.feature_dim).to(self.device) * 1e-4
 
-            # 3. Shrinkage (base.py dòng 157)
+            # --- Logic Shrinkage & Norm (Giống code gốc) ---
+            
+            # Shrinkage
             if self.use_shrink:
                 cov = self._shrink_cov(cov)
             
-            # 4. Normalize (base.py dòng 168)
+            # Normalize
             if self.use_norm_cov:
                 cov = self._normalize_cov(cov)
             
-            # 5. Inverse (base.py dòng 144 dùng pinv)
+            # Inverse
             inv_cov = torch.linalg.pinv(cov)
             
-            self.class_cov_invs[c_idx] = inv_cov
+            self.class_cov_invs[c] = inv_cov
             
-            del vectors, x_minus_mu, cov, inv_cov
+            # Dọn rác biến tạm
+            del cov, inv_cov, sum_x, scatter_x
             
         self.known_classes = max(self.known_classes, max_cls)
         
-        # Dọn rác CPU
-        del all_feats, all_labels
-        if torch.cuda.is_available(): torch.cuda.empty_cache()
-        print(f"--> [FeCAM] Update done. Total classes: {self.known_classes}")
+        # Xóa bộ stats tích lũy
+        del stats
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        print(f"--> [FeCAM] Update done via Streaming. Total classes: {self.known_classes}")
 
     def _shrink_cov(self, cov):
-        """base.py line 157"""
+        """Logic Shrinkage chuẩn từ base.py"""
         diag = torch.diagonal(cov)
         diag_mean = torch.mean(diag)
         
@@ -186,7 +213,7 @@ class FeCAM_Manager(nn.Module):
         return cov_
 
     def _normalize_cov(self, cov):
-        """base.py line 168"""
+        """Logic Normalize chuẩn từ base.py"""
         sd = torch.sqrt(torch.diagonal(cov)) 
         sd = torch.clamp(sd, min=1e-6)
         normalization_matrix = torch.matmul(sd.unsqueeze(1), sd.unsqueeze(0))
@@ -195,9 +222,8 @@ class FeCAM_Manager(nn.Module):
 
     def compute_scores(self, raw_features, active_classes, boundary_idx=0):
         """
-        Logic _maha_dist và _mahalanobis trong base.py (dòng 139)
+        Inference logic (như base.py)
         """
-        # 1. Transform input feature (nếu có tukey)
         if self.use_tukey:
             vectors = self._tukeys_transform(raw_features)
         else:
@@ -215,14 +241,13 @@ class FeCAM_Manager(nn.Module):
             inv_cov = self.class_cov_invs[c_idx]
             class_mean = self.class_means[c_idx]
             
-            # [TIỂU TIẾT QUAN TRỌNG NHẤT]: base.py dòng 141
-            # L2 Normalize TRƯỚC KHI trừ mean
+            # L2 Normalize TRƯỚC KHI trừ mean (Chuẩn base.py dòng 141)
             vectors_norm = F.normalize(vectors, p=2, dim=-1)
             mean_norm = F.normalize(class_mean, p=2, dim=-1)
             
             x_minus_mu = vectors_norm - mean_norm 
             
-            # Mahalanobis calculation
+            # Mahalanobis
             left_term = torch.matmul(x_minus_mu, inv_cov)
             mahal_diag = torch.sum(left_term * x_minus_mu, dim=1)
             
@@ -232,7 +257,7 @@ class FeCAM_Manager(nn.Module):
         scores_stack = torch.stack(scores, dim=1)
         distances_stack = torch.stack(distances, dim=1)
 
-        # Log bias để debug
+        # Log bias
         if boundary_idx > 0 and boundary_idx < active_classes:
             dist_old = distances_stack[:, :boundary_idx]
             dist_new = distances_stack[:, boundary_idx:]
@@ -240,7 +265,7 @@ class FeCAM_Manager(nn.Module):
             if dist_old.numel() > 0 and dist_new.numel() > 0:
                 min_dist_old = dist_old.min(dim=1)[0].mean().item()
                 min_dist_new = dist_new.min(dim=1)[0].mean().item()
-                print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.4f} | New: {min_dist_new:.4f} | Bias Ratio: {min_dist_old/(min_dist_new+1e-6):.2f}", end="")
+                print(f"\r[FeCAM Check] Avg Min Dist => Old: {min_dist_old:.4f} | New: {min_dist_new:.4f}", end="")
 
         return scores_stack
 
@@ -267,7 +292,6 @@ class MiNbaseNet(nn.Module):
         self.cur_task = -1
         self.known_class = 0
         
-        # Init FeCAM Manager
         self.fecam = FeCAM_Manager(self.feature_dim, self.device, args)
 
     def update_fc(self, nb_classes):
@@ -297,23 +321,17 @@ class MiNbaseNet(nn.Module):
         Combine: Analytic Logits (RLS) + FeCAM Scores (Z-score Norm)
         """
         with torch.no_grad():
-            # RLS Path
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
             logits_rls = self.forward_fc(f_buf) 
-            # Sử dụng self.known_class (số ít) thay vì known_classes
             curr_logits_rls = logits_rls[:, :self.known_class]
 
-            # FeCAM Path (pass active classes count)
-            # Boundary index cho logging
             boundary = 0
             if self.cur_task > 0 and 'increment' in self.args:
                 boundary = self.known_class - self.args['increment']
-                
-            # [FIXED]: self.known_class (singular)
+
             scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
             
-            # Z-Score Normalization & Fusion
             rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
             rls_std = curr_logits_rls.std(dim=1, keepdim=True) + 1e-8
             norm_rls = (curr_logits_rls - rls_mean) / rls_std
@@ -335,7 +353,7 @@ class MiNbaseNet(nn.Module):
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
 
-    # ... Noise & GPM & RLS Fit ...
+    # ... Noise & GPM ...
     def update_noise(self):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].update_noise()
     def after_task_magmax_merge(self):
@@ -360,7 +378,9 @@ class MiNbaseNet(nn.Module):
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         try: from torch.amp import autocast
         except ImportError: from torch.cuda.amp import autocast
+        
         R_gpu = self.R_cpu.to(self.device)
+        
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
