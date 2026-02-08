@@ -292,95 +292,95 @@ class MiNbaseNet(nn.Module):
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
     #softmax summation with temperature scaling
-    # def predict_combined(self, x, beta=0.4):
-    #     """
-    #     [ROBUST FUSION STRATEGY]: Softmax Summation với Temperature Scaling.
-    #     - Giảm độ "hung hăng" của RLS bằng T_rls.
-    #     - Chuẩn hóa khoảng cách của FeCAM bằng T_fecam.
-    #     - Luôn cộng gộp để tận dụng FeCAM như một "lưới an toàn".
-    #     """
-    #     import math # Đảm bảo đã import math
+    def predict_combined(self, x, beta=0.4):
+        """
+        [ROBUST FUSION STRATEGY]: Softmax Summation với Temperature Scaling.
+        - Giảm độ "hung hăng" của RLS bằng T_rls.
+        - Chuẩn hóa khoảng cách của FeCAM bằng T_fecam.
+        - Luôn cộng gộp để tận dụng FeCAM như một "lưới an toàn".
+        """
+        import math # Đảm bảo đã import math
         
-    #     with torch.no_grad():
-    #         # 1. Nhánh RLS (Specialist)
-    #         f_raw = self.backbone(x)
-    #         f_buf = self.buffer(f_raw.to(torch.float32))
-    #         logits_rls = self.forward_fc(f_buf) 
-    #         curr_logits_rls = logits_rls[:, :self.known_class]
-
-    #         # 2. Nhánh FeCAM (Generalist)
-    #         boundary = 0
-    #         if self.cur_task > 0 and 'increment' in self.args:
-    #             boundary = self.known_class - self.args['increment']
-            
-    #         # Scores này là âm khoảng cách (Negative Distance), giá trị thường rất lớn (vd: -200, -500)
-    #         scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
-            
-    #         # --- XỬ LÝ FUSION (Temperature Scaling) ---
-            
-    #         # T_rls = 2.0: Làm mềm phân phối xác suất của RLS. 
-    #         # Giúp RLS bớt "ảo tưởng" (giảm max prob từ 0.99 xuống 0.7-0.8), tạo cơ hội cho FeCAM sửa sai.
-    #         T_rls = 2.0  
-            
-    #         # T_fecam = sqrt(D): Chuẩn hóa thang đo khoảng cách Mahalanobis.
-    #         # Nếu không chia, exp(-200) sẽ về 0 ngay lập tức.
-    #         T_fecam = math.sqrt(self.feature_dim) 
-            
-    #         # Chuyển về xác suất (Probability)
-    #         probs_rls = F.softmax(curr_logits_rls / T_rls, dim=1)
-    #         probs_fecam = F.softmax(scores_fecam / T_fecam, dim=1)
-            
-    #         # Cộng gộp xác suất
-    #         # beta = 0.4 nghĩa là: Kết quả cuối cùng = 60% ý kiến RLS + 40% ý kiến FeCAM.
-    #         final_probs = probs_rls * (1 - beta) + probs_fecam * beta
-            
-    #         # Trả về Logits giả lập (để tương thích với các hàm eval bên ngoài dùng argmax)
-    #         # Cộng 1e-8 để tránh lỗi log(0)
-    #         final_logits = torch.log(final_probs + 1e-8)
-            
-    #         return {'logits': final_logits}
-    
-    
-    # z score
-    def predict_combined(self, x, beta=0.5):
-        """
-        [OPTION: Z-SCORE FUSION]
-        - Chuẩn hóa điểm số về phân phối N(0, 1) trước khi cộng.
-        - Công thức: z = (x - mean) / (std + epsilon)
-        """
         with torch.no_grad():
-            # 1. Lấy Raw Outputs
+            # 1. Nhánh RLS (Specialist)
             f_raw = self.backbone(x)
             f_buf = self.buffer(f_raw.to(torch.float32))
-            
             logits_rls = self.forward_fc(f_buf) 
             curr_logits_rls = logits_rls[:, :self.known_class]
 
+            # 2. Nhánh FeCAM (Generalist)
             boundary = 0
             if self.cur_task > 0 and 'increment' in self.args:
                 boundary = self.known_class - self.args['increment']
             
-            # Scores (Negative Distance)
+            # Scores này là âm khoảng cách (Negative Distance), giá trị thường rất lớn (vd: -200, -500)
             scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
             
-            # --- Z-SCORE NORMALIZATION (Instance-wise) ---
-            # Tính Mean và Std cho từng ảnh (dim=1)
+            # --- XỬ LÝ FUSION (Temperature Scaling) ---
             
-            # 1. Chuẩn hóa RLS
-            rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
-            rls_std = curr_logits_rls.std(dim=1, keepdim=True)
-            norm_rls = (curr_logits_rls - rls_mean) / (rls_std + 1e-8)
+            # T_rls = 2.0: Làm mềm phân phối xác suất của RLS. 
+            # Giúp RLS bớt "ảo tưởng" (giảm max prob từ 0.99 xuống 0.7-0.8), tạo cơ hội cho FeCAM sửa sai.
+            T_rls = 2.0  
             
-            # 2. Chuẩn hóa FeCAM
-            fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
-            fecam_std = scores_fecam.std(dim=1, keepdim=True)
-            norm_fecam = (scores_fecam - fecam_mean) / (fecam_std + 1e-8)
+            # T_fecam = sqrt(D): Chuẩn hóa thang đo khoảng cách Mahalanobis.
+            # Nếu không chia, exp(-200) sẽ về 0 ngay lập tức.
+            T_fecam = math.sqrt(self.feature_dim) 
             
-            # 3. Cộng gộp
-            # Vì đã về cùng scale N(0,1) nên cộng trực tiếp được
-            final_logits = norm_rls * (1 - beta) + norm_fecam * beta
+            # Chuyển về xác suất (Probability)
+            probs_rls = F.softmax(curr_logits_rls / T_rls, dim=1)
+            probs_fecam = F.softmax(scores_fecam / T_fecam, dim=1)
+            
+            # Cộng gộp xác suất
+            # beta = 0.4 nghĩa là: Kết quả cuối cùng = 60% ý kiến RLS + 40% ý kiến FeCAM.
+            final_probs = probs_rls * (1 - beta) + probs_fecam * beta
+            
+            # Trả về Logits giả lập (để tương thích với các hàm eval bên ngoài dùng argmax)
+            # Cộng 1e-8 để tránh lỗi log(0)
+            final_logits = torch.log(final_probs + 1e-8)
             
             return {'logits': final_logits}
+    
+    
+    # z score
+    # def predict_combined(self, x, beta=0.5):
+    #     """
+    #     [OPTION: Z-SCORE FUSION]
+    #     - Chuẩn hóa điểm số về phân phối N(0, 1) trước khi cộng.
+    #     - Công thức: z = (x - mean) / (std + epsilon)
+    #     """
+    #     with torch.no_grad():
+    #         # 1. Lấy Raw Outputs
+    #         f_raw = self.backbone(x)
+    #         f_buf = self.buffer(f_raw.to(torch.float32))
+            
+    #         logits_rls = self.forward_fc(f_buf) 
+    #         curr_logits_rls = logits_rls[:, :self.known_class]
+
+    #         boundary = 0
+    #         if self.cur_task > 0 and 'increment' in self.args:
+    #             boundary = self.known_class - self.args['increment']
+            
+    #         # Scores (Negative Distance)
+    #         scores_fecam = self.fecam.compute_scores(f_raw, self.known_class, boundary_idx=boundary)
+            
+    #         # --- Z-SCORE NORMALIZATION (Instance-wise) ---
+    #         # Tính Mean và Std cho từng ảnh (dim=1)
+            
+    #         # 1. Chuẩn hóa RLS
+    #         rls_mean = curr_logits_rls.mean(dim=1, keepdim=True)
+    #         rls_std = curr_logits_rls.std(dim=1, keepdim=True)
+    #         norm_rls = (curr_logits_rls - rls_mean) / (rls_std + 1e-8)
+            
+    #         # 2. Chuẩn hóa FeCAM
+    #         fecam_mean = scores_fecam.mean(dim=1, keepdim=True)
+    #         fecam_std = scores_fecam.std(dim=1, keepdim=True)
+    #         norm_fecam = (scores_fecam - fecam_mean) / (fecam_std + 1e-8)
+            
+    #         # 3. Cộng gộp
+    #         # Vì đã về cùng scale N(0,1) nên cộng trực tiếp được
+    #         final_logits = norm_rls * (1 - beta) + norm_fecam * beta
+            
+    #         return {'logits': final_logits}
     
     
     def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
