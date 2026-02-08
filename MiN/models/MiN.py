@@ -150,8 +150,8 @@ class MinNet(object):
         
         # [FeCAM]: Update Stats
         # Gọi đúng tên hàm update_fecam (khớp với inc_net)
-        fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam(fecam_loader)
+        # fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
+        # self._network.update_fecam(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()
@@ -215,8 +215,8 @@ class MinNet(object):
         self.re_fit(train_loader, test_loader)
         
         # [FeCAM]: Update Stats
-        fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
-        self._network.update_fecam(fecam_loader)
+        # fecam_loader = DataLoader(train_set, batch_size=256, shuffle=False, num_workers=self.num_workers)
+        # self._network.update_fecam(fecam_loader)
         
         del train_set, test_set
         self._clear_gpu()
@@ -336,9 +336,10 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                # use_fecam=True, beta=0.6 (Z-score combined)
-                outputs = model(inputs, use_fecam=True, beta=0.6)
-                
+                # # use_fecam=True, beta=0.6 (Z-score combined)
+                # outputs = model(inputs, use_fecam=True, beta=0.6)
+                # use_fecam=False
+                outputs = model(inputs, use_fecam=False)
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
