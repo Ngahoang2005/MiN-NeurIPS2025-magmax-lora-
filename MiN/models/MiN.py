@@ -210,7 +210,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        self._network.weight_merging(alpha=0.3)
+        self._network.weight_merging(alpha=0.1)
         
         del train_set, test_set
         self._clear_gpu()
