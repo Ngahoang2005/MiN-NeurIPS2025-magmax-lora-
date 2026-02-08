@@ -127,23 +127,87 @@ class PiNoise(nn.Module):
         # MagMax Merge
         self._perform_magmax_merge()
 
+  
+
     def _perform_magmax_merge(self):
+        """
+        GPM-Aware MagMax Merge:
+        - Chỉ merge MagMax trên phần không gian TRỰC GIAO (Orthogonal) với Core Memory.
+        - Phần nằm trong Core Memory (Protected) sẽ lấy của trạng thái hiện tại (Anchor).
+        """
         if not self.history_mu: return
 
-        def get_merged_state(history_list):
-            keys = history_list[0].keys()
-            merged_dict = {}
-            for key in keys:
-                stacked = torch.stack([d[key] for d in history_list], dim=0)
-                magnitudes = torch.abs(stacked)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_param = torch.gather(stacked, 0, max_indices).squeeze(0)
-                merged_dict[key] = best_param.to(self.w_down.device)
-            return merged_dict
+        # Lấy Basis U từ Buffer [Hidden, Rank]
+        U = self.core_U.detach()
+        has_core = (U.shape[1] > 0)
+        device = self.w_down.device
 
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
+        def decompose_weight(W, U_basis):
+            """
+            Tách W thành 2 phần:
+            1. P (Projected): Phần nằm trong không gian GPM (W @ U @ U.T)
+            2. O (Orthogonal): Phần tự do (W - P)
+            """
+            if not has_core:
+                return torch.zeros_like(W), W # Nếu chưa có GPM, tất cả là tự do
+            
+            # W: [Out, In], U: [In, Rank]
+            # Projection logic: P = (W @ U) @ U.T
+            # W @ U -> [Out, Rank]
+            # (W @ U) @ U.T -> [Out, In]
+            P = (W @ U_basis) @ U_basis.t()
+            O = W - P
+            return P, O
 
+        def get_merged_layer_params(history_list, current_module):
+            # 1. Lấy phần Protected của module hiện tại làm gốc
+            # (Vì GPM đã đảm bảo W hiện tại tôn trọng subspace cũ tốt nhất)
+            curr_W = current_module.weight.data.detach().clone()
+            P_curr, _ = decompose_weight(curr_W, U)
+            
+            # 2. Collect phần Orthogonal từ lịch sử để MagMax
+            orth_weights_stack = []
+            biases_stack = [] # Bias không bị ảnh hưởng bởi input projection
+            
+            for state_dict in history_list:
+                W_hist = state_dict['weight'].to(device)
+                B_hist = state_dict['bias'].to(device)
+                
+                # Tách lấy phần tự do
+                _, O_hist = decompose_weight(W_hist, U)
+                orth_weights_stack.append(O_hist)
+                biases_stack.append(B_hist)
+            
+            # 3. Thực hiện MagMax trên phần Orthogonal
+            stacked_O = torch.stack(orth_weights_stack, dim=0)
+            mag_O = torch.abs(stacked_O)
+            max_idx_O = torch.argmax(mag_O, dim=0, keepdim=True)
+            best_O = torch.gather(stacked_O, 0, max_idx_O).squeeze(0)
+            
+            # 4. Thực hiện MagMax trên Bias (như bình thường)
+            stacked_B = torch.stack(biases_stack, dim=0)
+            mag_B = torch.abs(stacked_B)
+            max_idx_B = torch.argmax(mag_B, dim=0, keepdim=True)
+            best_B = torch.gather(stacked_B, 0, max_idx_B).squeeze(0)
+            
+            # 5. Tái hợp: Final = Protected(Current) + MagMax(Orthogonal_History)
+            final_W = P_curr + best_O
+            
+            return final_W, best_B
+
+        # --- Apply cho Mu ---
+        w_mu, b_mu = get_merged_layer_params(self.history_mu, self.mu)
+        self.mu.weight.data.copy_(w_mu)
+        self.mu.bias.data.copy_(b_mu)
+
+        # --- Apply cho Sigma ---
+        w_sigma, b_sigma = get_merged_layer_params(self.history_sigma, self.sigma)
+        self.sigma.weight.data.copy_(w_sigma)
+        self.sigma.bias.data.copy_(b_sigma)
+        
+        # Xóa history để tiết kiệm RAM sau khi merge (Optional, tùy logic code chính của bạn)
+        # self.history_mu = []
+        # self.history_sigma = []
     def forward(self, hyper_features, new_forward=False):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down 

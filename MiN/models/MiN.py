@@ -125,7 +125,7 @@ class MinNet(object):
         
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
-        
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
         
         # Analytic Learning
@@ -195,7 +195,7 @@ class MinNet(object):
         
         # GPM Collect
         self._network.collect_projections(mode='threshold', val=0.95)
-        
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
 
         del train_set
