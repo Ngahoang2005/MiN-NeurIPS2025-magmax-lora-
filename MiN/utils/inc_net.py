@@ -193,7 +193,8 @@ class MiNbaseNet(nn.Module):
             # [FIX] Không save R về CPU nữa
             
             del term, jitter, K, X, Y
-            if torch.cuda.is_available(): torch.cuda.empty_cache()    def extract_feature(self, x): return self.backbone(x)
+            if torch.cuda.is_available(): torch.cuda.empty_cache()    
+    def extract_feature(self, x): return self.backbone(x)
     
     def forward_normal_fc(self, x, new_forward=False):
         if new_forward: h = self.backbone(x, new_forward=True)
