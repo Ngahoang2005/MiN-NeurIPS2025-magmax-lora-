@@ -1,4 +1,5 @@
 import copy
+import gc
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -74,7 +75,8 @@ class MiNbaseNet(nn.Module):
         self.register_buffer("w_ref", torch.zeros((self.buffer_size, 0), **factory_kwargs))
         # R (Inverse Covariance) - Nằm trên GPU để tránh OOM RAM
         self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
-        
+        self.class_means = [] 
+        self.class_vars = []
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -82,8 +84,8 @@ class MiNbaseNet(nn.Module):
         
     def update_fc(self, nb_classes):
         # Lưu Snapshot
-        if self.cur_task >= 0:
-            self.w_ref = self.weight.clone().detach()
+        # if self.cur_task >= 0:
+        #     self.w_ref = self.weight.clone().detach()
             
         self.cur_task += 1
         self.prev_known_class = self.known_class 
@@ -132,46 +134,173 @@ class MiNbaseNet(nn.Module):
         features = features.to(self.weight.dtype) 
         return features @ self.weight
 
+    # @torch.no_grad()
+    # def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
+    #     try: from torch.amp import autocast
+    #     except ImportError: from torch.cuda.amp import autocast
+        
+    #     with autocast('cuda', enabled=False):
+    #         X = self.backbone(X).float() 
+    #         X = self.buffer(X) 
+    #         X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+            
+    #         # --- Expand Weight ---
+    #         num_targets = Y.shape[1]
+    #         if num_targets > self.weight.shape[1]:
+    #             increment_size = num_targets - self.weight.shape[1]
+    #             tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
+    #             self.weight = torch.cat((self.weight, tail), dim=1)
+                
+    #             if self.w_ref.shape[1] > 0 and self.w_ref.shape[1] < num_targets:
+    #                  ref_tail = torch.zeros((self.w_ref.shape[0], num_targets - self.w_ref.shape[1]), device=self.weight.device)
+    #                  self.w_ref = torch.cat((self.w_ref, ref_tail), dim=1)
+
+    #         elif num_targets < self.weight.shape[1]:
+    #             increment_size = self.weight.shape[1] - num_targets
+    #             tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
+    #             Y = torch.cat((Y, tail), dim=1)
+            
+    #         # --- RLS Update (Standard - KHÔNG CÓ KÉO ở đây) ---
+    #         # Xử lý R trực tiếp trên GPU
+    #         term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
+    #         jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+    #         try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
+    #         except: K = self.R @ X.T @ torch.inverse(term + jitter)
+            
+    #         self.R -= K @ X @ self.R
+    #         self.weight += K @ (Y - X @ self.weight)
+            
+    #         # Đã loại bỏ hoàn toàn việc chuyển R về CPU -> Hết lỗi OOM
+    #         del term, jitter, K, X, Y
+    #         # if torch.cuda.is_available(): torch.cuda.empty_cache() # Có thể comment lại nếu muốn nhanh hơn
+ 
+
+    #fit sinh mẫu giả
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        try: from torch.amp import autocast
-        except ImportError: from torch.cuda.amp import autocast
+        """
+        Hàm fit cải tiến:
+        1. Cập nhật thống kê Mean/Var cho class mới.
+        2. Sinh dữ liệu giả cho class cũ (Pseudo-Replay).
+        3. Tính RLS trên CPU theo từng Chunk nhỏ (tránh tràn RAM).
+        """
         
-        with autocast('cuda', enabled=False):
-            X = self.backbone(X).float() 
-            X = self.buffer(X) 
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-            
-            # --- Expand Weight ---
-            num_targets = Y.shape[1]
-            if num_targets > self.weight.shape[1]:
-                increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
-                self.weight = torch.cat((self.weight, tail), dim=1)
+        # 1. Chuyển dữ liệu thật về CPU ngay lập tức
+        X_cpu_all = X.cpu().float()
+        Y_cpu_all = Y.cpu().float()
+        
+        # Xóa tham chiếu GPU
+        del X, Y
+        
+        # --- BƯỚC 1: CẬP NHẬT THỐNG KÊ (Class Mới) ---
+        # Lưu ý: Code này giả định fit được gọi với batch đủ lớn hoặc re-fit toàn bộ data
+        # để thống kê chính xác.
+        if self.training:
+            unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
+            for c in unique_classes:
+                c = c.item()
+                # Mở rộng list nếu class mới xuất hiện
+                if c >= len(self.class_means):
+                    while len(self.class_means) <= c:
+                        self.class_means.append(None)
+                        self.class_vars.append(None)
                 
-                if self.w_ref.shape[1] > 0 and self.w_ref.shape[1] < num_targets:
-                     ref_tail = torch.zeros((self.w_ref.shape[0], num_targets - self.w_ref.shape[1]), device=self.weight.device)
-                     self.w_ref = torch.cat((self.w_ref, ref_tail), dim=1)
+                # Lấy feature của class c trong batch này
+                mask = (torch.argmax(Y_cpu_all, dim=1) == c)
+                features_c = X_cpu_all[mask]
+                
+                # Tính Mean/Var và lưu lại (CPU)
+                # Dùng detach để chắc chắn không dính graph
+                mean_c = features_c.mean(dim=0).detach()
+                var_c = (features_c.var(dim=0, unbiased=False) + 1e-5).detach()
+                
+                self.class_means[c] = mean_c
+                self.class_vars[c] = var_c
 
-            elif num_targets < self.weight.shape[1]:
-                increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
-                Y = torch.cat((Y, tail), dim=1)
+        # --- BƯỚC 2: SINH DATA GIẢ (Cho Class Cũ) ---
+        if self.prev_known_class > 0:
+            X_pseudo_list = []
+            Y_pseudo_list = []
             
-            # --- RLS Update (Standard - KHÔNG CÓ KÉO ở đây) ---
-            # Xử lý R trực tiếp trên GPU
-            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
-            except: K = self.R @ X.T @ torch.inverse(term + jitter)
+            # Số lượng mẫu giả mỗi class cũ
+            # Để cân bằng, có thể lấy bằng số lượng trung bình class mới trong batch
+            # Hoặc fix cứng con số này (ví dụ 20-50 mẫu/class)
+            samples_per_class = 20 
             
-            self.R -= K @ X @ self.R
-            self.weight += K @ (Y - X @ self.weight)
+            for c in range(self.prev_known_class):
+                if c < len(self.class_means) and self.class_means[c] is not None:
+                    mean = self.class_means[c] # Đã ở CPU
+                    std = torch.sqrt(self.class_vars[c]) # Đã ở CPU
+                    
+                    # Sinh nhiễu Gaussian
+                    noise = torch.randn(samples_per_class, self.buffer_size)
+                    X_fake = noise * std + mean
+                    
+                    # Tạo nhãn one-hot
+                    Y_fake = torch.zeros(samples_per_class, Y_cpu_all.shape[1])
+                    Y_fake[:, c] = 1.0
+                    
+                    X_pseudo_list.append(X_fake)
+                    Y_pseudo_list.append(Y_fake)
             
-            # Đã loại bỏ hoàn toàn việc chuyển R về CPU -> Hết lỗi OOM
-            del term, jitter, K, X, Y
-            # if torch.cuda.is_available(): torch.cuda.empty_cache() # Có thể comment lại nếu muốn nhanh hơn
+            if len(X_pseudo_list) > 0:
+                X_pseudo = torch.cat(X_pseudo_list, dim=0)
+                Y_pseudo = torch.cat(Y_pseudo_list, dim=0)
+                
+                # Gộp Thật + Giả
+                X_cpu_all = torch.cat((X_cpu_all, X_pseudo), dim=0)
+                Y_cpu_all = torch.cat((Y_cpu_all, Y_pseudo), dim=0)
 
+        # --- BƯỚC 3: RLS CHUNKING (Chống Tràn RAM) ---
+        BATCH_CHUNK = 256 # Kích thước an toàn cho RAM
+        total_samples = X_cpu_all.shape[0]
+        
+        # Đảm bảo R ở CPU
+        if self.R.device.type != 'cpu': self.R = self.R.cpu()
+        
+        # Kéo Weight về CPU để tính toán
+        weight_cpu = self.weight.cpu()
+        
+        # Expand Weight nếu số class tăng lên
+        num_targets = Y_cpu_all.shape[1]
+        if num_targets > weight_cpu.shape[1]:
+            tail = torch.zeros((weight_cpu.shape[0], num_targets - weight_cpu.shape[1]))
+            weight_cpu = torch.cat((weight_cpu, tail), dim=1)
+        elif num_targets < weight_cpu.shape[1]:
+            tail = torch.zeros((Y_cpu_all.shape[0], weight_cpu.shape[1] - num_targets))
+            Y_cpu_all = torch.cat((Y_cpu_all, tail), dim=1)
+
+        # Vòng lặp tính toán từng miếng nhỏ
+        for start_idx in range(0, total_samples, BATCH_CHUNK):
+            end_idx = min(start_idx + BATCH_CHUNK, total_samples)
+            
+            X_batch = X_cpu_all[start_idx:end_idx]
+            Y_batch = Y_cpu_all[start_idx:end_idx]
+            
+            # --- RLS Math Core ---
+            # Chỉ tốn RAM cho ma trận [256, 256] và [256, 16384]
+            term = torch.eye(X_batch.shape[0]) + X_batch @ self.R @ X_batch.T
+            jitter = 1e-6 * torch.eye(term.shape[0])
+            
+            try: 
+                K = torch.linalg.solve(term + jitter, X_batch @ self.R)
+                K = K.T
+            except: 
+                K = self.R @ X_batch.T @ torch.inverse(term + jitter)
+            
+            # Update
+            self.R -= K @ X_batch @ self.R
+            weight_cpu += K @ (Y_batch - X_batch @ weight_cpu)
+            
+            # Dọn rác ngay lập tức
+            del term, jitter, K, X_batch, Y_batch
+
+        # Update xong, đẩy Weight mới lên GPU
+        self.weight = weight_cpu.to(self.device)
+        
+        # Xóa biến to
+        del X_cpu_all, Y_cpu_all, weight_cpu
+        gc.collect() # Force dọn RAM
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
