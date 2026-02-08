@@ -175,10 +175,12 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
+                
+        self._network.update_fc(self.increment)
 
         self.fit_fc(train_loader, test_loader)
 
-        self._network.update_fc(self.increment)
+        
 
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
@@ -208,8 +210,7 @@ class MinNet(object):
                 param.requires_grad = False
 
         self.re_fit(train_loader, test_loader)
-        
-       
+        self._network.weight_merging(alpha=0.2)
         
         del train_set, test_set
         self._clear_gpu()

@@ -1,10 +1,6 @@
 import copy
-import logging
-import math
-import numpy as np
 import torch
-import gc
-from torch import nn, Tensor
+from torch import nn
 from torch.nn import functional as F
 from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
@@ -72,27 +68,25 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         
-        # W hiện tại (sẽ liên tục được cập nhật bởi RLS)
+        # W hiện tại
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
-        
-        # [THÊM MỚI] W_ref: Snapshot để làm điểm neo cho L2-SP
+        # W_ref (Snapshot)
         self.register_buffer("w_ref", torch.zeros((self.buffer_size, 0), **factory_kwargs))
-        
-        # Đăng ký R là Buffer để nó nằm luôn trên GPU, không chuyển qua lại CPU nữa.
-        # Kích thước ~1GB (nếu buffer 16k), GPU chịu tốt.
+        # R (Inverse Covariance) - Nằm trên GPU để tránh OOM RAM
         self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
+        
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
-        self.prev_known_class = 0 # Để biết đâu là cột cũ
+        self.prev_known_class = 0 
         
     def update_fc(self, nb_classes):
-        # [THÊM MỚI] Lưu Snapshot trước khi sang task mới
+        # Lưu Snapshot
         if self.cur_task >= 0:
             self.w_ref = self.weight.clone().detach()
             
         self.cur_task += 1
-        self.prev_known_class = self.known_class # Chốt số lượng class cũ
+        self.prev_known_class = self.known_class 
         self.known_class += nb_classes
         
         if self.cur_task > 0:
@@ -114,8 +108,6 @@ class MiNbaseNet(nn.Module):
     def forward(self, x, new_forward=False):
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
         else: hyper_features = self.backbone(x)
-        
-        # Không Normalize X (để giữ độ lớn cho RLS)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
@@ -139,33 +131,15 @@ class MiNbaseNet(nn.Module):
     def forward_fc(self, features):
         features = features.to(self.weight.dtype) 
         return features @ self.weight
-    # def forward_fc(self, features):
-    #     features = features.to(self.weight.dtype)
-        
-    #     # --- [FIX ACC TỤT] Cosine Normalization ---
-    #     # 1. Chuẩn hóa Input Feature (về độ dài 1)
-    #     features_norm = F.normalize(features, p=2, dim=1)
-        
-    #     # 2. Chuẩn hóa Weight (về độ dài 1)
-    #     # Weight shape: [In_dim, Out_dim] -> Normalize theo dim 0 (cột)
-    #     weight_norm = F.normalize(self.weight, p=2, dim=0)
-        
-    #     # 3. Tính Logits (Cosine Similarity)
-    #     # Nhân thêm một scalar (tau) để logits không quá bé (thường chọn 10-30)
-    #     tau = 20.0 
-    #     return tau * (features_norm @ weight_norm)
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         try: from torch.amp import autocast
         except ImportError: from torch.cuda.amp import autocast
         
-        # [FIX] Không load R từ CPU nữa, dùng trực tiếp self.R trên GPU
-        
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
             X = self.buffer(X) 
-            
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
             
             # --- Expand Weight ---
@@ -175,52 +149,54 @@ class MiNbaseNet(nn.Module):
                 tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
                 
-                # Expand w_ref nếu cần
                 if self.w_ref.shape[1] > 0 and self.w_ref.shape[1] < num_targets:
                      ref_tail = torch.zeros((self.w_ref.shape[0], num_targets - self.w_ref.shape[1]), device=self.weight.device)
                      self.w_ref = torch.cat((self.w_ref, ref_tail), dim=1)
 
             elif num_targets < self.weight.shape[1]:
-                # Pad Y với số 0
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
             
-            # --- RLS Update ---
-            # Dùng self.R trực tiếp
+            # --- RLS Update (Standard - KHÔNG CÓ KÉO ở đây) ---
+            # Xử lý R trực tiếp trên GPU
             term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
             except: K = self.R @ X.T @ torch.inverse(term + jitter)
             
-            # Update in-place
             self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
             
-            # --- Soft L2-SP ---
-            if self.cur_task > 0 and self.w_ref.shape[1] > 0:
-                beta = 0.001 # Giữ mức thấp an toàn
-                old_cols = self.prev_known_class
-                current_old_W = self.weight[:, :old_cols]
-                ref_old_W = self.w_ref[:, :old_cols].to(self.weight.device)
-                self.weight[:, :old_cols] = (1 - beta) * current_old_W + beta * ref_old_W
-
-            # [FIX] Không save R về CPU nữa
-            
+            # Đã loại bỏ hoàn toàn việc chuyển R về CPU -> Hết lỗi OOM
             del term, jitter, K, X, Y
-            if torch.cuda.is_available(): torch.cuda.empty_cache()    
+            # if torch.cuda.is_available(): torch.cuda.empty_cache() # Có thể comment lại nếu muốn nhanh hơn
+
+    # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
+    def weight_merging(self, alpha=0.2):
+        if self.cur_task > 0 and self.w_ref.shape[1] > 0:
+            print(f"--> [Weight Merging] Blending with alpha={alpha}...")
+            old_cols = self.prev_known_class
+            
+            W_new = self.weight[:, :old_cols]
+            W_ref = self.w_ref[:, :old_cols].to(self.weight.device)
+            
+            # W_final = (1-alpha) * W_new + alpha * W_ref
+            self.weight[:, :old_cols] = (1 - alpha) * W_new + alpha * W_ref
+
     def extract_feature(self, x): return self.backbone(x)
     
-    def forward_normal_fc(self, x, new_forward=False):
-        if new_forward: h = self.backbone(x, new_forward=True)
-        else: h = self.backbone(x)
-        h = self.buffer(h.to(self.buffer.weight.dtype))
-        h = h.to(self.normal_fc.weight.dtype)
-        return {"logits": self.normal_fc(h)['logits']}
-
     def collect_projections(self, mode='threshold', val=0.95):
         print(f"--> [IncNet] GPM Collect...")
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].compute_projection_matrix(mode, val)
 
     def apply_gpm_to_grads(self, scale=1.0):
         for j in range(self.backbone.layer_num): self.backbone.noise_maker[j].apply_gradient_projection(scale)
+
+
+    def forward_normal_fc(self, x, new_forward=False):
+        if new_forward: h = self.backbone(x, new_forward=True)
+        else: h = self.backbone(x)
+        h = self.buffer(h.to(self.buffer.weight.dtype))
+        h = h.to(self.normal_fc.weight.dtype)
+        return {"logits": self.normal_fc(h)['logits']}
