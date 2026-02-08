@@ -124,7 +124,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.99)
+        self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
         
@@ -194,7 +194,7 @@ class MinNet(object):
         self.run(train_loader)
         
         # GPM Collect
-        self._network.collect_projections(mode='threshold', val=0.99)
+        self._network.collect_projections(mode='threshold', val=0.95)
         
         self._clear_gpu()
 

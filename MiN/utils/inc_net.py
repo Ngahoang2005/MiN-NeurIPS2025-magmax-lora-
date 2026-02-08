@@ -269,6 +269,7 @@ class MiNbaseNet(nn.Module):
         
         self.fecam = FeCAM_Manager(self.feature_dim, self.device, args)
 
+    
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
@@ -291,7 +292,7 @@ class MiNbaseNet(nn.Module):
     def update_fecam(self, train_loader):
         self.fecam.update_stats(self, train_loader)
 
-    def predict_combined(self, x, beta=0.5):
+    def predict_combined(self, x, beta=1.0):
         """
         Combine: Analytic Logits (RLS) + FeCAM Scores (Probability Fusion)
         """
@@ -327,7 +328,7 @@ class MiNbaseNet(nn.Module):
             
             return {'logits': final_logits}
 
-    def forward(self, x, new_forward=False, use_fecam=False, beta=0.0):
+    def forward(self, x, new_forward=False, use_fecam=False, beta=1.0):
         if use_fecam and not self.training:
             return self.predict_combined(x, beta=beta)
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
