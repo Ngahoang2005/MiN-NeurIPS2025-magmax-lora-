@@ -58,6 +58,7 @@ class RandomBuffer(torch.nn.Linear):
         X = X.to(self.weight.dtype)
         return F.relu(X @ self.W)
 
+
 class MiNbaseNet(nn.Module):
     def __init__(self, args: dict):
         super(MiNbaseNet, self).__init__()
@@ -72,17 +73,29 @@ class MiNbaseNet(nn.Module):
         self.buffer = RandomBuffer(self.feature_dim, self.buffer_size, self.device)
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
         
+        # W hiện tại (sẽ liên tục được cập nhật bởi RLS)
         self.register_buffer("weight", torch.zeros((self.buffer_size, 0), **factory_kwargs))
-        # RLS Memory Safe
+        
+        # W_ref: Snapshot của W tại thời điểm kết thúc task trước
+        # Chỉ dùng cho các class CŨ.
+        self.register_buffer("w_ref", torch.zeros((self.buffer_size, 0), **factory_kwargs))
+        
         self.R_cpu = torch.eye(self.buffer_size, dtype=torch.float32) / self.gamma
         
         self.normal_fc = None
         self.cur_task = -1
-        self.known_class = 0
+        self.known_class = 0 # Số lượng class ĐÃ biết (của các task trước)
         
     def update_fc(self, nb_classes):
+        # Trước khi update task mới, lưu snapshot W hiện tại làm Reference
+        if self.cur_task >= 0:
+            self.w_ref = self.weight.clone().detach()
+            
         self.cur_task += 1
+        # Lưu lại mốc known_class để biết đâu là cột cũ, đâu là cột mới
+        self.prev_known_class = self.known_class 
         self.known_class += nb_classes
+        
         if self.cur_task > 0:
             new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
@@ -99,23 +112,13 @@ class MiNbaseNet(nn.Module):
             if new_fc.bias is not None: nn.init.constant_(new_fc.bias, 0.)
         self.normal_fc = new_fc
 
-    
     def forward(self, x, new_forward=False):
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
         else: hyper_features = self.backbone(x)
         
-        # [CONTRIBUTION]: Feature Normalization
-        hyper_features = F.normalize(hyper_features, p=2, dim=1)
-        
+        # Không Normalize X (theo yêu cầu của bạn để giữ accuracy)
         hyper_features = hyper_features.to(self.weight.dtype)
-        # Đi qua Buffer (16k chiều)
-        buffered_features = self.buffer(hyper_features)
-        
-        # [OPTIONAL]: Normalize Buffer Output
-        # (Giúp RLS ổn định hơn nữa, nếu muốn thử có thể uncomment)
-        # buffered_features = F.normalize(buffered_features, p=2, dim=1)
-        
-        logits = self.forward_fc(buffered_features)
+        logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
 
     def update_noise(self):
@@ -135,26 +138,9 @@ class MiNbaseNet(nn.Module):
             for p in self.backbone.norm.parameters(): p.requires_grad = True
 
     def forward_fc(self, features):
-        """
-        [CONTRIBUTION]: Dual-Spherical Prediction (Cosine Classifier)
-        - Feature đã được normalize (hoặc qua buffer).
-        - Weight được normalize tại đây.
-        - Kết quả = eta * Cosine(Feature, Weight)
-        """
         features = features.to(self.weight.dtype) 
-        
-        # 1. Normalize Weight (theo từng class/cột)
-        W = self.weight
-        W_norm = F.normalize(W, p=2, dim=0) 
-        
-        # 2. Cosine Logits
-        logits = features @ W_norm
-        
-        # 3. Scaling (Eta)
-        # eta = 20.0 là giá trị thực nghiệm tốt cho bài toán CIL
-        eta = 20.0
-        
-        return logits * eta
+        return features @ self.weight
+
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         try: from torch.amp import autocast
@@ -162,33 +148,62 @@ class MiNbaseNet(nn.Module):
         R_gpu = self.R_cpu.to(self.device)
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
-            X = F.normalize(X, p=2, dim=1)
+            # Không Normalize X
             X = self.buffer(X) 
+            
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+            
+            # --- 1. Mở rộng Weight nếu cần ---
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.weight.shape[1]:
-                increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
-                Y = torch.cat((Y, tail), dim=1)
+            
+            # --- 2. Standard RLS Update (Global) ---
+            # Bước này tối ưu hóa Loss ||Y - XW||^2 cho TOÀN BỘ ma trận
             term = torch.eye(X.shape[0], device=X.device) + X @ R_gpu @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             try: K = torch.linalg.solve(term + jitter, X @ R_gpu); K = K.T
             except: K = R_gpu @ X.T @ torch.inverse(term + jitter)
+            
             R_gpu -= K @ X @ R_gpu
             self.weight += K @ (Y - X @ self.weight)
+            
+            # --- 3. [CORRECTED] Masked L2-SP Regularization ---
+            # Chỉ áp dụng cho các cột class CŨ (0 -> prev_known_class)
+            # Các cột mới (prev_known_class -> end) được giữ nguyên (Free Plasticity)
+            
+            if self.cur_task > 0 and self.w_ref.shape[1] > 0:
+                # Hệ số beta: Cần nhỏ vì R có thể có giá trị lớn
+                beta = 0.01 
+                
+                # Xác định vùng cột cũ
+                old_cols = self.prev_known_class
+                
+                # Lấy W hiện tại (đã bị RLS update lệch đi) và W tham chiếu
+                W_curr_old = self.weight[:, :old_cols]
+                W_ref_old = self.w_ref[:, :old_cols].to(self.weight.device)
+                
+                # Tính độ lệch (Drift)
+                diff = W_curr_old - W_ref_old
+                
+                # Dùng R để tính hướng kéo tối ưu (Natural Gradient Direction)
+                # Công thức: adjustment = R * (W - W_ref)
+                # Ý nghĩa: Chỗ nào R lớn (không chắc chắn) thì kéo về mạnh hơn.
+                adjustment = R_gpu @ diff
+                
+                # Cập nhật lại Weight
+                self.weight[:, :old_cols] = W_curr_old - beta * adjustment
             self.R_cpu = R_gpu.cpu()
             del term, jitter, K, X, Y, R_gpu
             if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-    def extract_feature(self, x): return F.normalize(self.backbone(x), p=2, dim=1)
+    def extract_feature(self, x): return self.backbone(x)
+    
     def forward_normal_fc(self, x, new_forward=False):
         if new_forward: h = self.backbone(x, new_forward=True)
         else: h = self.backbone(x)
-        h = F.normalize(h, p=2, dim=1)
         h = self.buffer(h.to(self.buffer.weight.dtype))
         h = h.to(self.normal_fc.weight.dtype)
         return {"logits": self.normal_fc(h)['logits']}
