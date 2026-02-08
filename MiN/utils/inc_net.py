@@ -225,7 +225,7 @@ class MiNbaseNet(nn.Module):
             # Số lượng mẫu giả mỗi class cũ
             # Để cân bằng, có thể lấy bằng số lượng trung bình class mới trong batch
             # Hoặc fix cứng con số này (ví dụ 20-50 mẫu/class)
-            samples_per_class = 20 
+            samples_per_class = 6 
             
             for c in range(self.prev_known_class):
                 if c < len(self.class_means) and self.class_means[c] is not None:
