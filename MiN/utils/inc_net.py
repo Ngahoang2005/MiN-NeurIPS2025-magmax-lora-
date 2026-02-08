@@ -199,7 +199,7 @@ class MiNbaseNet(nn.Module):
             
             # --- Soft L2-SP ---
             if self.cur_task > 0 and self.w_ref.shape[1] > 0:
-                beta = 0.005 # Giữ mức thấp an toàn
+                beta = 0.001 # Giữ mức thấp an toàn
                 old_cols = self.prev_known_class
                 current_old_W = self.weight[:, :old_cols]
                 ref_old_W = self.w_ref[:, :old_cols].to(self.weight.device)
