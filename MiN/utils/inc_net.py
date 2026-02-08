@@ -176,7 +176,7 @@ class MiNbaseNet(nn.Module):
             # --- 3. [L2-SP] Soft Regularization (Stability - Giữ cái cũ) ---
             # Chỉ áp dụng khi đã có task cũ (cur_task > 0)
             if self.cur_task > 0 and self.w_ref.shape[1] > 0:
-                beta = 0.01 # Hệ số kéo về (Regularization Strength)
+                beta = 0.002# Hệ số kéo về (Regularization Strength)
                 
                 # Xác định vùng cột cũ
                 old_cols = self.prev_known_class
