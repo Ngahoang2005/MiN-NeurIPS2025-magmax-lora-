@@ -139,6 +139,21 @@ class MiNbaseNet(nn.Module):
     def forward_fc(self, features):
         features = features.to(self.weight.dtype) 
         return features @ self.weight
+    # def forward_fc(self, features):
+    #     features = features.to(self.weight.dtype)
+        
+    #     # --- [FIX ACC TỤT] Cosine Normalization ---
+    #     # 1. Chuẩn hóa Input Feature (về độ dài 1)
+    #     features_norm = F.normalize(features, p=2, dim=1)
+        
+    #     # 2. Chuẩn hóa Weight (về độ dài 1)
+    #     # Weight shape: [In_dim, Out_dim] -> Normalize theo dim 0 (cột)
+    #     weight_norm = F.normalize(self.weight, p=2, dim=0)
+        
+    #     # 3. Tính Logits (Cosine Similarity)
+    #     # Nhân thêm một scalar (tau) để logits không quá bé (thường chọn 10-30)
+    #     tau = 20.0 
+    #     return tau * (features_norm @ weight_norm)
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
@@ -184,7 +199,7 @@ class MiNbaseNet(nn.Module):
             
             # --- Soft L2-SP ---
             if self.cur_task > 0 and self.w_ref.shape[1] > 0:
-                beta = 0.002 # Giữ mức thấp an toàn
+                beta = 0.005 # Giữ mức thấp an toàn
                 old_cols = self.prev_known_class
                 current_old_W = self.weight[:, :old_cols]
                 ref_old_W = self.w_ref[:, :old_cols].to(self.weight.device)
