@@ -78,8 +78,9 @@ class MiNbaseNet(nn.Module):
         # [THÊM MỚI] W_ref: Snapshot để làm điểm neo cho L2-SP
         self.register_buffer("w_ref", torch.zeros((self.buffer_size, 0), **factory_kwargs))
         
-        self.R_cpu = torch.eye(self.buffer_size, dtype=torch.float32) / self.gamma
-        
+        # Đăng ký R là Buffer để nó nằm luôn trên GPU, không chuyển qua lại CPU nữa.
+        # Kích thước ~1GB (nếu buffer 16k), GPU chịu tốt.
+        self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -144,57 +145,55 @@ class MiNbaseNet(nn.Module):
         try: from torch.amp import autocast
         except ImportError: from torch.cuda.amp import autocast
         
-        R_gpu = self.R_cpu.to(self.device)
+        # [FIX] Không load R từ CPU nữa, dùng trực tiếp self.R trên GPU
         
         with autocast('cuda', enabled=False):
             X = self.backbone(X).float() 
-            X = self.buffer(X) # Projection
+            X = self.buffer(X) 
             
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
             
-            # --- 1. Mở rộng Weight (Expand) ---
+            # --- Expand Weight ---
             num_targets = Y.shape[1]
             if num_targets > self.weight.shape[1]:
                 increment_size = num_targets - self.weight.shape[1]
                 tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
+                
+                # Expand w_ref nếu cần
+                if self.w_ref.shape[1] > 0 and self.w_ref.shape[1] < num_targets:
+                     ref_tail = torch.zeros((self.w_ref.shape[0], num_targets - self.w_ref.shape[1]), device=self.weight.device)
+                     self.w_ref = torch.cat((self.w_ref, ref_tail), dim=1)
+
             elif num_targets < self.weight.shape[1]:
+                # Pad Y với số 0
                 increment_size = self.weight.shape[1] - num_targets
                 tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
                 Y = torch.cat((Y, tail), dim=1)
             
-            # --- 2. RLS Update (Standard) ---
-            # Cập nhật toàn bộ ma trận (Plasticity - Học cái mới)
-            term = torch.eye(X.shape[0], device=X.device) + X @ R_gpu @ X.T
+            # --- RLS Update ---
+            # Dùng self.R trực tiếp
+            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            try: K = torch.linalg.solve(term + jitter, X @ R_gpu); K = K.T
-            except: K = R_gpu @ X.T @ torch.inverse(term + jitter)
+            try: K = torch.linalg.solve(term + jitter, X @ self.R); K = K.T
+            except: K = self.R @ X.T @ torch.inverse(term + jitter)
             
-            R_gpu -= K @ X @ R_gpu
+            # Update in-place
+            self.R -= K @ X @ self.R
             self.weight += K @ (Y - X @ self.weight)
             
-            # --- 3. [L2-SP] Soft Regularization (Stability - Giữ cái cũ) ---
-            # Chỉ áp dụng khi đã có task cũ (cur_task > 0)
+            # --- Soft L2-SP ---
             if self.cur_task > 0 and self.w_ref.shape[1] > 0:
-                beta = 0.002# Hệ số kéo về (Regularization Strength)
-                
-                # Xác định vùng cột cũ
+                beta = 0.001 # Giữ mức thấp an toàn
                 old_cols = self.prev_known_class
-                
-                # Lấy W hiện tại (vừa học xong) và W tham chiếu (snapshot)
                 current_old_W = self.weight[:, :old_cols]
                 ref_old_W = self.w_ref[:, :old_cols].to(self.weight.device)
-                
-                # Công thức Soft L2-SP: W = (1-beta)*W_new + beta*W_ref
-                # Kéo nhẹ W về phía Ref để tránh Drifting quá xa
                 self.weight[:, :old_cols] = (1 - beta) * current_old_W + beta * ref_old_W
 
-            self.R_cpu = R_gpu.cpu()
+            # [FIX] Không save R về CPU nữa
             
-            del term, jitter, K, X, Y, R_gpu
-            if torch.cuda.is_available(): torch.cuda.empty_cache()
-
-    def extract_feature(self, x): return self.backbone(x)
+            del term, jitter, K, X, Y
+            if torch.cuda.is_available(): torch.cuda.empty_cache()    def extract_feature(self, x): return self.backbone(x)
     
     def forward_normal_fc(self, x, new_forward=False):
         if new_forward: h = self.backbone(x, new_forward=True)
