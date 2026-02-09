@@ -257,7 +257,7 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        WARMUP_EPOCHS = 5
+        WARMUP_EPOCHS = 3
 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
