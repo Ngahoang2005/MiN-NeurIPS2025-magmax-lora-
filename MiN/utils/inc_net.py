@@ -273,61 +273,154 @@ class MiNbaseNet(nn.Module):
 
     #fit sinh mẫu giả
     @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        self.backbone.eval()
-        # 1. Trích xuất đặc trưng THÔ
-        f_real = self.backbone(X.to(self.device)).float().cpu()
-        Y_cpu = Y.cpu().float()
+    def generate_pseudo_dataset_hybrid(self, train_loader):
+        """
+        Sinh mẫu giả nhìn toàn cục (Global View).
+        Chiến thuật: Hybrid (FeTrIL nếu có họ hàng, Gaussian Fallback nếu không).
+        """
+        print("--> [FeTrIL] Generating Pseudo Data (Global Hybrid Mode)...")
+        self.eval()
         
-        # Lấy các lớp có trong batch hiện tại (thường là các lớp của task mới)
-        unique_new = torch.argmax(Y_cpu, dim=1).unique().tolist()
+        # 1. Thu thập toàn bộ đặc trưng THẬT của Task mới
+        all_features = []
+        all_labels = []
+        
+        for inputs, labels in train_loader:
+            inputs = inputs.to(self.device)
+            # Trích xuất đặc trưng thô từ Backbone
+            features = self.backbone(inputs).float() 
+            all_features.append(features)
+            all_labels.append(labels.to(self.device))
+            
+        all_features = torch.cat(all_features)
+        all_labels = torch.cat(all_labels)
 
-        X_pseudo_list = []
-        Y_pseudo_list = []
+        # 2. Cập nhật Mean cho các Class MỚI (Quan trọng!)
+        unique_new = torch.unique(all_labels).tolist()
+        self.new_class_means = [] # Reset temporary list
+        new_means_map = {}
         
-        # 2. Sinh mẫu giả (Chỉ tiêu thụ Centroid, không tính toán)
+        for c in unique_new:
+            mask = (all_labels == c)
+            mean_c = all_features[mask].mean(dim=0)
+            self.class_means[c] = mean_c # Lưu vào bộ nhớ toàn cục
+            new_means_map[c] = mean_c
+        
+        # Tạo ma trận Mean mới để tính cosine nhanh
+        # Chú ý: Cần sort unique_new để index khớp với thứ tự trong matrix
+        unique_new.sort()
+        new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
+        
+        # 3. Tính toán thống kê cho Fallback (Gaussian)
+        task_std = torch.std(all_features, dim=0).mean().item()
+        
+        pseudo_features = []
+        pseudo_labels = []
+        
+        # Chỉ sinh mẫu nếu đã có task cũ
         if self.prev_known_class > 0:
-            # Lấy danh sách means của các lớp mới để làm seed
-            # Đã đảm bảo self.class_means được lấp đầy từ Min.py
-            new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
-            samples_per_old = max(1, min(int(f_real.shape[0] / self.prev_known_class), 500))
-
+            # Ngưỡng lọc (0.1 như đã bàn)
+            THRESHOLD = 0.1
+            samples_per_old = 200 # Số lượng mẫu cố định (tăng lên vì làm offline)
+            
+            # Duyệt qua từng class CŨ
             for c_old in range(self.prev_known_class):
-                # mu_old PHẢI TỒN TẠI từ các task trước
-                mu_old = self.class_means[c_old]
+                mu_old = self.class_means[c_old].to(self.device)
                 
-                # Chọn Seed (Cosine Similarity)
-                sims = torch.matmul(F.normalize(new_means_mat, p=2, dim=1), 
-                                    F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T)
-                c_seed = unique_new[torch.argmax(sims).item()]
+                # Tính Sim với tất cả class mới
+                sims = torch.matmul(
+                    F.normalize(new_means_mat, p=2, dim=1), 
+                    F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T
+                )
+                best_sim_val, best_idx = torch.max(sims, dim=0)
+                best_sim_val = best_sim_val.item()
+                best_class_new = unique_new[best_idx.item()]
                 
-                mu_seed = self.class_means[c_seed]
-                mask_seed = (torch.argmax(Y_cpu, dim=1) == c_seed)
-                seed_feats = f_real[mask_seed]
+                f_fake = None
                 
-                if seed_feats.shape[0] > 0:
-                    idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
-                    # Tịnh tiến Euclid: $X_{fake} = (X_{seed} - \mu_{seed}) + \mu_{old}$
-                    f_fake = (seed_feats[idx] - mu_seed) + mu_old
-                    X_pseudo_list.append(f_fake)
-                    Y_pseudo_list.append(torch.zeros(samples_per_old, Y_cpu.shape[1]).index_fill_(1, torch.tensor(c_old), 1.0))
+                # --- LOGIC HYBRID ---
+                if best_sim_val > THRESHOLD:
+                    # [FeTrIL XỊN]: Có họ hàng
+                    mask_seed = (all_labels == best_class_new)
+                    seed_feats = all_features[mask_seed]
+                    mu_seed = self.class_means[best_class_new].to(self.device)
+                    
+                    if seed_feats.shape[0] > 0:
+                        idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
+                        f_fake = (seed_feats[idx] - mu_seed) + mu_old
+                
+                if f_fake is None:
+                    # [FALLBACK]: Gaussian Noise (Shrinkage)
+                    shrinkage = 0.6
+                    safe_std = task_std * shrinkage
+                    noise = torch.randn(samples_per_old, self.feature_dim).to(self.device)
+                    f_fake = mu_old + (noise * safe_std)
+                
+                pseudo_features.append(f_fake)
+                pseudo_labels.append(torch.full((samples_per_old,), c_old, device=self.device))
 
-        # 3. Gộp và RLS Update (Dữ liệu THÔ)
-        X_total = torch.cat([f_real] + X_pseudo_list).to(self.device)
-        Y_total = torch.cat([Y_cpu] + Y_pseudo_list).to(self.device)
+        # 4. Gộp dữ liệu Thật + Giả
+        if len(pseudo_features) > 0:
+            final_features = torch.cat([all_features, torch.cat(pseudo_features)])
+            final_labels = torch.cat([all_labels, torch.cat(pseudo_labels)])
+        else:
+            final_features = all_features
+            final_labels = all_labels
+            
+        return final_features, final_labels
 
-        # Cập nhật RLS (Giữ nguyên logic của bạn)
-        if Y_total.shape[1] > self.weight.shape[1]:
-            self.weight = torch.cat((self.weight, torch.zeros((self.buffer_size, Y_total.shape[1] - self.weight.shape[1]), device=self.device)), dim=1)
+    # =========================================================================
+    # [3] CLASSIFIER TRAINING (RLS - Analytic)
+    # =========================================================================
 
-        H = self.buffer(X_total)
-        RHt = H @ self.R.T 
-        A = RHt @ H.T 
-        A.diagonal().add_(1e-6) 
+    def fit_classifier_global(self, train_loader):
+        """
+        Hàm này thay thế hàm fit() cũ. 
+        Được gọi 1 lần duy nhất sau khi train backbone xong.
+        """
+        # 1. Sinh dữ liệu (Real + Hybrid Pseudo)
+        X_total, Y_total_indices = self.generate_pseudo_dataset_hybrid(train_loader)
         
-        K = RHt.T @ torch.linalg.solve(A + torch.eye(A.shape[0], device=self.device), torch.eye(A.shape[0], device=self.device))
-        self.R.sub_(K @ H @ self.R) 
-        self.weight.add_(K @ (Y_total - (H @ self.weight)))
+        # One-hot encode labels
+        Y_total = torch.zeros(Y_total_indices.shape[0], self.known_class, device=self.device)
+        Y_total.scatter_(1, Y_total_indices.unsqueeze(1).long(), 1.0)
+        
+        # 2. Mở rộng trọng số RLS nếu có class mới
+        if self.known_class > self.weight.shape[1]:
+            added_dim = self.known_class - self.weight.shape[1]
+            self.weight = torch.cat((self.weight, torch.zeros((self.buffer_size, added_dim), device=self.device)), dim=1)
+
+        # 3. Giải RLS (Analytic Solution)
+        # Vì giải offline 1 lần nên ta có thể dùng batch lớn hoặc giải toàn cục
+        # Để tránh OOM với tập dữ liệu lớn, ta vẫn chia batch để update ma trận R và W
+        
+        batch_size = 512 # Batch lớn cho nhanh vì chỉ tính ma trận
+        N = X_total.shape[0]
+        
+        print(f"--> [RLS] Fitting Classifier on {N} samples (Real + Pseudo)...")
+        
+        # Reset R nếu muốn (Optional: Nếu muốn học lại từ đầu mỗi task để tránh lỗi tích lũy)
+        # self.R = torch.eye(self.buffer_size, device=self.device) / self.gamma
+        
+        permutation = torch.randperm(N)
+        
+        for i in range(0, N, batch_size):
+            indices = permutation[i : i + batch_size]
+            batch_x = X_total[indices]
+            batch_y = Y_total[indices]
+            
+            # Qua Random Buffer
+            H = self.buffer(batch_x)
+            
+            # RLS Update Formula
+            RHt = H @ self.R.T 
+            A = RHt @ H.T 
+            A.diagonal().add_(1e-6) # Stability
+            
+            K = RHt.T @ torch.linalg.solve(A + torch.eye(A.shape[0], device=self.device), torch.eye(A.shape[0], device=self.device))
+            
+            self.R.sub_(K @ H @ self.R) 
+            self.weight.add_(K @ (batch_y - (H @ self.weight)))
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     
     def update_noise(self):
