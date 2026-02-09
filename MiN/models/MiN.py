@@ -483,13 +483,8 @@ class MinNet(object):
         self.run(train_loader)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
-        
-        # --- RLS Training with Pseudo-Replay ---
-        # Dùng batch nhỏ (512) để an toàn RAM
-        safe_rls_batch = 512
-        
-        # Fit lần 1 (Augmented) - Có thể bỏ nếu muốn nhanh
-        rls_loader = DataLoader(train_set, batch_size=safe_rls_batch, shuffle=True,
+    
+        rls_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
                                   num_workers=self.num_workers)
         self.fit_fc(rls_loader, test_loader)
 
@@ -497,7 +492,7 @@ class MinNet(object):
         train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
         
-        rls_loader_noaug = DataLoader(train_set_noaug, batch_size=safe_rls_batch, shuffle=True,
+        rls_loader_noaug = DataLoader(train_set_noaug, batch_size=self.init_batch_size, shuffle=True,
                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
@@ -520,9 +515,9 @@ class MinNet(object):
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=512, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=512, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=self.batch_size, shuffle=False,
                                  num_workers=self.num_workers)
 
         self.test_loader = test_loader
@@ -531,18 +526,11 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # -----------------------------------------------------------
-        # [KHÔI PHỤC LẠI LOGIC GỐC]
-        # 1. Update Normal FC
+    
         self._network.update_fc(self.increment)
-        
-        # 2. GỌI FIT NGAY TẠI ĐÂY (Để mở rộng RLS Weight tự động)
-        # Hàm fit() trong inc_net.py sẽ tự phát hiện class mới và cat thêm cột
-        # Đồng thời nó cũng sinh mẫu giả sơ bộ -> Rất tốt để làm mốc
+     
         self.fit_fc(train_loader, test_loader)
-        # -----------------------------------------------------------
-
-        # 3. Train Noise (Giờ chạy Run thoải mái vì Weight đã được expand ở bước 2)
+        # ----------------------------------------------------------
         train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
         self._network.update_noise()
@@ -555,14 +543,11 @@ class MinNet(object):
 
         del train_set
 
-        # 4. RE-FIT (TINH CHỈNH CUỐI CÙNG)
-        # Sau khi train Noise xong, Feature bị trôi đi một chút.
-        # Ta gọi fit lại lần nữa để sinh mẫu giả khớp với Feature mới nhất.
+     
         train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
 
-        # Batch 512 cho nhanh
-        rls_loader = DataLoader(train_set_noaug, batch_size=512, shuffle=True,
+        rls_loader = DataLoader(train_set_noaug, batch_size=self.batch_size, shuffle=True,
                                 num_workers=self.num_workers)
 
         if self.args['pretrained']:
