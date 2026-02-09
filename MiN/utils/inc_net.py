@@ -114,6 +114,7 @@ class MiNbaseNet(nn.Module):
     def forward(self, x, new_forward=False):
         if new_forward: hyper_features = self.backbone(x, new_forward=True)
         else: hyper_features = self.backbone(x)
+        hyper_features = F.normalize(hyper_features.float(), p=2, dim=1)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
         return {'logits': logits}
@@ -191,152 +192,106 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        [FIXED OOM] Batching Feature Extraction.
-        Thay vì đưa cả cục X (5000 ảnh) vào backbone, ta chia nhỏ ra chạy từng chút một.
+        Phiên bản FeTrIL¹ bám sát cấu trúc của bạn + Chống OOM cho ViT.
         """
-        # -------------------------------------------------------
-        # BƯỚC 1: TRÍCH XUẤT ĐẶC TRƯNG (CHIA BATCH ĐỂ TRÁNH OOM)
-        # -------------------------------------------------------
         self.backbone.eval()
+        # 1. Feature Extraction (Chia nhỏ batch để tránh OOM bộ nhớ GPU)
         features_list = []
-        
-        # Batch size an toàn cho ViT/ResNet khi chỉ inference
-        EXTRACT_BATCH = 128 
-        total_samples = X.shape[0]
-        
-        # Loop qua từng batch nhỏ
-        for start in range(0, total_samples, EXTRACT_BATCH):
-            end = min(start + EXTRACT_BATCH, total_samples)
-            
-            # 1. Lấy batch nhỏ và đưa lên GPU
+        EXTRACT_BATCH = 128
+        for start in range(0, X.shape[0], EXTRACT_BATCH):
+            end = min(start + EXTRACT_BATCH, X.shape[0])
             x_batch = X[start:end].to(self.device)
-            
-            # 2. Qua Backbone (Chỉ tốn VRAM cho 128 ảnh)
             f_batch = self.backbone(x_batch)
+            # Normalize ngay sau backbone (Normalize 1)
+            f_batch = F.normalize(f_batch.float(), p=2, dim=1)
+            features_list.append(f_batch.cpu())
             
-            # [Quan trọng] Đưa về CPU ngay lập tức để giải phóng VRAM
-            features_list.append(f_batch.cpu()) 
-
-        # Gộp lại thành 1 cục to ở CPU (RAM thường chịu tốt 5000 vector)
-        X_real_backbone = torch.cat(features_list).float()
-        
-        # Xử lý Y (nếu Y đang ở GPU thì đưa về CPU)
+        X_real_norm = torch.cat(features_list) # [N_real, 768]
         Y_cpu_all = Y.cpu().float()
-        
-        # Dọn dẹp
         del X, features_list
-        torch.cuda.empty_cache()
 
-        # -------------------------------------------------------
-        # BƯỚC 2: LOGIC SINH MẪU (FETRIL) - CHẠY TRÊN CPU
-        # -------------------------------------------------------
+        # --- SINH MẪU GIẢ (FETRIL¹ LOGIC) ---
         new_class_samples_dict = {}
-        new_class_means_raw = {} 
-        new_class_means_norm = {}
+        new_class_means_dict = {}
         
-        if self.training:
-            if not hasattr(self, 'class_means'): self.class_means = []
-            
-            unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
-            for c in unique_classes:
-                c = c.item()
-                while len(self.class_means) <= c: self.class_means.append(None)
-                
-                mask = (torch.argmax(Y_cpu_all, dim=1) == c)
-                feats = X_real_backbone[mask]
-                
-                mean_c = feats.mean(dim=0)
-                
-                self.class_means[c] = mean_c.detach()
-                new_class_samples_dict[c] = feats
-                new_class_means_raw[c] = mean_c
-                new_class_means_norm[c] = F.normalize(mean_c.unsqueeze(0), p=2, dim=1).squeeze(0)
+        # Tính Mean cho các lớp mới trong Batch hiện tại
+        unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
+        for c in unique_classes:
+            c = c.item()
+            while len(self.class_means) <= c: self.class_means.append(None)
+            mask = (torch.argmax(Y_cpu_all, dim=1) == c)
+            feats = X_real_norm[mask]
+            mean_c = feats.mean(dim=0)
+            self.class_means[c] = mean_c.detach() # Lưu cho task sau
+            new_class_samples_dict[c] = feats
+            new_class_means_dict[c] = mean_c
 
         X_pseudo_list = []
         Y_pseudo_list = []
         
+        # Nếu đang ở task increment (>0), thực hiện sinh mẫu cho các lớp cũ
         if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
-            available_new_classes = list(new_class_samples_dict.keys())
-            new_means_matrix_norm = torch.stack([new_class_means_norm[k] for k in available_new_classes])
+            available_new = list(new_class_samples_dict.keys())
+            new_means_matrix = torch.stack([new_class_means_dict[k] for k in available_new])
             
-            total_real = X_real_backbone.shape[0]
-            samples_per_old = int(total_real / self.prev_known_class)
-            samples_per_old = max(1, min(samples_per_old, 500))
+            # Cân bằng: Mỗi lớp cũ sinh ra số mẫu bằng trung bình mẫu lớp mới trong batch
+            samples_per_old = max(1, min(int(X_real_norm.shape[0] / self.prev_known_class), 500))
 
             for c_old in range(self.prev_known_class):
-                if c_old < len(self.class_means) and self.class_means[c_old] is not None:
+                if self.class_means[c_old] is not None:
+                    # Chọn lớp Seed giống nhất (Cosine)
+                    mean_old_vec = self.class_means[c_old]
+                    similarities = torch.matmul(new_means_matrix, mean_old_vec)
+                    c_seed = available_new[torch.argmax(similarities).item()]
                     
-                    # Cosine Selection
-                    mean_old_raw = self.class_means[c_old]
-                    mean_old_norm = F.normalize(mean_old_raw.unsqueeze(0), p=2, dim=1).squeeze(0)
+                    # Dịch chuyển (Translation)
+                    seed_feats = new_class_samples_dict[c_seed]
+                    mean_seed = new_class_means_dict[c_seed]
                     
-                    similarities = torch.matmul(new_means_matrix_norm, mean_old_norm)
-                    best_idx = torch.argmax(similarities).item()
-                    c_seed = available_new_classes[best_idx]
+                    # Lấy mẫu ngẫu nhiên từ seed để dịch chuyển
+                    idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
+                    X_fake = (seed_feats[idx] - mean_seed) + mean_old_vec
                     
-                    # Generation
-                    seed = new_class_samples_dict[c_seed]
-                    mean_seed_raw = new_class_means_raw[c_seed]
+                    # Normalize lại mẫu giả (Normalize 2)
+                    X_fake = F.normalize(X_fake, p=2, dim=1)
                     
-                    while seed.shape[0] < samples_per_old: 
-                        seed = torch.cat((seed, seed), dim=0)
-                    seed = seed[:samples_per_old]
-                    
-                    X_fake = (seed - mean_seed_raw) + mean_old_raw
                     Y_fake = torch.zeros(samples_per_old, Y_cpu_all.shape[1])
                     Y_fake[:, c_old] = 1.0
-                    
                     X_pseudo_list.append(X_fake)
                     Y_pseudo_list.append(Y_fake)
 
-        # Gộp dữ liệu (Vẫn ở CPU)
+        # Gộp Thật + Giả
         if len(X_pseudo_list) > 0:
-            X_total = torch.cat([X_real_backbone] + X_pseudo_list, dim=0)
-            Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list, dim=0)
+            X_total = torch.cat([X_real_norm] + X_pseudo_list).to(self.device)
+            Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list).to(self.device)
         else:
-            X_total = X_real_backbone; Y_total = Y_cpu_all
+            X_total = X_real_norm.to(self.device); Y_total = Y_cpu_all.to(self.device)
 
-        # -------------------------------------------------------
-        # BƯỚC 3: RLS UPDATE (DUAL FORM) - CHẠY TRÊN GPU
-        # -------------------------------------------------------
-        # Chỉ đưa ma trận Feature (số) lên GPU -> Rất nhẹ
-        if self.R.device != self.device: self.R = self.R.to(self.device)
-        self.weight = self.weight.to(self.device)
-        
-        # Expand weight
+        # --- DUAL-FORM RLS UPDATE ---
         if Y_total.shape[1] > self.weight.shape[1]:
             tail = torch.zeros((self.weight.shape[0], Y_total.shape[1] - self.weight.shape[1]), device=self.device)
             self.weight = torch.cat((self.weight, tail), dim=1)
 
-        # Chunking cho RLS (Phòng hờ ma trận 10k x 10k quá to)
-        # Với Dual Form, ta cần tính H @ R.T (N x D) @ (D x D)
-        # N=10000, D=768 (sau backbone) -> Nhẹ.
-        # Nhưng H là output của Buffer (D=16384). N x D = 10000 x 16384 floats = 650MB. Vẫn ổn.
+        H = self.buffer(X_total) # Qua Random Project + ReLU
         
-        X_total = X_total.to(self.device)
-        Y_total = Y_total.to(self.device)
-
-        H = self.buffer(X_total) # Project lên 16384 chiều
-        
-        # Woodbury Identity
+        # Công thức Woodbury (Dual-Form) cho tốc độ siêu nhanh trên GPU
         RHt = H @ self.R.T 
         A = RHt @ H.T 
-        A.diagonal().add_(1.0) 
+        A.diagonal().add_(1.0) # Cộng Identity
 
         try:
             B = torch.linalg.solve(A, torch.eye(A.shape[0], device=self.device))
         except:
-            B = torch.inverse(A + 1e-6 * torch.eye(A.shape[0], device=self.device))
+            B = torch.inverse(A + 1e-7 * torch.eye(A.shape[0], device=self.device))
 
         K = RHt.T @ B 
-        
         self.R.sub_(K @ RHt) 
         self.weight.add_(K @ (Y_total - (H @ self.weight)))
 
-        # Dọn dẹp sạch sẽ
         del X_total, Y_total, H, A, B, K, RHt
         gc.collect()
         torch.cuda.empty_cache()
+    
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
@@ -362,6 +317,8 @@ class MiNbaseNet(nn.Module):
     def forward_normal_fc(self, x, new_forward=False):
         if new_forward: h = self.backbone(x, new_forward=True)
         else: h = self.backbone(x)
+        # Chuẩn hóa đồng nhất trước khi vào Buffer
+        h = F.normalize(h.float(), p=2, dim=1)
         h = self.buffer(h.to(self.buffer.weight.dtype))
         h = h.to(self.normal_fc.weight.dtype)
         return {"logits": self.normal_fc(h)['logits']}
