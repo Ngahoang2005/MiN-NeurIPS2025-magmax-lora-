@@ -194,10 +194,9 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        Phiên bản FeTrIL Chuẩn (Class-Specific Translation):
-        1. Sinh mẫu ở không gian Backbone (768 chiều).
-        2. Chọn ngẫu nhiên 1 class mới làm seed cho mỗi class cũ để giữ cấu trúc.
-        3. Đi qua Buffer -> RLS Chunking.
+        Phiên bản KHÔNG sửa RandomBuffer:
+        - Giữ RandomBuffer trên GPU.
+        - Đẩy từng batch dữ liệu nhỏ lên GPU để qua Buffer, sau đó kéo về CPU để tính RLS.
         """
         
         # --- BƯỚC 0: FEATURE EXTRACTION ---
@@ -206,7 +205,6 @@ class MiNbaseNet(nn.Module):
             except: pass
             
             if X.device != self.device: X = X.to(self.device)
-            # Lấy feature 768 chiều
             features_backbone = self.backbone(X) 
         
         X_real_backbone = features_backbone.cpu().float()
@@ -214,14 +212,10 @@ class MiNbaseNet(nn.Module):
         
         del X, features_backbone, Y
         
-        # --- BƯỚC 1: CẬP NHẬT THỐNG KÊ & GOM NHÓM DATA ---
-        # Dictionary lưu trữ mẫu của từng class mới trong batch để làm Seed
-        # Key: Class ID, Value: Tensor Features
+        # --- BƯỚC 1: CẬP NHẬT THỐNG KÊ ---
         new_class_samples_dict = {}
-        
         if self.training:
             unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
-            
             for c in unique_classes:
                 c = c.item()
                 if c >= len(self.class_means):
@@ -232,24 +226,17 @@ class MiNbaseNet(nn.Module):
                 mask = (torch.argmax(Y_cpu_all, dim=1) == c)
                 features_c = X_real_backbone[mask]
                 
-                # Lưu thống kê
                 self.class_means[c] = features_c.mean(dim=0).detach()
                 self.class_vars[c] = (features_c.var(dim=0, unbiased=False) + 1e-5).detach()
-                
-                # [FIX 2] Lưu mẫu lại để dùng làm Seed cho FeTrIL
                 new_class_samples_dict[c] = features_c
 
-        # --- BƯỚC 2: SINH DATA GIẢ (FeTrIL Chuẩn) ---
+        # --- BƯỚC 2: SINH DATA GIẢ (FeTrIL) ---
         X_pseudo_list = []
         Y_pseudo_list = []
         
-        # Chỉ sinh nếu có class cũ VÀ trong batch này có class mới để làm mẫu
         if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
-            
-            # Lấy danh sách các class mới có trong batch
             available_new_classes = list(new_class_samples_dict.keys())
             
-            # Tính số lượng mẫu cần sinh (Dynamic Balancing)
             num_new_samples_total = X_real_backbone.shape[0]
             num_new_classes_count = len(available_new_classes)
             
@@ -259,42 +246,28 @@ class MiNbaseNet(nn.Module):
                 samples_per_old_class = 1
             
             samples_per_old_class = max(samples_per_old_class, 1)
-            # samples_per_old_class = min(samples_per_old_class, 50) # Tùy chọn giới hạn
 
             for c_old in range(self.prev_known_class):
                 if c_old < len(self.class_means) and self.class_means[c_old] is not None:
-                    
-                    # 1. Chọn ngẫu nhiên 1 class mới làm "cơ thể" (Seed)
-                    # Việc này giúp mẫu giả có cấu trúc tự nhiên của ảnh thật
                     c_new_seed = np.random.choice(available_new_classes)
                     seed_features = new_class_samples_dict[c_new_seed]
                     
-                    # 2. Oversample (lặp lại) nếu seed ít hơn số lượng cần sinh
                     while seed_features.shape[0] < samples_per_old_class:
                         seed_features = torch.cat((seed_features, seed_features), dim=0)
-                    
-                    # Cắt đúng số lượng và clone để không ảnh hưởng dữ liệu gốc
                     seed_features = seed_features[:samples_per_old_class].clone()
                     
-                    # 3. Tính Mean của class mới NÀY (Mean cục bộ chuẩn xác)
                     mean_new_source = seed_features.mean(dim=0)
-                    
-                    # 4. Lấy Mean của class cũ
                     mean_old_target = self.class_means[c_old]
                     
-                    # --- FeTrIL FORMULA ---
-                    # Dịch chuyển tâm: X_fake = (X_seed - Mean_Seed) + Mean_Old
-                    # Giữ nguyên độ phân tán (Variance) của class mới nhưng dời về vị trí cũ
                     X_fake_backbone = (seed_features - mean_new_source) + mean_old_target
                     
-                    # Tạo Label
                     Y_fake = torch.zeros(samples_per_old_class, Y_cpu_all.shape[1])
                     Y_fake[:, c_old] = 1.0
                     
                     X_pseudo_list.append(X_fake_backbone)
                     Y_pseudo_list.append(Y_fake)
         
-        # --- BƯỚC 3: GỘP & BUFFER & RLS (Phần này giữ nguyên logic đúng) ---
+        # --- BƯỚC 3: CHUẨN BỊ RLS ---
         if len(X_pseudo_list) > 0:
             X_pseudo_backbone = torch.cat(X_pseudo_list, dim=0)
             Y_pseudo = torch.cat(Y_pseudo_list, dim=0)
@@ -304,12 +277,13 @@ class MiNbaseNet(nn.Module):
             X_total_backbone = X_real_backbone
             Y_total = Y_cpu_all
 
-        # Đẩy buffer về CPU để tính
-        self.buffer = self.buffer.cpu() 
+        # [KHÁC BIỆT Ở ĐÂY] KHÔNG gọi self.buffer.cpu() nữa!
+        # Để Buffer nằm yên trên GPU (self.device)
         
         BATCH_CHUNK = 256
         total_samples = X_total_backbone.shape[0]
         
+        # R và Weight vẫn ở CPU để tính toán cho nhẹ RAM
         if self.R.device.type != 'cpu': self.R = self.R.cpu()
         weight_cpu = self.weight.cpu()
         
@@ -322,17 +296,25 @@ class MiNbaseNet(nn.Module):
             tail = torch.zeros((Y_total.shape[0], weight_cpu.shape[1] - num_targets))
             Y_total = torch.cat((Y_total, tail), dim=1)
 
+        # --- BƯỚC 4: RLS LOOP (GPU PROJECTION -> CPU MATH) ---
         for start_idx in range(0, total_samples, BATCH_CHUNK):
             end_idx = min(start_idx + BATCH_CHUNK, total_samples)
             
-            X_batch_backbone = X_total_backbone[start_idx:end_idx]
+            # 1. Lấy batch nhỏ (đang ở CPU)
+            X_batch_cpu = X_total_backbone[start_idx:end_idx]
             Y_batch = Y_total[start_idx:end_idx]
             
-            # Project 768 -> 16384
-            with torch.no_grad():
-                X_batch_expanded = self.buffer(X_batch_backbone)
+            # 2. Đẩy lên GPU để qua Buffer (tránh lỗi RandomBuffer)
+            X_batch_gpu = X_batch_cpu.to(self.device)
             
-            # RLS Math
+            with torch.no_grad():
+                # Buffer tính trên GPU (Nhanh & Không lỗi)
+                X_batch_expanded_gpu = self.buffer(X_batch_gpu)
+                
+                # 3. Kéo kết quả về CPU ngay lập tức
+                X_batch_expanded = X_batch_expanded_gpu.cpu()
+            
+            # 4. Tính RLS trên CPU (An toàn RAM)
             term = torch.eye(X_batch_expanded.shape[0]) + X_batch_expanded @ self.R @ X_batch_expanded.T
             jitter = 1e-6 * torch.eye(term.shape[0])
             
@@ -345,13 +327,15 @@ class MiNbaseNet(nn.Module):
             self.R -= K @ X_batch_expanded @ self.R
             weight_cpu += K @ (Y_batch - X_batch_expanded @ weight_cpu)
             
-            del term, jitter, K, X_batch_backbone, X_batch_expanded, Y_batch
+            # Xóa biến tạm
+            del X_batch_gpu, X_batch_expanded_gpu, term, jitter, K, X_batch_cpu, X_batch_expanded, Y_batch
 
-        self.buffer = self.buffer.to(self.device)
+        # Đẩy Weight cuối cùng về lại GPU
         self.weight = weight_cpu.to(self.device)
         
         del X_real_backbone, X_total_backbone, Y_total, weight_cpu, new_class_samples_dict
         gc.collect()
+    
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
