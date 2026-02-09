@@ -138,6 +138,7 @@ class MinNet(object):
     
         rls_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
                                   num_workers=self.num_workers)
+        self.update_global_centroids(data_manger, train_list)
         self.fit_fc(rls_loader, test_loader)
 
         # Re-fit (No Aug) - Đây là bước quan trọng nhất
@@ -323,7 +324,34 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
+    def update_global_centroids(self, data_manger, class_list):
+        """Tính centroid chuẩn cho các lớp mới một lần duy nhất"""
+        self._network.eval()
+        # Lấy data không có Augmentation
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=class_list)
+        loader = DataLoader(train_set_no_aug, batch_size=self.init_batch_size, shuffle=False)
+        
+        # Dictionary lưu tích lũy feature
+        class_features = {c: [] for c in class_list}
+        
+        with torch.no_grad():
+            for _, inputs, targets in loader:
+                inputs = inputs.to(self.device)
+                # Trích xuất feature và normalize (Normalize 1)
+                feats = self._network.backbone(inputs)
+                feats = F.normalize(feats, p=2, dim=1)
+                
+                for f, t in zip(feats, targets):
+                    class_features[t.item()].append(f.cpu())
 
+        # Tính trung bình cho từng lớp và lưu vào network
+        for c in class_list:
+            all_f = torch.stack(class_features[c])
+            mean_f = all_f.mean(dim=0)
+            # Quan trọng: Gán thẳng vào danh sách means của model
+            while len(self._network.class_means) <= c:
+                self._network.class_means.append(None)
+            self._network.class_means[c] = mean_f # Đây là centroid chuẩn!
 
 
 
