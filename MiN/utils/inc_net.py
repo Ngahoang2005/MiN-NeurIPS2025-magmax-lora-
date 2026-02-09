@@ -266,7 +266,14 @@ class MiNbaseNet(nn.Module):
             Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list).to(self.device)
         else:
             X_total = X_real_norm.to(self.device); Y_total = Y_cpu_all.to(self.device)
-
+        # ---------------------------------------------------------------------
+        # [SANITY CHECK] KIỂM TRA ĐỘ HOÀN HẢO CỦA NORMALIZE
+        # ---------------------------------------------------------------------
+        avg_norm = torch.norm(X_total, p=2, dim=1).mean().item()
+        print(f"\n[SANITY CHECK] Task {self.cur_task} | Samples: {X_total.shape[0]} | Mean L2 Norm: {avg_norm:.6f}")
+        if abs(avg_norm - 1.0) > 1e-3:
+            print(">>> CẢNH BÁO: Normalize đang bị lệch, kiểm tra lại logic!")
+        # ---------------------------------------------------------------------
         # --- DUAL-FORM RLS UPDATE ---
         if Y_total.shape[1] > self.weight.shape[1]:
             tail = torch.zeros((self.weight.shape[0], Y_total.shape[1] - self.weight.shape[1]), device=self.device)
