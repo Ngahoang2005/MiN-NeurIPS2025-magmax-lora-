@@ -140,112 +140,67 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        FeTrIL trên đặc trưng THÔ (Raw Features).
-        Tính centroid đúng dựa trên biên độ thực tế của Backbone.
+        Hàm Fit tối ưu: 
+        1. Không chuẩn hóa.
+        2. Không tính lại Mean (Truy xuất từ Global Centroids).
         """
         self.backbone.eval()
-        
         # --- 1. TRÍCH XUẤT ĐẶC TRƯNG THÔ ---
-        features_list = []
-        EXTRACT_BATCH = 128 
-        for start in range(0, X.shape[0], EXTRACT_BATCH):
-            end = min(start + EXTRACT_BATCH, X.shape[0])
-            f_batch = self.backbone(X[start:end].to(self.device))
-            # [BỎ CHUẨN HÓA]: features_list chứa giá trị thô
-            features_list.append(f_batch.float().cpu())
-            
-        X_real_raw = torch.cat(features_list)
-        Y_cpu_all = Y.cpu().float()
-        del X, features_list
+        f_real = self.backbone(X.to(self.device)).float().cpu()
+        Y_cpu = Y.cpu().float()
 
-        # --- 2. TÍNH TOÁN CENTROID THÔ (Correct Centroid calculation) ---
-        new_class_samples_dict = {}
-        new_class_means_dict = {}
-        unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
-        
-        for c in unique_classes:
-            c = c.item()
-            while len(self.class_means) <= c: self.class_means.append(None)
-            mask = (torch.argmax(Y_cpu_all, dim=1) == c)
-            feats = X_real_raw[mask]
-            
-            # Tính trung bình cộng trên giá trị thô để giữ nguyên năng lượng lớp
-            mean_c = feats.mean(dim=0)
-            self.class_means[c] = mean_c.detach() 
-            new_class_samples_dict[c] = feats
-            new_class_means_dict[c] = mean_c
-
-        # --- 3. SINH MẪU GIẢ (RAW TRANSLATION) ---
         X_pseudo_list = []
         Y_pseudo_list = []
         
-        if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
-            available_new = list(new_class_samples_dict.keys())
+        # --- 2. SINH MẪU GIẢ (Dùng Centroid đã tính trước ở Min.py) ---
+        if self.prev_known_class > 0:
+            unique_new = torch.argmax(Y_cpu, dim=1).unique().tolist()
             
-            # Để chọn seed đúng nhất, ta vẫn dùng hướng (Direction) 
-            # nhưng tịnh tiến trên giá trị thô
-            new_means_mat = torch.stack([new_class_means_dict[k] for k in available_new])
-            
-            samples_per_old = max(1, min(int(X_real_raw.shape[0] / self.prev_known_class), 500))
+            # Lấy danh sách Centroids của các lớp mới để so sánh seed
+            # (Chỉ dùng Normalize tạm thời để tính Cosine Similarity chọn Seed)
+            new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
+            samples_per_old = max(1, min(int(f_real.shape[0] / self.prev_known_class), 500))
 
             for c_old in range(self.prev_known_class):
                 if self.class_means[c_old] is not None:
                     mu_old = self.class_means[c_old]
-                    
-                    # Chọn seed dựa trên độ tương đồng hướng (Cosine) để đảm bảo 'giống' nhất
+                    # Tìm Seed dựa trên hướng (Cosine) - Đây là cách chọn seed chuẩn nhất
                     sims = torch.matmul(F.normalize(new_means_mat, p=2, dim=1), 
                                         F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T)
-                    c_seed = available_new[torch.argmax(sims).item()]
+                    c_seed = unique_new[torch.argmax(sims).item()]
                     
-                    seed_feats = new_class_samples_dict[c_seed]
-                    mu_seed = new_class_means_dict[c_seed]
+                    mu_seed = self.class_means[c_seed]
+                    mask_seed = (torch.argmax(Y_cpu, dim=1) == c_seed)
+                    seed_feats = f_real[mask_seed]
                     
-                    idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
-                    
-                    # CÔNG THỨC THÔ: Giữ nguyên biên độ của mẫu seed và sai khác tâm thô
-                    X_fake = (seed_feats[idx] - mu_seed) + mu_old
-                    
-                    # [BỎ CHUẨN HÓA]: Không normalize X_fake
-                    Y_fake = torch.zeros(samples_per_old, Y_cpu_all.shape[1]).index_fill_(1, torch.tensor(c_old), 1.0)
-                    
-                    X_pseudo_list.append(X_fake)
-                    Y_pseudo_list.append(Y_fake)
+                    if seed_feats.shape[0] > 0:
+                        idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
+                        # TỊNH TIẾN THÔ (Không chuẩn hóa kết quả)
+                        f_fake = (seed_feats[idx] - mu_seed) + mu_old
+                        X_pseudo_list.append(f_fake)
+                        Y_pseudo_list.append(torch.zeros(samples_per_old, Y_cpu.shape[1]).index_fill_(1, torch.tensor(c_old), 1.0))
 
-        # --- 4. GỘP DỮ LIỆU THÔ ---
-        if len(X_pseudo_list) > 0:
-            X_total = torch.cat([X_real_raw] + X_pseudo_list).to(self.device)
-            Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list).to(self.device)
-        else:
-            X_total = X_real_raw.to(self.device); Y_total = Y_cpu_all.to(self.device)
+        # --- 3. GỘP & CẬP NHẬT RLS ---
+        X_total = torch.cat([f_real] + X_pseudo_list).to(self.device)
+        Y_total = torch.cat([Y_cpu] + Y_pseudo_list).to(self.device)
 
-        # --- 5. RLS UPDATE TRÊN DỮ LIỆU THÔ ---
         if Y_total.shape[1] > self.weight.shape[1]:
             diff = Y_total.shape[1] - self.weight.shape[1]
             self.weight = torch.cat((self.weight, torch.zeros((self.buffer_size, diff), device=self.device)), dim=1)
 
-        H = self.buffer(X_total) # ReLU(X_raw @ W)
-        
-        # Log Sparsity để kiểm tra Buffer có bị 'ngộp' bởi dữ liệu thô không
-        if self.cur_task >= 0:
-            zero_ratio = (H == 0).float().mean().item()
-            if zero_ratio > 0.95: print(f"Warning: High Sparsity ({zero_ratio:.2f}) - Consider increasing Buffer Std.")
-
-        # Woodbury Dual-Form
+        H = self.buffer(X_total)
         RHt = H @ self.R.T 
         A = RHt @ H.T 
         A.diagonal().add_(1.0) 
         
-        try:
-            K = RHt.T @ torch.inverse(A + 1e-7 * torch.eye(A.shape[0], device=self.device))
-        except:
-            K = torch.linalg.solve(A, RHt).T
+        try: K = RHt.T @ torch.inverse(A + 1e-7 * torch.eye(A.shape[0], device=self.device))
+        except: K = torch.linalg.solve(A, RHt).T
 
         self.R.sub_(K @ RHt) 
         self.weight.add_(K @ (Y_total - (H @ self.weight)))
-
-        del X_total, Y_total, H, K, RHt, A
-        gc.collect()
-        torch.cuda.empty_cache() 
+    
+    
+    
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:

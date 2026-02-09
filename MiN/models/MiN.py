@@ -1,10 +1,5 @@
 
 
-
-
-
-
-
 import math
 import random
 import numpy as np
@@ -324,36 +319,40 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
+    # Trong class MinNet (file Min.py)
+
     def update_global_centroids(self, data_manger, class_list):
-        """Tính centroid chuẩn cho các lớp mới một lần duy nhất"""
+        """
+        Tính centroid chuẩn (Global) cho các lớp mới một lần duy nhất.
+        Đảm bảo Centroid là THÔ (Raw), không chuẩn hóa.
+        """
+        print(f"--> Calculating Global Centroids for classes: {class_list}")
         self._network.eval()
-        # Lấy data không có Augmentation
+        # 1. Lấy dữ liệu SẠCH (Không Augmentation)
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=class_list)
-        loader = DataLoader(train_set_no_aug, batch_size=self.init_batch_size, shuffle=False)
+        loader = DataLoader(train_set_no_aug, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
         
-        # Dictionary lưu tích lũy feature
         class_features = {c: [] for c in class_list}
         
+        # 2. Trích xuất đặc trưng THÔ
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs = inputs.to(self.device)
-                # Trích xuất feature và normalize (Normalize 1)
-                feats = self._network.backbone(inputs)
-                feats = F.normalize(feats, p=2, dim=1)
-                
+                feats = self._network.backbone(inputs).float().cpu()
+                # TUYỆT ĐỐI KHÔNG NORMALIZE Ở ĐÂY
                 for f, t in zip(feats, targets):
-                    class_features[t.item()].append(f.cpu())
+                    class_features[t.item()].append(f)
 
-        # Tính trung bình cho từng lớp và lưu vào network
+        # 3. Tính trung bình và lưu trữ
         for c in class_list:
-            all_f = torch.stack(class_features[c])
-            mean_f = all_f.mean(dim=0)
-            # Quan trọng: Gán thẳng vào danh sách means của model
-            while len(self._network.class_means) <= c:
-                self._network.class_means.append(None)
-            self._network.class_means[c] = mean_f # Đây là centroid chuẩn!
-
-
+            if len(class_features[c]) > 0:
+                mean_f = torch.stack(class_features[c]).mean(dim=0)
+                # Lưu vào danh sách means của model
+                while len(self._network.class_means) <= c:
+                    self._network.class_means.append(None)
+                self._network.class_means[c] = mean_f
+            else:
+                print(f"Warning: No samples found for class {c}")
 
 
 
