@@ -7,7 +7,8 @@ from backbones.pretrained_backbone import get_pretrained_backbone
 from backbones.linears import SimpleLinear
 import numpy as np
 from sklearn.metrics import accuracy_score  
-
+import os
+import random
 
 try:
     from torch.amp import autocast
