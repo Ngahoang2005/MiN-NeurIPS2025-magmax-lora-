@@ -176,7 +176,7 @@ class MinNet(object):
 
     
         self._network.update_fc(self.increment)
-       
+        self.update_global_centroids(data_manger, train_list)
         self.fit_fc(train_loader, test_loader)
         # ----------------------------------------------------------
         train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
@@ -185,7 +185,7 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_noise) # ---> HẾT LỖI
-        #self.update_global_centroids(data_manger, train_list)
+        self.update_global_centroids(data_manger, train_list)
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
 
