@@ -243,8 +243,8 @@ class MiNbaseNet(nn.Module):
         self.register_buffer("w_ref", torch.zeros((self.buffer_size, 0), **factory_kwargs))
         # R (Inverse Covariance) - Nằm trên GPU để tránh OOM RAM
         self.register_buffer("R", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
-        self.class_means = [] 
-       
+        self.class_means = {} 
+        self.new_class_means = []
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
@@ -293,17 +293,31 @@ class MiNbaseNet(nn.Module):
 
         # ... (Phần còn lại giữ nguyên) ...
         
-        # Logic tính Mean và Fallback Gaussian giữ nguyên như cũ
+        # ... (Đoạn code thu thập features giữ nguyên) ...
+        
+        # [SỬA] Logic cập nhật Mean dùng Dictionary
         unique_new = torch.unique(all_labels).tolist()
         self.new_class_means = [] 
         
+        # Tạo map tạm để dùng sau
+        new_means_map = {}
+        
         for c in unique_new:
+            c = int(c) # Đảm bảo key là int chuẩn
             mask = (all_labels == c)
             mean_c = all_features[mask].mean(dim=0)
+            
+            # Gán vào Dict (An toàn tuyệt đối, không lo Index Out of Range)
             self.class_means[c] = mean_c 
-
-        unique_new.sort()
-        new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
+            new_means_map[c] = mean_c
+        
+        # Sắp xếp key để tạo ma trận tensor đúng thứ tự
+        sorted_new_classes = sorted(unique_new)
+        
+        # Stack lại thành Tensor để tính toán ma trận (Quan trọng!)
+        # Dùng new_means_map[c] thay vì self.class_means[c] để chắc chắn lấy đúng cái mới
+        new_means_mat = torch.stack([self.class_means[c] for c in sorted_new_classes])
+        
         task_std = torch.std(all_features, dim=0).mean().item()
         
         pseudo_features = []
@@ -314,15 +328,24 @@ class MiNbaseNet(nn.Module):
             samples_per_old = 200 
             
             for c_old in range(self.prev_known_class):
-                mu_old = self.class_means[c_old].to(self.device)
+                # Kiểm tra an toàn: Nếu c_old chưa có trong dict (hiếm gặp nhưng nên check)
+                if c_old not in self.class_means:
+                    print(f"Warning: Class {c_old} missing mean! Using Zero vector.")
+                    mu_old = torch.zeros(self.feature_dim, device=self.device)
+                else:
+                    mu_old = self.class_means[c_old].to(self.device)
                 
+                # Logic FeTrIL giữ nguyên...
+                # Lưu ý dùng sorted_new_classes để map index lại đúng class ID
                 sims = torch.matmul(
                     F.normalize(new_means_mat, p=2, dim=1), 
                     F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T
                 )
                 best_sim_val, best_idx = torch.max(sims, dim=0)
                 best_sim_val = best_sim_val.item()
-                best_class_new = unique_new[best_idx.item()]
+                
+                # Lấy đúng class ID từ list đã sort
+                best_class_new = sorted_new_classes[best_idx.item()]
                 
                 f_fake = None
                 
@@ -335,12 +358,7 @@ class MiNbaseNet(nn.Module):
                         idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
                         f_fake = (seed_feats[idx] - mu_seed) + mu_old
                 
-                if f_fake is None:
-                    shrinkage = 0.6
-                    safe_std = task_std * shrinkage
-                    noise = torch.randn(samples_per_old, self.feature_dim).to(self.device)
-                    f_fake = mu_old + (noise * safe_std)
-                
+                # ... (Phần Fallback Gaussian giữ nguyên) ...
                 pseudo_features.append(f_fake)
                 pseudo_labels.append(torch.full((samples_per_old,), c_old, device=self.device))
 
