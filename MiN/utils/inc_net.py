@@ -274,20 +274,16 @@ class MiNbaseNet(nn.Module):
     #fit sinh mẫu giả
     @torch.no_grad()
     def generate_pseudo_dataset_hybrid(self, train_loader):
-        """
-        Sinh mẫu giả nhìn toàn cục (Global View).
-        Chiến thuật: Hybrid (FeTrIL nếu có họ hàng, Gaussian Fallback nếu không).
-        """
         print("--> [FeTrIL] Generating Pseudo Data (Global Hybrid Mode)...")
         self.eval()
         
-        # 1. Thu thập toàn bộ đặc trưng THẬT của Task mới
         all_features = []
         all_labels = []
         
-        for inputs, labels in train_loader:
+        # --- [FIX LỖI UNPACK] ---
+        # Loader trả về: (index, image, label) -> Dùng (_, inputs, labels)
+        for _, inputs, labels in train_loader:
             inputs = inputs.to(self.device)
-            # Trích xuất đặc trưng thô từ Backbone
             features = self.backbone(inputs).float() 
             all_features.append(features)
             all_labels.append(labels.to(self.device))
@@ -295,39 +291,31 @@ class MiNbaseNet(nn.Module):
         all_features = torch.cat(all_features)
         all_labels = torch.cat(all_labels)
 
-        # 2. Cập nhật Mean cho các Class MỚI (Quan trọng!)
+        # ... (Phần còn lại giữ nguyên) ...
+        
+        # Logic tính Mean và Fallback Gaussian giữ nguyên như cũ
         unique_new = torch.unique(all_labels).tolist()
-        self.new_class_means = [] # Reset temporary list
-        new_means_map = {}
+        self.new_class_means = [] 
         
         for c in unique_new:
             mask = (all_labels == c)
             mean_c = all_features[mask].mean(dim=0)
-            self.class_means[c] = mean_c # Lưu vào bộ nhớ toàn cục
-            new_means_map[c] = mean_c
-        
-        # Tạo ma trận Mean mới để tính cosine nhanh
-        # Chú ý: Cần sort unique_new để index khớp với thứ tự trong matrix
+            self.class_means[c] = mean_c 
+
         unique_new.sort()
         new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
-        
-        # 3. Tính toán thống kê cho Fallback (Gaussian)
         task_std = torch.std(all_features, dim=0).mean().item()
         
         pseudo_features = []
         pseudo_labels = []
         
-        # Chỉ sinh mẫu nếu đã có task cũ
         if self.prev_known_class > 0:
-            # Ngưỡng lọc (0.1 như đã bàn)
             THRESHOLD = 0.1
-            samples_per_old = 200 # Số lượng mẫu cố định (tăng lên vì làm offline)
+            samples_per_old = 200 
             
-            # Duyệt qua từng class CŨ
             for c_old in range(self.prev_known_class):
                 mu_old = self.class_means[c_old].to(self.device)
                 
-                # Tính Sim với tất cả class mới
                 sims = torch.matmul(
                     F.normalize(new_means_mat, p=2, dim=1), 
                     F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T
@@ -338,9 +326,7 @@ class MiNbaseNet(nn.Module):
                 
                 f_fake = None
                 
-                # --- LOGIC HYBRID ---
                 if best_sim_val > THRESHOLD:
-                    # [FeTrIL XỊN]: Có họ hàng
                     mask_seed = (all_labels == best_class_new)
                     seed_feats = all_features[mask_seed]
                     mu_seed = self.class_means[best_class_new].to(self.device)
@@ -350,7 +336,6 @@ class MiNbaseNet(nn.Module):
                         f_fake = (seed_feats[idx] - mu_seed) + mu_old
                 
                 if f_fake is None:
-                    # [FALLBACK]: Gaussian Noise (Shrinkage)
                     shrinkage = 0.6
                     safe_std = task_std * shrinkage
                     noise = torch.randn(samples_per_old, self.feature_dim).to(self.device)
@@ -359,7 +344,6 @@ class MiNbaseNet(nn.Module):
                 pseudo_features.append(f_fake)
                 pseudo_labels.append(torch.full((samples_per_old,), c_old, device=self.device))
 
-        # 4. Gộp dữ liệu Thật + Giả
         if len(pseudo_features) > 0:
             final_features = torch.cat([all_features, torch.cat(pseudo_features)])
             final_labels = torch.cat([all_labels, torch.cat(pseudo_labels)])
@@ -368,7 +352,6 @@ class MiNbaseNet(nn.Module):
             final_labels = all_labels
             
         return final_features, final_labels
-
     # =========================================================================
     # [3] CLASSIFIER TRAINING (RLS - Analytic)
     # =========================================================================
