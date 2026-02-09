@@ -548,7 +548,7 @@ class MinNet(object):
 
     
         self._network.update_fc(self.increment)
-     
+        self.update_global_centroids(data_manger, train_list)
         self.fit_fc(train_loader, test_loader)
         # ----------------------------------------------------------
         train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
@@ -693,6 +693,7 @@ class MinNet(object):
         }
     def update_global_centroids(self, data_manger, class_list):
         """Tính centroid chuẩn cho các lớp mới một lần duy nhất"""
+        "Không chuẩn hóa"""
         self._network.eval()
         # Lấy data không có Augmentation
         train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=class_list)
@@ -706,7 +707,7 @@ class MinNet(object):
                 inputs = inputs.to(self.device)
                 # Trích xuất feature và normalize (Normalize 1)
                 feats = self._network.backbone(inputs)
-                feats = F.normalize(feats, p=2, dim=1)
+               
                 
                 for f, t in zip(feats, targets):
                     class_features[t.item()].append(f.cpu())
@@ -719,16 +720,6 @@ class MinNet(object):
             while len(self._network.class_means) <= c:
                 self._network.class_means.append(None)
             self._network.class_means[c] = mean_f # Đây là centroid chuẩn!
-
-
-
-
-
-
-
-
-
-
 
 
 
