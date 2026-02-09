@@ -129,6 +129,7 @@ class MinNet(object):
         # Train Noise/GPM
         self.run(train_loader)
         #self._network.collect_projections(mode='threshold', val=0.9)
+        self._network.after_task_magmax_merge()
         self._clear_gpu()
     
         rls_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
@@ -185,7 +186,7 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_noise) # ---> HẾT LỖI
-        
+        self._network.after_task_magmax_merge()
         #self._network.collect_projections(mode='threshold', val=0.9)
         self.update_global_centroids(data_manger, train_list)
         self._clear_gpu()
