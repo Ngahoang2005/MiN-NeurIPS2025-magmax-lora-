@@ -531,45 +531,48 @@ class MinNet(object):
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # Update FC để mở rộng class
+        # -----------------------------------------------------------
+        # [KHÔI PHỤC LẠI LOGIC GỐC]
+        # 1. Update Normal FC
         self._network.update_fc(self.increment)
+        
+        # 2. GỌI FIT NGAY TẠI ĐÂY (Để mở rộng RLS Weight tự động)
+        # Hàm fit() trong inc_net.py sẽ tự phát hiện class mới và cat thêm cột
+        # Đồng thời nó cũng sinh mẫu giả sơ bộ -> Rất tốt để làm mốc
+        self.fit_fc(train_loader, test_loader)
+        # -----------------------------------------------------------
 
-        # Train Noise/GPM (Dùng Weight cũ + FC mở rộng)
+        # 3. Train Noise (Giờ chạy Run thoải mái vì Weight đã được expand ở bước 2)
         train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                     num_workers=self.num_workers)
         self._network.update_noise()
         
         self._clear_gpu()
-        self.run(train_loader_noise)
+        self.run(train_loader_noise) # ---> HẾT LỖI
         
         self._network.collect_projections(mode='threshold', val=0.95)
         self._clear_gpu()
 
         del train_set
-        
-        # --- RLS Re-fit (QUAN TRỌNG) ---
-        # Lúc này Noise đã học xong, Feature đã trôi (Drift).
-        # Hàm fit() sẽ tự động tính lại Mean/Var và sinh Pseudo-Samples khớp với Noise mới.
-        
+
+        # 4. RE-FIT (TINH CHỈNH CUỐI CÙNG)
+        # Sau khi train Noise xong, Feature bị trôi đi một chút.
+        # Ta gọi fit lại lần nữa để sinh mẫu giả khớp với Feature mới nhất.
         train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
 
-        safe_rls_batch = 512
-        rls_loader_noaug = DataLoader(train_set_noaug, batch_size=safe_rls_batch, shuffle=True,
-                                    num_workers=self.num_workers)
+        # Batch 512 cho nhanh
+        rls_loader = DataLoader(train_set_noaug, batch_size=512, shuffle=True,
+                                num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(rls_loader_noaug, test_loader)
-        
-        # [ĐÃ BỎ] Không gọi self._network.weight_merging nữa
-        # Vì RLS đã tự merge bằng dữ liệu giả rồi.
+        self.re_fit(rls_loader, test_loader)
         
         del train_set_noaug, test_set
         self._clear_gpu()
-
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
