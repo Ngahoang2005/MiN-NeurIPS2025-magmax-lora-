@@ -128,7 +128,7 @@ class MinNet(object):
         
         # Train Noise/GPM
         self.run(train_loader)
-        self._network.collect_projections(mode='threshold', val=0.9)
+        #self._network.collect_projections(mode='threshold', val=0.9)
         self._clear_gpu()
     
         rls_loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=True,
@@ -176,7 +176,7 @@ class MinNet(object):
 
     
         self._network.update_fc(self.increment)
-        self.update_global_centroids(data_manger, train_list)
+        #self.update_global_centroids(data_manger, train_list)
         self.fit_fc(train_loader, test_loader)
         # ----------------------------------------------------------
         train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
@@ -186,7 +186,7 @@ class MinNet(object):
         self._clear_gpu()
         self.run(train_loader_noise) # ---> HẾT LỖI
         
-        self._network.collect_projections(mode='threshold', val=0.9)
+        #self._network.collect_projections(mode='threshold', val=0.9)
         self.update_global_centroids(data_manger, train_list)
         self._clear_gpu()
 
@@ -242,7 +242,7 @@ class MinNet(object):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
-        current_scale = 0.8
+        #current_scale = 0.8
 
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
@@ -276,9 +276,9 @@ class MinNet(object):
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
-                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
-                     self.scaler.unscale_(optimizer)
-                     self._network.apply_gpm_to_grads(scale=current_scale)
+                # if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+                #      self.scaler.unscale_(optimizer)
+                #      self._network.apply_gpm_to_grads(scale=current_scale)
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
