@@ -881,7 +881,7 @@ class MinNet(object):
         # Lấy nhanh dữ liệu Task 0 để so sánh
         _, t0_list, _ = data_manger.get_task_list(0)
         t0_set = data_manger.get_task_data(source="test", class_list=t0_list)
-        t0_loader = DataLoader(t0_set, batch_size=32, shuffle=False, num_workers=self.num_workers)
+        t0_loader = DataLoader(t0_set, batch_size=128, shuffle=False, num_workers=self.num_workers)
         
         # Lấy mẫu neo (Anchor)
         for _, ref_imgs, _ in t0_loader:

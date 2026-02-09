@@ -191,25 +191,48 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        [FIXED VERSION] FeTrIL¹ Strategy on RAW Features.
-        - Dùng Cosine để chọn class giống nhất (Seed).
-        - Nhưng tính toán RLS trên Feature Thô (để tránh lỗi scale/gamma).
+        [FIXED OOM] Batching Feature Extraction.
+        Thay vì đưa cả cục X (5000 ảnh) vào backbone, ta chia nhỏ ra chạy từng chút một.
         """
-        # 1. Feature Extraction (KHÔNG CHUẨN HÓA Ở ĐÂY NỮA)
-        with torch.no_grad():
-            if X.device != self.device: X = X.to(self.device)
-            features_backbone = self.backbone(X) # Raw features
+        # -------------------------------------------------------
+        # BƯỚC 1: TRÍCH XUẤT ĐẶC TRƯNG (CHIA BATCH ĐỂ TRÁNH OOM)
+        # -------------------------------------------------------
+        self.backbone.eval()
+        features_list = []
+        
+        # Batch size an toàn cho ViT/ResNet khi chỉ inference
+        EXTRACT_BATCH = 128 
+        total_samples = X.shape[0]
+        
+        # Loop qua từng batch nhỏ
+        for start in range(0, total_samples, EXTRACT_BATCH):
+            end = min(start + EXTRACT_BATCH, total_samples)
+            
+            # 1. Lấy batch nhỏ và đưa lên GPU
+            x_batch = X[start:end].to(self.device)
+            
+            # 2. Qua Backbone (Chỉ tốn VRAM cho 128 ảnh)
+            f_batch = self.backbone(x_batch)
+            
+            # [Quan trọng] Đưa về CPU ngay lập tức để giải phóng VRAM
+            features_list.append(f_batch.cpu()) 
 
-        X_real_backbone = features_backbone.cpu().float()
+        # Gộp lại thành 1 cục to ở CPU (RAM thường chịu tốt 5000 vector)
+        X_real_backbone = torch.cat(features_list).float()
+        
+        # Xử lý Y (nếu Y đang ở GPU thì đưa về CPU)
         Y_cpu_all = Y.cpu().float()
-        del X, features_backbone, Y
+        
+        # Dọn dẹp
+        del X, features_list
+        torch.cuda.empty_cache()
 
         # -------------------------------------------------------
-        # BƯỚC 1: TÍNH MEAN & CHUẨN BỊ
+        # BƯỚC 2: LOGIC SINH MẪU (FETRIL) - CHẠY TRÊN CPU
         # -------------------------------------------------------
         new_class_samples_dict = {}
-        new_class_means_raw = {}  # Mean thô để dịch chuyển
-        new_class_means_norm = {} # Mean chuẩn hóa để so sánh Cosine
+        new_class_means_raw = {} 
+        new_class_means_norm = {}
         
         if self.training:
             if not hasattr(self, 'class_means'): self.class_means = []
@@ -224,27 +247,18 @@ class MiNbaseNet(nn.Module):
                 
                 mean_c = feats.mean(dim=0)
                 
-                # Lưu trữ
-                self.class_means[c] = mean_c.detach() # Mean cũ (Raw)
+                self.class_means[c] = mean_c.detach()
                 new_class_samples_dict[c] = feats
                 new_class_means_raw[c] = mean_c
-                
-                # Tạo bản normalized chỉ để tính Cosine cho chuẩn
                 new_class_means_norm[c] = F.normalize(mean_c.unsqueeze(0), p=2, dim=1).squeeze(0)
 
-        # -------------------------------------------------------
-        # BƯỚC 2: SINH MẪU (DÙNG COSINE ĐỂ CHỌN, DÙNG RAW ĐỂ TÍNH)
-        # -------------------------------------------------------
         X_pseudo_list = []
         Y_pseudo_list = []
         
         if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
             available_new_classes = list(new_class_samples_dict.keys())
-            
-            # Ma trận Mean mới (đã chuẩn hóa) để tính Cosine nhanh
             new_means_matrix_norm = torch.stack([new_class_means_norm[k] for k in available_new_classes])
             
-            # Dynamic Balancing
             total_real = X_real_backbone.shape[0]
             samples_per_old = int(total_real / self.prev_known_class)
             samples_per_old = max(1, min(samples_per_old, 500))
@@ -252,58 +266,62 @@ class MiNbaseNet(nn.Module):
             for c_old in range(self.prev_known_class):
                 if c_old < len(self.class_means) and self.class_means[c_old] is not None:
                     
-                    # --- [LOGIC CHỌN: Dùng Cosine] ---
+                    # Cosine Selection
                     mean_old_raw = self.class_means[c_old]
-                    # Chuẩn hóa mean cũ tạm thời để so sánh
                     mean_old_norm = F.normalize(mean_old_raw.unsqueeze(0), p=2, dim=1).squeeze(0)
                     
-                    # Tính độ giống nhau
                     similarities = torch.matmul(new_means_matrix_norm, mean_old_norm)
                     best_idx = torch.argmax(similarities).item()
                     c_seed = available_new_classes[best_idx]
-                    # ----------------------------------
-
-                    # --- [LOGIC SINH: Dùng Raw] ---
+                    
+                    # Generation
                     seed = new_class_samples_dict[c_seed]
-                    mean_seed_raw = new_class_means_raw[c_seed] # Mean thô của class seed
+                    mean_seed_raw = new_class_means_raw[c_seed]
                     
                     while seed.shape[0] < samples_per_old: 
                         seed = torch.cat((seed, seed), dim=0)
                     seed = seed[:samples_per_old]
                     
-                    # Công thức FeTrIL trên không gian gốc (Raw Space)
-                    # X_fake = (Raw_Seed - Raw_Mean_Seed) + Raw_Mean_Old
                     X_fake = (seed - mean_seed_raw) + mean_old_raw
-                    
                     Y_fake = torch.zeros(samples_per_old, Y_cpu_all.shape[1])
                     Y_fake[:, c_old] = 1.0
                     
                     X_pseudo_list.append(X_fake)
                     Y_pseudo_list.append(Y_fake)
 
-        # Gộp và Train (Code cũ Dual Form)
+        # Gộp dữ liệu (Vẫn ở CPU)
         if len(X_pseudo_list) > 0:
             X_total = torch.cat([X_real_backbone] + X_pseudo_list, dim=0)
             Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list, dim=0)
         else:
             X_total = X_real_backbone; Y_total = Y_cpu_all
 
-        # RLS Update (GPU) - KHÔNG CẦN NORMALIZATION
+        # -------------------------------------------------------
+        # BƯỚC 3: RLS UPDATE (DUAL FORM) - CHẠY TRÊN GPU
+        # -------------------------------------------------------
+        # Chỉ đưa ma trận Feature (số) lên GPU -> Rất nhẹ
         if self.R.device != self.device: self.R = self.R.to(self.device)
         self.weight = self.weight.to(self.device)
-        X_total = X_total.to(self.device)
-        Y_total = Y_total.to(self.device)
-
+        
+        # Expand weight
         if Y_total.shape[1] > self.weight.shape[1]:
             tail = torch.zeros((self.weight.shape[0], Y_total.shape[1] - self.weight.shape[1]), device=self.device)
             self.weight = torch.cat((self.weight, tail), dim=1)
 
-        H = self.buffer(X_total) 
+        # Chunking cho RLS (Phòng hờ ma trận 10k x 10k quá to)
+        # Với Dual Form, ta cần tính H @ R.T (N x D) @ (D x D)
+        # N=10000, D=768 (sau backbone) -> Nhẹ.
+        # Nhưng H là output của Buffer (D=16384). N x D = 10000 x 16384 floats = 650MB. Vẫn ổn.
+        
+        X_total = X_total.to(self.device)
+        Y_total = Y_total.to(self.device)
+
+        H = self.buffer(X_total) # Project lên 16384 chiều
         
         # Woodbury Identity
         RHt = H @ self.R.T 
         A = RHt @ H.T 
-        A.diagonal().add_(1.0) # Gamma = 1.0 hợp với Raw Features
+        A.diagonal().add_(1.0) 
 
         try:
             B = torch.linalg.solve(A, torch.eye(A.shape[0], device=self.device))
@@ -315,9 +333,10 @@ class MiNbaseNet(nn.Module):
         self.R.sub_(K @ RHt) 
         self.weight.add_(K @ (Y_total - (H @ self.weight)))
 
-        del X_real_backbone, X_total, Y_total, H, A, B, K
+        # Dọn dẹp sạch sẽ
+        del X_total, Y_total, H, A, B, K, RHt
         gc.collect()
-    
+        torch.cuda.empty_cache()
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
