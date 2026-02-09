@@ -176,6 +176,7 @@ class MinNet(object):
 
     
         self._network.update_fc(self.increment)
+        self.update_global_centroids(data_manger, train_list)
      
         self.fit_fc(train_loader, test_loader)
         # ----------------------------------------------------------
