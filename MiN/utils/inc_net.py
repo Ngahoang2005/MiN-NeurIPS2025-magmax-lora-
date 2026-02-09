@@ -263,16 +263,7 @@ class MiNbaseNet(nn.Module):
         # [TỐC ĐỘ]: Đưa ma trận R và Weight lên GPU
         if self.R.device != self.device: self.R = self.R.to(self.device)
         self.weight = self.weight.to(self.device)
-        
-        # Expand Weight nếu cần
-        num_targets = Y_total.shape[1]
-        if num_targets > self.weight.shape[1]:
-            diff = num_targets - self.weight.shape[1]
-            tail = torch.zeros((self.weight.shape[0], diff), device=self.device)
-            self.weight = torch.cat((self.weight, tail), dim=1)
-
-        # CHUNK VỪA PHẢI (Để GPU tính nhanh mà không OOM)
-        # GPU tính ma trận cực nhanh nên chunk 512-1024 là đẹp
+    
         BATCH_CHUNK = 1024 
         total_samples = X_total.shape[0]
 
