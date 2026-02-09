@@ -520,9 +520,9 @@ class MinNet(object):
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
+        train_loader = DataLoader(train_set, batch_size=512, shuffle=True,
                                   num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
+        test_loader = DataLoader(test_set, batch_size=512, shuffle=False,
                                  num_workers=self.num_workers)
 
         self.test_loader = test_loader

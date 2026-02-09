@@ -225,13 +225,23 @@ class MiNbaseNet(nn.Module):
         # Sinh mẫu giả
         if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
             available_new_classes = list(new_class_samples_dict.keys())
-            num_new_samples = X_real_backbone.shape[0]
-            num_new_classes = len(available_new_classes)
-            if num_new_classes > 0:
-                samples_per_old = int(num_new_samples / num_new_classes)
-            else:
-                samples_per_old = 1
-            samples_per_old = max(1, min(samples_per_old, 50)) # Giới hạn 50 mẫu
+            
+            # --- [LOGIC MỚI: DYNAMIC BALANCING] ---
+            # 1. Lấy tổng số mẫu thật đang có
+            total_real_samples = X_real_backbone.shape[0] 
+            
+            # 2. Tính số lượng mẫu giả cần sinh cho mỗi class cũ
+            # Công thức: Chia đều tổng mẫu thật cho số class cũ
+            samples_per_old = int(total_real_samples / self.prev_known_class)
+            
+            # 3. Kẹp giá trị an toàn (Không quá 500, không dưới 1)
+            # - max(1): Để đảm bảo luôn có ít nhất 1 mẫu
+            # - min(500): Để không bao giờ vượt quá số mẫu gốc (tránh lãng phí ở Task đầu)
+            samples_per_old = max(1, min(samples_per_old, 500))
+            
+            # (Optional) Log ra xem chơi
+            # print(f"Task {self.cur_task}: Generating {samples_per_old} fake samples per old class.")
+            # --------------------------------------
 
             for c_old in range(self.prev_known_class):
                 if c_old < len(self.class_means) and self.class_means[c_old] is not None:
@@ -263,7 +273,16 @@ class MiNbaseNet(nn.Module):
         # [TỐC ĐỘ]: Đưa ma trận R và Weight lên GPU
         if self.R.device != self.device: self.R = self.R.to(self.device)
         self.weight = self.weight.to(self.device)
-    
+        
+        # Expand Weight nếu cần
+        num_targets = Y_total.shape[1]
+        if num_targets > self.weight.shape[1]:
+            diff = num_targets - self.weight.shape[1]
+            tail = torch.zeros((self.weight.shape[0], diff), device=self.device)
+            self.weight = torch.cat((self.weight, tail), dim=1)
+
+        # CHUNK VỪA PHẢI (Để GPU tính nhanh mà không OOM)
+        # GPU tính ma trận cực nhanh nên chunk 512-1024 là đẹp
         BATCH_CHUNK = 1024 
         total_samples = X_total.shape[0]
 
