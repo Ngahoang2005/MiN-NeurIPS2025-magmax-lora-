@@ -191,180 +191,121 @@ class MiNbaseNet(nn.Module):
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         """
-        [FINAL VERSION]
-        - Logic: FeTrIL (Class-Specific Translation)
-        - Device: Buffer @ GPU | RLS Math @ CPU
-        - Speed: Chunking 4096
+        Phiên bản TỐC ĐỘ CAO (GPU Accelerated).
+        Đưa ma trận R lên GPU để tính toán thay vì CPU chậm chạp.
         """
-        
-        # -------------------------------------------------------
-        # BƯỚC 0: FEATURE EXTRACTION (Chỉ chạy Backbone, chưa qua Buffer)
-        # -------------------------------------------------------
+        # 1. Feature Extraction
         with torch.no_grad():
-            # Tắt autocast để đảm bảo ra float32 chuẩn
-            try: from torch.cuda.amp import autocast
-            except: pass
-            
             if X.device != self.device: X = X.to(self.device)
-            
-            # Lấy Feature gốc (ví dụ 768 chiều)
             features_backbone = self.backbone(X) 
-        
-        # Đưa về CPU để xử lý FeTrIL và RLS (Tiết kiệm VRAM)
+
+        # Đưa về CPU tạm để xử lý FeTrIL (đỡ tốn VRAM lúc sinh mẫu)
         X_real_backbone = features_backbone.cpu().float()
         Y_cpu_all = Y.cpu().float()
-        
-        # Dọn rác GPU ngay
         del X, features_backbone, Y
 
         # -------------------------------------------------------
-        # BƯỚC 1: CẬP NHẬT THỐNG KÊ & CHUẨN BỊ SEED
+        # BƯỚC 1 & 2: SINH MẪU GIẢ (Giữ nguyên logic FeTrIL)
         # -------------------------------------------------------
-        new_class_samples_dict = {} # Lưu mẫu class mới để làm "xác" cho FeTrIL
-
+        new_class_samples_dict = {}
         if self.training:
-            # Khởi tạo list lưu trữ nếu chưa có
             if not hasattr(self, 'class_means'): self.class_means = []
-            
             unique_classes = torch.argmax(Y_cpu_all, dim=1).unique()
             for c in unique_classes:
                 c = c.item()
-                # Mở rộng list nếu cần
                 while len(self.class_means) <= c: self.class_means.append(None)
-                
                 mask = (torch.argmax(Y_cpu_all, dim=1) == c)
                 features_c = X_real_backbone[mask]
-                
-                # 1. Lưu Mean (Ký ức)
                 self.class_means[c] = features_c.mean(dim=0).detach()
-                
-                # 2. Lưu mẫu làm Seed
                 new_class_samples_dict[c] = features_c
 
-        # -------------------------------------------------------
-        # BƯỚC 2: SINH MẪU GIẢ (FeTrIL STRATEGY)
-        # -------------------------------------------------------
         X_pseudo_list = []
         Y_pseudo_list = []
         
-        # Chỉ sinh nếu đây là Task > 0 (đã có class cũ)
+        # Sinh mẫu giả
         if self.prev_known_class > 0 and len(new_class_samples_dict) > 0:
             available_new_classes = list(new_class_samples_dict.keys())
-            
-            # Dynamic Balancing: Tính số lượng mẫu giả cần sinh
             num_new_samples = X_real_backbone.shape[0]
             num_new_classes = len(available_new_classes)
             if num_new_classes > 0:
                 samples_per_old = int(num_new_samples / num_new_classes)
             else:
                 samples_per_old = 1
-            
-            # Kẹp số lượng: Ít nhất 1, tối đa 50 (để không quá tải RAM)
-            samples_per_old = max(1, min(samples_per_old, 50))
+            samples_per_old = max(1, min(samples_per_old, 50)) # Giới hạn 50 mẫu
 
             for c_old in range(self.prev_known_class):
                 if c_old < len(self.class_means) and self.class_means[c_old] is not None:
-                    # A. Chọn ngẫu nhiên 1 class mới làm "xác" (Seed)
                     c_seed = np.random.choice(available_new_classes)
                     seed_feats = new_class_samples_dict[c_seed]
-                    
-                    # B. Lặp lại nếu thiếu
                     while seed_feats.shape[0] < samples_per_old:
                         seed_feats = torch.cat((seed_feats, seed_feats), dim=0)
                     seed_feats = seed_feats[:samples_per_old].clone()
                     
-                    # C. FeTrIL Formula: X_fake = (Seed - Mean_Seed) + Mean_Old
-                    # Dịch chuyển đám mây Seed về vị trí Class Cũ
                     mean_seed = seed_feats.mean(dim=0)
                     mean_old = self.class_means[c_old]
                     X_fake = (seed_feats - mean_seed) + mean_old
                     
-                    # D. Tạo Label One-hot
                     Y_fake = torch.zeros(samples_per_old, Y_cpu_all.shape[1])
                     Y_fake[:, c_old] = 1.0
-                    
                     X_pseudo_list.append(X_fake)
                     Y_pseudo_list.append(Y_fake)
 
         # -------------------------------------------------------
-        # BƯỚC 3: GỘP DỮ LIỆU & RLS UPDATE
+        # BƯỚC 3: GỘP & UPDATE TRÊN GPU (QUAN TRỌNG)
         # -------------------------------------------------------
         if len(X_pseudo_list) > 0:
-            # Gộp Real + Pseudo (ở không gian 768 chiều)
             X_total = torch.cat([X_real_backbone] + X_pseudo_list, dim=0)
             Y_total = torch.cat([Y_cpu_all] + Y_pseudo_list, dim=0)
         else:
             X_total = X_real_backbone
             Y_total = Y_cpu_all
 
-        # Chuẩn bị Weight & R trên CPU
-        if self.R.device.type != 'cpu': self.R = self.R.cpu()
-        weight_cpu = self.weight.cpu()
+        # [TỐC ĐỘ]: Đưa ma trận R và Weight lên GPU
+        if self.R.device != self.device: self.R = self.R.to(self.device)
+        self.weight = self.weight.to(self.device)
         
-        # [QUAN TRỌNG] Tự động mở rộng Weight nếu số class tăng
-        # Đây chính là chỗ giúp code không cần chỉnh tay bên ngoài
+        # Expand Weight nếu cần
         num_targets = Y_total.shape[1]
-        if num_targets > weight_cpu.shape[1]:
-            diff = num_targets - weight_cpu.shape[1]
-            tail = torch.zeros((weight_cpu.shape[0], diff))
-            weight_cpu = torch.cat((weight_cpu, tail), dim=1)
-        elif num_targets < weight_cpu.shape[1]:
-             # Padding Y nếu weight đã mở rộng trước đó
-             diff = weight_cpu.shape[1] - num_targets
-             tail = torch.zeros((Y_total.shape[0], diff))
-             Y_total = torch.cat((Y_total, tail), dim=1)
+        if num_targets > self.weight.shape[1]:
+            diff = num_targets - self.weight.shape[1]
+            tail = torch.zeros((self.weight.shape[0], diff), device=self.device)
+            self.weight = torch.cat((self.weight, tail), dim=1)
 
-        # -------------------------------------------------------
-        # BƯỚC 4: VÒNG LẶP RLS (Chunking GPU -> CPU)
-        # -------------------------------------------------------
-        # Dùng chunk 4096 để tính toán nhanh gấp nhiều lần so với 256
-        BATCH_CHUNK = 4096 
+        # CHUNK VỪA PHẢI (Để GPU tính nhanh mà không OOM)
+        # GPU tính ma trận cực nhanh nên chunk 512-1024 là đẹp
+        BATCH_CHUNK = 1024 
         total_samples = X_total.shape[0]
 
         for start in range(0, total_samples, BATCH_CHUNK):
             end = min(start + BATCH_CHUNK, total_samples)
             
-            # 1. Lấy batch nhỏ ở CPU (768 chiều)
-            X_batch_cpu = X_total[start:end]
-            Y_batch = Y_total[start:end]
+            # Lấy batch và đưa ngay lên GPU
+            X_batch = X_total[start:end].to(self.device)
+            Y_batch = Y_total[start:end].to(self.device)
             
-            # 2. Đẩy lên GPU để qua Buffer (TRÁNH LỖI RandomBuffer)
-            # RandomBuffer nằm yên ở GPU, ta đưa data đến chỗ nó
-            with torch.no_grad():
-                X_batch_gpu = X_batch_cpu.to(self.device)
-                
-                # Project: 768 -> 16384
-                X_batch_expanded_gpu = self.buffer(X_batch_gpu) 
-                
-                # 3. Kéo ngay về CPU để tính toán RLS (Tránh OOM)
-                X_batch_expanded = X_batch_expanded_gpu.cpu()
+            # Project (GPU)
+            X_batch_expanded = self.buffer(X_batch) 
             
-            # 4. Toán học RLS (Trên CPU)
+            # RLS Math (GPU - Siêu nhanh)
             # P = (I + X R X^T)^-1
-            term = torch.eye(X_batch_expanded.shape[0]) + X_batch_expanded @ self.R @ X_batch_expanded.T
-            jitter = 1e-6 * torch.eye(term.shape[0])
+            term = torch.eye(X_batch_expanded.shape[0], device=self.device) + X_batch_expanded @ self.R @ X_batch_expanded.T
+            jitter = 1e-6 * torch.eye(term.shape[0], device=self.device)
             
             try: 
-                # Giải hệ phương trình tuyến tính (Nhanh hơn nghịch đảo)
                 K = torch.linalg.solve(term + jitter, X_batch_expanded @ self.R)
                 K = K.T
             except: 
-                # Fallback nếu lỗi
                 K = self.R @ X_batch_expanded.T @ torch.inverse(term + jitter)
             
-            # Update R và Weight
             self.R -= K @ X_batch_expanded @ self.R
-            weight_cpu += K @ (Y_batch - X_batch_expanded @ weight_cpu)
+            self.weight += K @ (Y_batch - X_batch_expanded @ self.weight)
             
-            # Dọn rác
-            del X_batch_gpu, X_batch_expanded_gpu, term, jitter, K
+            del X_batch, Y_batch, X_batch_expanded, term, jitter, K
 
-        # Update xong đẩy weight về lại GPU để dùng cho forward
-        self.weight = weight_cpu.to(self.device)
-        
-        # Dọn sạch sẽ RAM
-        del X_real_backbone, X_total, Y_total, weight_cpu
+        # Dọn dẹp RAM CPU
+        del X_real_backbone, X_total, Y_total
         gc.collect()
+    
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
