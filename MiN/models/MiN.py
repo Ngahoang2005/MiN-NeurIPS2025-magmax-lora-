@@ -185,8 +185,9 @@ class MinNet(object):
         
         self._clear_gpu()
         self.run(train_loader_noise) # ---> HẾT LỖI
-        self.update_global_centroids(data_manger, train_list)
+        
         self._network.collect_projections(mode='threshold', val=0.95)
+        self.update_global_centroids(data_manger, train_list)
         self._clear_gpu()
 
         del train_set
