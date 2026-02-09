@@ -280,7 +280,8 @@ class MiNbaseNet(nn.Module):
             self.weight = torch.cat((self.weight, tail), dim=1)
 
         H = self.buffer(X_total) # Qua Random Project + ReLU
-        
+        zero_ratio = (H == 0).float().mean().item()
+        print(f"Sparsity: {zero_ratio:.2f}")
         # Công thức Woodbury (Dual-Form) cho tốc độ siêu nhanh trên GPU
         RHt = H @ self.R.T 
         A = RHt @ H.T 
