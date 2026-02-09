@@ -610,7 +610,25 @@ class MinNet(object):
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
-                        logits_final = logits2 + logits1
+                        if logits1.shape[1] < logits2.shape[1]:
+                            # 1. Tạo một bản copy số 0 có kích thước y hệt logits2 (cái lớn)
+                            logits1_padded = torch.zeros_like(logits2)
+                            
+                            # 2. Đổ dữ liệu cũ vào đúng vị trí các class cũ
+                            # logits1.shape[1] tự động lấy số lượng class cũ (ví dụ 10)
+                            logits1_padded[:, :logits1.shape[1]] = logits1
+                            
+                            # 3. Cộng lại: (New FC) + (Old RLS đã padding)
+                            logits_final = logits2 + logits1_padded
+                            
+                        elif logits1.shape[1] == logits2.shape[1]:
+                            # Trường hợp lý tưởng (Task 0 hoặc chiều dài bằng nhau)
+                            logits_final = logits2 + logits1
+                            
+                        else:
+                            # Trường hợp hiếm gặp: Old lớn hơn New (Lỗi logic đâu đó)
+                            # Fallback về New để không crash
+                            logits_final = logits2
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                     
