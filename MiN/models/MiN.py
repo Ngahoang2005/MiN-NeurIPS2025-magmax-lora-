@@ -322,6 +322,7 @@ class MinNet(object):
         """Hàm duy nhất được phép ghi vào self.class_means"""
         self._network.eval()
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=class_list)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
         loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=False)
         
         class_features = {c: [] for c in class_list}
