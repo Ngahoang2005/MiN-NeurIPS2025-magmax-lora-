@@ -139,68 +139,60 @@ class MiNbaseNet(nn.Module):
     #fit sinh mẫu giả
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """
-        Hàm Fit tối ưu: 
-        1. Không chuẩn hóa.
-        2. Không tính lại Mean (Truy xuất từ Global Centroids).
-        """
         self.backbone.eval()
-        # --- 1. TRÍCH XUẤT ĐẶC TRƯNG THÔ ---
+        # 1. Trích xuất đặc trưng THÔ
         f_real = self.backbone(X.to(self.device)).float().cpu()
         Y_cpu = Y.cpu().float()
+        
+        # Lấy các lớp có trong batch hiện tại (thường là các lớp của task mới)
+        unique_new = torch.argmax(Y_cpu, dim=1).unique().tolist()
 
         X_pseudo_list = []
         Y_pseudo_list = []
         
-        # --- 2. SINH MẪU GIẢ (Dùng Centroid đã tính trước ở Min.py) ---
+        # 2. Sinh mẫu giả (Chỉ tiêu thụ Centroid, không tính toán)
         if self.prev_known_class > 0:
-            unique_new = torch.argmax(Y_cpu, dim=1).unique().tolist()
-            
-            # Lấy danh sách Centroids của các lớp mới để so sánh seed
-            # (Chỉ dùng Normalize tạm thời để tính Cosine Similarity chọn Seed)
+            # Lấy danh sách means của các lớp mới để làm seed
+            # Đã đảm bảo self.class_means được lấp đầy từ Min.py
             new_means_mat = torch.stack([self.class_means[c] for c in unique_new])
             samples_per_old = max(1, min(int(f_real.shape[0] / self.prev_known_class), 500))
 
             for c_old in range(self.prev_known_class):
-                if self.class_means[c_old] is not None:
-                    mu_old = self.class_means[c_old]
-                    # Tìm Seed dựa trên hướng (Cosine) - Đây là cách chọn seed chuẩn nhất
-                    sims = torch.matmul(F.normalize(new_means_mat, p=2, dim=1), 
-                                        F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T)
-                    c_seed = unique_new[torch.argmax(sims).item()]
-                    
-                    mu_seed = self.class_means[c_seed]
-                    mask_seed = (torch.argmax(Y_cpu, dim=1) == c_seed)
-                    seed_feats = f_real[mask_seed]
-                    
-                    if seed_feats.shape[0] > 0:
-                        idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
-                        # TỊNH TIẾN THÔ (Không chuẩn hóa kết quả)
-                        f_fake = (seed_feats[idx] - mu_seed) + mu_old
-                        X_pseudo_list.append(f_fake)
-                        Y_pseudo_list.append(torch.zeros(samples_per_old, Y_cpu.shape[1]).index_fill_(1, torch.tensor(c_old), 1.0))
+                # mu_old PHẢI TỒN TẠI từ các task trước
+                mu_old = self.class_means[c_old]
+                
+                # Chọn Seed (Cosine Similarity)
+                sims = torch.matmul(F.normalize(new_means_mat, p=2, dim=1), 
+                                    F.normalize(mu_old.unsqueeze(0), p=2, dim=1).T)
+                c_seed = unique_new[torch.argmax(sims).item()]
+                
+                mu_seed = self.class_means[c_seed]
+                mask_seed = (torch.argmax(Y_cpu, dim=1) == c_seed)
+                seed_feats = f_real[mask_seed]
+                
+                if seed_feats.shape[0] > 0:
+                    idx = torch.randint(0, seed_feats.shape[0], (samples_per_old,))
+                    # Tịnh tiến Euclid: $X_{fake} = (X_{seed} - \mu_{seed}) + \mu_{old}$
+                    f_fake = (seed_feats[idx] - mu_seed) + mu_old
+                    X_pseudo_list.append(f_fake)
+                    Y_pseudo_list.append(torch.zeros(samples_per_old, Y_cpu.shape[1]).index_fill_(1, torch.tensor(c_old), 1.0))
 
-        # --- 3. GỘP & CẬP NHẬT RLS ---
+        # 3. Gộp và RLS Update (Dữ liệu THÔ)
         X_total = torch.cat([f_real] + X_pseudo_list).to(self.device)
         Y_total = torch.cat([Y_cpu] + Y_pseudo_list).to(self.device)
 
+        # Cập nhật RLS (Giữ nguyên logic của bạn)
         if Y_total.shape[1] > self.weight.shape[1]:
-            diff = Y_total.shape[1] - self.weight.shape[1]
-            self.weight = torch.cat((self.weight, torch.zeros((self.buffer_size, diff), device=self.device)), dim=1)
+            self.weight = torch.cat((self.weight, torch.zeros((self.buffer_size, Y_total.shape[1] - self.weight.shape[1]), device=self.device)), dim=1)
 
         H = self.buffer(X_total)
         RHt = H @ self.R.T 
         A = RHt @ H.T 
-        A.diagonal().add_(1.0) 
+        A.diagonal().add_(1e-6) 
         
-        try: K = RHt.T @ torch.inverse(A + 1e-7 * torch.eye(A.shape[0], device=self.device))
-        except: K = torch.linalg.solve(A, RHt).T
-
-        self.R.sub_(K @ RHt) 
+        K = RHt.T @ torch.linalg.solve(A + torch.eye(A.shape[0], device=self.device), torch.eye(A.shape[0], device=self.device))
+        self.R.sub_(K @ H @ self.R) 
         self.weight.add_(K @ (Y_total - (H @ self.weight)))
-    
-    
-    
     # --- HÀM MỚI: Weight Merging (Gọi 1 lần cuối task) ---
     def weight_merging(self, alpha=0.2):
         if self.cur_task > 0 and self.w_ref.shape[1] > 0:
