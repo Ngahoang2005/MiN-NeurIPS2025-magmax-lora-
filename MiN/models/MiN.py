@@ -319,27 +319,37 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
     def update_global_centroids(self, data_manger, class_list):
-        """Hàm duy nhất được phép ghi vào self.class_means"""
+        """Tính centroid chuẩn: Đã sửa lỗi KeyError bằng cách đồng bộ nhãn"""
         self._network.eval()
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=class_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-        loader = DataLoader(train_set, batch_size=self.init_batch_size, shuffle=False)
         
-        class_features = {c: [] for c in class_list}
+        # 1. Map nhãn trong dataset về thứ tự hệ thống (0, 1, 2...)
+        train_set.labels = self.cat2order(train_set.labels, data_manger)
+        
+        # 2. Quan trọng: Lấy danh sách các nhãn thực tế sau khi đã map
+        # Điều này đảm bảo nhãn '6' (nếu có) sẽ là một chìa khóa trong dictionary
+        unique_mapped_labels = np.unique(train_set.labels)
+        class_features = {int(c): [] for c in unique_mapped_labels}
+        
+        loader = DataLoader(train_set, batch_size=self.init_batch_size, 
+                            shuffle=False, num_workers=self.num_workers)
+        
         with torch.no_grad():
             for _, inputs, targets in loader:
                 inputs = inputs.to(self.device)
+                # Trích xuất đặc trưng THÔ (không chuẩn hóa)
                 feats = self._network.backbone(inputs).float().cpu()
+                
                 for f, t in zip(feats, targets):
                     class_features[t.item()].append(f)
 
-        for c in class_list:
-            if len(class_features[c]) > 0:
-                mean_f = torch.stack(class_features[c]).mean(dim=0)
-                # Đảm bảo mảng đủ lớn để chứa index c
+        # 3. Tính trung bình và lưu vào class_means
+        for c, features in class_features.items():
+            if len(features) > 0:
+                mean_f = torch.stack(features).mean(dim=0)
+                # Đảm bảo list class_means đủ chỗ để chứa index c
                 while len(self._network.class_means) <= c:
                     self._network.class_means.append(None)
                 self._network.class_means[c] = mean_f
             else:
-                # Nếu xảy ra dòng này, dữ liệu của bạn đang có vấn đề (lớp không có ảnh)
-                print(f"CRITICAL: Class {c} has no images in train_no_aug!")
+                print(f"Warning: Lớp {c} không có dữ liệu để tính Centroid!")
