@@ -481,7 +481,7 @@ class MinNet(object):
         self.run(train_loader)
         
         # 2. MagMax Merge (Quan trọng: Merge ngay sau khi train xong)
-        self._network.after_task_magmax_merge()
+        #self._network.after_task_magmax_merge()
         self._clear_gpu()
     
         # 3. Fit Classifier (Global FeTrIL)
@@ -532,7 +532,7 @@ class MinNet(object):
         self.run(train_loader_noise)
         
         # 2. MagMax Merge (Trộn trọng số sau khi train)
-        self._network.after_task_magmax_merge()
+        #self._network.after_task_magmax_merge()
         self._clear_gpu()
 
         del train_set
