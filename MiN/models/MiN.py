@@ -356,7 +356,6 @@
 #                 print(f"Warning: Lớp {c} không có dữ liệu để tính Centroid!")
 
 
-
 import math
 import random
 import numpy as np
@@ -389,6 +388,7 @@ class MinNet(object):
         self.logger = loger
         self._network = MiNbaseNet(args)
         self.device = args['device']
+        # Worker = 0 hoặc thấp để an toàn RAM
         self.num_workers = min(args["num_workers"], 2) 
 
         self.init_epochs = args["init_epochs"]
@@ -405,17 +405,20 @@ class MinNet(object):
         self.increment = args["increment"]
 
         self.buffer_size = args["buffer_size"]
+        self.buffer_batch = args["buffer_batch"] # (Nếu có dùng)
         self.gamma = args['gamma']
         self.fit_epoch = args["fit_epochs"]
 
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
+        self.class_acc = []
+        self.task_acc = []
         
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
-        gc.collect()
+        gc.collect() # Quan trọng: Dọn rác RAM
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -436,6 +439,7 @@ class MinNet(object):
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
         self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         
@@ -451,13 +455,20 @@ class MinNet(object):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
 
+    # =========================================================================
+    # TASK 0: KHỞI TẠO
+    # =========================================================================
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(0)
         self.logger.info("task_list: {}".format(train_list_name))
+        self.logger.info("task_order: {}".format(train_list))
 
+        # 1. Train Loader (CÓ AUGMENTATION) dùng để train Backbone
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
+        
+        # Test loader dùng để đánh giá và MƯỢN TRANSFORM
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
@@ -470,44 +481,58 @@ class MinNet(object):
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
-                param.requires_grad = True
+                param.requires_grad = True # Task 0 unfreeze hết
 
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
         self._clear_gpu()
         
-        # 1. Train Backbone
+        # --- PHASE 1: Train Backbone (Có Augmentation) ---
+        print(f"--> Task 0: Training Backbone...")
         self.run(train_loader)
         
-        # 2. MagMax Merge (Quan trọng: Merge ngay sau khi train xong)
+        # --- PHASE 2: MagMax Merge ---
+        print(f"--> Task 0: Merging Weights...")
         #self._network.after_task_magmax_merge()
         self._clear_gpu()
     
-        # 3. Fit Classifier (Global FeTrIL)
-        # Lưu ý: Dùng train_set_noaug để tính Centroid chuẩn xác hơn
-        train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        # --- PHASE 3: Fit Classifier (KHÔNG AUGMENTATION) ---
+        print(f"--> Task 0: Fitting Final Classifier (Clean Data)...")
+        
+        # [MẸO QUAN TRỌNG]: Tạo dataset mới nhưng dùng Transform của Test Set
+        # Test Set chỉ có Resize + Normalize chuẩn, không có nhiễu loạn
+        train_set_noaug = data_manger.get_task_data(source="train", class_list=train_list)
+        train_set_noaug.transform = test_set.transform # <--- COPY TRANSFORM SẠCH
         train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
         
-        rls_loader = DataLoader(train_set_noaug, batch_size=self.init_batch_size, shuffle=True,
+        # Shuffle=False để ổn định, nhưng True cũng được (vì tính Mean toàn cục)
+        rls_loader = DataLoader(train_set_noaug, batch_size=self.init_batch_size, shuffle=False,
                                 num_workers=self.num_workers)
         
-        # Gọi hàm wrapper fit_fc (bên trong sẽ gọi fit_classifier_global)
+        # Gọi hàm Global Fit
         self.fit_fc(rls_loader, test_loader)
         
         del train_set, test_set, train_set_noaug
         self._clear_gpu()
 
+    # =========================================================================
+    # TASK > 0: INCREMENTAL TRAIN
+    # =========================================================================
     def increment_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info("task_list: {}".format(train_list_name))
+        self.logger.info("task_order: {}".format(train_list))
 
+        # 1. Train Loader (CÓ AUGMENTATION)
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
+        
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
 
+        # Loader này dùng để train backbone (cần nhiễu để học tốt)
         train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.batch_size, shuffle=False,
@@ -520,66 +545,62 @@ class MinNet(object):
                 param.requires_grad = False
 
         self._network.update_fc(self.increment)
-        # self.update_global_centroids(...) -> Không cần nữa vì fit_fc mới đã tự làm
-        
-        train_loader_noise = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
         self._network.update_noise()
         
         self._clear_gpu()
         
-        # 1. Train Backbone (MagMax mode: chỉ train noise/adapter)
-        self.run(train_loader_noise)
+        # --- PHASE 1: Train Backbone (MagMax mode) ---
+        # Dùng loader có augment để tăng khả năng tổng quát hóa
+        print(f"--> Task {self.cur_task}: Training Backbone...")
+        self.run(train_loader) 
         
-        # 2. MagMax Merge (Trộn trọng số sau khi train)
+        # --- PHASE 2: MagMax Merge ---
+        print(f"--> Task {self.cur_task}: Merging Weights...")
         #self._network.after_task_magmax_merge()
         self._clear_gpu()
 
-        del train_set
-
-        # 3. Fit Classifier (Global FeTrIL)
-        # Dùng set No Augment để tính Mean và tạo Fake Data chuẩn
-        train_set_noaug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        # --- PHASE 3: Fit Classifier (Clean Data - KHÔNG AUGMENT) ---
+        print(f"--> Task {self.cur_task}: Fitting Final Classifier (Clean Data)...")
+        
+        # Tạo lại dataset sạch
+        train_set_noaug = data_manger.get_task_data(source="train", class_list=train_list)
+        # [MẸO QUAN TRỌNG]: Ép dùng transform của Test Set
+        train_set_noaug.transform = test_set.transform 
         train_set_noaug.labels = self.cat2order(train_set_noaug.labels, data_manger)
 
-        rls_loader = DataLoader(train_set_noaug, batch_size=self.batch_size, shuffle=True,
+        rls_loader = DataLoader(train_set_noaug, batch_size=self.batch_size, shuffle=False,
                                 num_workers=self.num_workers)
 
+        # Freeze backbone tuyệt đối khi tính toán Feature
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        # Gọi hàm wrapper
+        # Gọi hàm Global Fit (RLS + FeTrIL)
         self.fit_fc(rls_loader, test_loader)
         
-        del train_set_noaug, test_set
+        del train_set, train_set_noaug, test_set
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
         """
-        Đã sửa đổi: Thay vì loop batch cũ, gọi hàm Global Fit mới.
+        Gọi hàm Global Fit mới trong inc_net.py
         """
         self._network.eval()
         self._network.to(self.device)
         
-        # Gọi hàm mới trong inc_net.py (Hybrid FeTrIL + Global RLS)
         # Hàm này sẽ tự động: Tính Mean -> Sinh Fake Data -> Giải RLS 1 lần
         self._network.fit_classifier_global(train_loader)
         
         self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
-        """
-        Hàm này giờ dư thừa vì fit_fc đã làm hết việc của nó rồi.
-        Giữ lại để tránh lỗi gọi hàm nếu có, nhưng để trống (pass).
-        """
         pass 
 
+    # =========================================================================
+    # TRAINING LOOP (Backbone)
+    # =========================================================================
     def run(self, train_loader):
-        """
-        Train Backbone.
-        Vì dùng MagMax, ta không cần GPM projection ở đây.
-        """
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
@@ -607,38 +628,32 @@ class MinNet(object):
                 
                 with autocast('cuda'):
                     if self.cur_task > 0:
+                        # Kiến thức cũ (RLS Weight)
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
+                        
+                        # Kiến thức mới (Training FC)
                         logits2 = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
+                        
+                        # --- [FIX LỖI SIZE & LOGIC CỘNG] ---
                         if logits1.shape[1] < logits2.shape[1]:
-                            # 1. Tạo một bản copy số 0 có kích thước y hệt logits2 (cái lớn)
+                            # Zero Padding: Tạo bản sao 0 và điền kiến thức cũ vào
                             logits1_padded = torch.zeros_like(logits2)
-                            
-                            # 2. Đổ dữ liệu cũ vào đúng vị trí các class cũ
-                            # logits1.shape[1] tự động lấy số lượng class cũ (ví dụ 10)
                             logits1_padded[:, :logits1.shape[1]] = logits1
                             
-                            # 3. Cộng lại: (New FC) + (Old RLS đã padding)
+                            # Cộng residual: Học cái mới + nhớ cái cũ
                             logits_final = logits2 + logits1_padded
                             
                         elif logits1.shape[1] == logits2.shape[1]:
-                            # Trường hợp lý tưởng (Task 0 hoặc chiều dài bằng nhau)
                             logits_final = logits2 + logits1
-                            
                         else:
-                            # Trường hợp hiếm gặp: Old lớn hơn New (Lỗi logic đâu đó)
-                            # Fallback về New để không crash
-                            logits_final = logits2
+                            logits_final = logits2 # Fallback an toàn
                     else:
                         logits_final = self._network.forward_normal_fc(inputs, new_forward=False)['logits']
                     
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
-                
-                # --- MAGMAX MODE: KHÔNG CÓ GPM PROJECTION ---
-                # Code GPM cũ đã bị bỏ qua ở đây
-                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
@@ -651,7 +666,6 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
             info = "Task {} | Ep {}/{} | Loss {:.3f} | Acc {:.2f}".format(self.cur_task, epoch + 1, epochs, losses / len(train_loader), train_acc)
-            # self.logger.info(info) # Log nhiều quá có thể tắt bớt
             prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
 
@@ -661,7 +675,8 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
-                outputs = model(inputs)
+                # Forward inference (qua Buffer + RLS Weight)
+                outputs = model(inputs) 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
                 pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
@@ -678,6 +693,5 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
     
-    # Hàm update_global_centroids cũ có thể xóa hoặc để đó nhưng không dùng
     def update_global_centroids(self, data_manger, class_list):
         pass
