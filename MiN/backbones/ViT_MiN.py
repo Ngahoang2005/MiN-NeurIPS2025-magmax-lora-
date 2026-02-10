@@ -115,7 +115,8 @@ class PiNoise(torch.nn.Linear):
     
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+            # Code cũ: torch.zeros -> Code mới: torch.ones
+            self.weight_noise = torch.ones(len(self.mu), requires_grad=True, device=self.w_down.device)
         else:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
             weight = torch.ones(len(self.mu))
