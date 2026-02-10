@@ -21,11 +21,5 @@
   "num_workers": 0,
   "buffer_size": 16384,
   "gamma": 100,
-  "hidden_dim": 192,
-  "tukey": false,
-  "beta": 1.0,
-  "shrink": true,
-  "norm_cov": true,
-  "alpha1": 1.0,
-  "alpha2": 1.0
+  "hidden_dim": 192
 }

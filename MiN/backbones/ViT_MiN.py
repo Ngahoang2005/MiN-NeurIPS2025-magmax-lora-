@@ -61,198 +61,112 @@ class Noise_weigh(nn.Module):
         return x * self.weight
 
 
-import torch
-import torch.nn as nn
-import copy
-import gc
+class PiNoise(torch.nn.Linear):
+    def __init__(self, in_dim, out_dim, hidden_dim=384):
+        super(torch.nn.Linear, self).__init__()
 
-class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=192):
-        super(PiNoise, self).__init__()
-        
-        # --- Shared Fixed Parts (LoRA-style) ---
-        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.w_down)
-        
-        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        nn.init.xavier_uniform_(self.w_up)
-        
+        self.bias = None
+
+        self.MLP = nn.Linear(in_dim, out_dim)
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
+
+        device = torch.device("cuda:{}".format(0))
+        factory_kwargs = {"device": device, "dtype": torch.float}
+
         self.hidden_dim = hidden_dim
-        
-        # --- Trainable Parts (MagMax targets) ---
-        self.mu = nn.Linear(hidden_dim, hidden_dim)
-        self.sigma = nn.Linear(hidden_dim, hidden_dim)
-        self._init_zero(self.mu)
-        self._init_zero(self.sigma)
-        
-        # --- History for MagMax ---
-        self.history_mu = []    
-        self.history_sigma = [] 
-        
-        # --- GPM Buffers ---
-        # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
-        self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
-        
-        self.feature_cache = [] 
 
-    def _init_zero(self, module):
-        torch.nn.init.constant_(module.weight, 0.)
-        torch.nn.init.constant_(module.bias, 0.)
+        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_down)
+
+        self.reset_parameters()
+
+        self.act = nn.GELU()
+
+        self.mu = nn.ModuleList()
+        self.sigmma = nn.ModuleList()
+
+        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_up)
+        self.reset_parameters()
+
+        self.weight_noise = None
 
     def update_noise(self):
-        """Unfreeze trainable parts for new task"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
 
-    def unfreeze_task_0(self):
-        """Task 0: Train everything"""
-        for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    def unfreeze_incremental(self):
-        """Task > 0: Train noise only"""
-        self.update_noise()
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    def after_task_training(self):
-        # Snapshot
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
-        
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
-        
-        # MagMax Merge
-        self._perform_magmax_merge()
-
-    def _perform_magmax_merge(self):
-        if not self.history_mu: return
-
-        def get_merged_state(history_list):
-            keys = history_list[0].keys()
-            merged_dict = {}
-            for key in keys:
-                stacked = torch.stack([d[key] for d in history_list], dim=0)
-                magnitudes = torch.abs(stacked)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_param = torch.gather(stacked, 0, max_indices).squeeze(0)
-                merged_dict[key] = best_param.to(self.w_down.device)
-            return merged_dict
-
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
-
-    def forward(self, hyper_features, new_forward=False):
-        # 1. Down Projection
-        x_down = hyper_features @ self.w_down 
-        
-        # 2. Caching for GPM
-        if self.training:
-            # Cache vừa đủ để tính SVD, không cần quá nhiều gây OOM
-            if len(self.feature_cache) < 50: 
-                self.feature_cache.append(x_down.detach().cpu().float())
-        
-        # 3. Generate Noise
-        noise = self.mu(x_down) + self.sigma(x_down)
-        
-        # 4. Add Noise & Up Projection
-        return hyper_features + (noise @ self.w_up)
-
-    def apply_gradient_projection(self, scale=1.0):
-        """
-        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
-        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
-        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
-        """
-        if self.core_U.shape[1] == 0: return
-        
-        with torch.no_grad():
-            U = self.core_U 
-            def project_grad(weight):
-                if weight.grad is not None:
-                    g_inner = weight.grad @ U 
-                    g_proj = g_inner @ U.t()
-                    
-                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
-                    # Nhân với scale để cho phép nới lỏng ràng buộc
-                    weight.grad -= (g_proj * scale)
-
-            project_grad(self.mu.weight)
-            project_grad(self.sigma.weight)
-
-    def compute_projection_matrix(self, mode='threshold', val=0.95):
-        """
-        Tính SVD trên Covariance Matrix.
-        Args:
-            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
-            val: Epsilon hoặc Ratio tương ứng.
-        """
-        if not self.feature_cache: return
-        
-        device = 'cpu' # Tiết kiệm VRAM tối đa
-        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
-        
-        for batch in self.feature_cache:
-            b = batch.to(device)
-            if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
-            correlation_matrix += b.t() @ b
-            del b
-            
-        self.feature_cache = []
-        gc.collect()
-
-        # 2. SVD
-        try:
-            U, S, _ = torch.linalg.svd(correlation_matrix)
-        except:
-            U, S, _ = torch.svd(correlation_matrix)
-        
-        # 3. CHỌN K
-        if mode == 'eigenvalue':
-            max_s = S[0]
-            if max_s == 0: k = 0
-            else:
-                relative_S = S / max_s
-                k = (relative_S > val).sum().item()
-            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
-
-        elif mode == 'threshold':
-            total_var = torch.sum(S)
-            s_cumsum = torch.cumsum(S, dim=0)
-            k = torch.searchsorted(s_cumsum, total_var * val).item()
-            print(f"--> GPM Selection (Energy {val}): Need {k} dims.")
-            
-        else: # ratio
-            k = max(1, int(self.hidden_dim * val))
-            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
-
-        # =================================================================
-        # 4. SAFETY MARGIN (BẮT BUỘC)
-        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
-        # dù Core Space đã đầy.
-        # =================================================================
-        MARGIN = 12 
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
-        
-        # Cắt bớt nếu vượt quá trần
-        k = min(k, MAX_ALLOWED_RANK)
-        
-        # 5. Update Memory
-        U_new = U[:, :k+1].to(self.core_U.device)
-
-        if self.core_U.shape[1] == 0:
-            self.core_U = U_new
+        if len(self.mu) == 0:
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[0].weight, 0.)
+            torch.nn.init.constant_(self.mu[0].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[0].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[0].bias, 0.)
         else:
-            combined = torch.cat([self.core_U, U_new], dim=1)
-            U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[-1].weight, 0.)
+            torch.nn.init.constant_(self.mu[-1].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+    
+    def init_weight_noise(self, prototypes):
+        if len(prototypes) <= 1:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+        else:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+            weight = torch.ones(len(self.mu))
+            for i in range(len(prototypes)):
+                mu_t = prototypes[-1]
+                mu_i = prototypes[i]
+                dot_product = torch.dot(mu_t, mu_i)
+                norm_t = torch.norm(mu_t)
+                norm_i = torch.norm(mu_i)
+                s_i = dot_product / (norm_t * norm_i)
+                weight[i] = s_i.detach().clone()
+            weight = torch.softmax(weight, dim=-1)
+            self.weight_noise = weight
+            self.weight_noise.requires_grad = True
             
-            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
-            final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
-            self.core_U = U_final[:, :final_k]
+    def unfreeze_noise(self):
 
-        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
+        for param in self.mu[-1].parameters():
+            param.requires_grad = True
+        for param in self.sigmma[-1].parameters():
+            param.requires_grad = True
+
+    def forward(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+
+        x_down = hyper_features @ self.w_down
+
+        noise = None
+
+        for i in range(len(self.mu)):
+            mu = self.mu[i](x_down)
+            sigmma = self.sigmma[i](x_down)
+            if noise is None:
+                noise = (mu + sigmma) * self.weight_noise[i]
+            else:
+                noise += (mu + sigmma) * self.weight_noise[i]
+
+        noise = noise @ self.w_up
+
+        return x1 + noise + hyper_features
+
+    def forward_new(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+
+        x_down = hyper_features @ self.w_down
+
+        mu = self.mu[-1](x_down)
+        sigmma = self.sigmma[-1](x_down)
+
+        noise = (mu + sigmma) * self.weight_noise[-1]
+
+        noise = noise @ self.w_up
+
+        return x1 + noise + hyper_features
+
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
@@ -726,7 +640,7 @@ class VisionTransformer(nn.Module):
             )
             for i in range(depth)])
         self.noise_maker = nn.Sequential(*[
-            PiNoise(768, 768, 192) for i in range(depth)
+            PiNoise(768, 768, args['hidden_dim']) for i in range(depth)
         ])
         self.norm = norm_layer(embed_dim) if not use_fc_norm else nn.Identity()
 

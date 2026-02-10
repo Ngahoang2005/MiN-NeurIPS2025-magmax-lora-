@@ -4,11 +4,17 @@ import math
 import numpy as np
 import torch
 from torch import nn, Tensor
-from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from backbones.pretrained_backbone import get_pretrained_backbone
-from backbones.linears import SimpleLinear
+from backbones.linears import SimpleLinear, SplitCosineLinear, CosineLinear
+from einops.layers.torch import Rearrange, Reduce
+from einops import rearrange, reduce, repeat
+from torch.nn import functional as F
+import scipy.stats as stats
+import timm
+import random
+# [ADDED] Import autocast để kiểm soát precision thủ công
 from torch.cuda.amp import autocast 
-from torch.distributions.multivariate_normal import MultivariateNormal
 
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
@@ -51,6 +57,7 @@ class RandomBuffer(torch.nn.Linear):
         self.in_features = in_features
         self.out_features = buffer_size
         
+        # [MODIFIED] Dùng float32 thay vì double (tiết kiệm 50% VRAM)
         factory_kwargs = {"device": device, "dtype": torch.float32}
         
         self.W = torch.empty((self.in_features, self.out_features), **factory_kwargs)
@@ -58,7 +65,9 @@ class RandomBuffer(torch.nn.Linear):
 
         self.reset_parameters()
 
+    # @torch.no_grad()
     def forward(self, X: torch.Tensor) -> torch.Tensor:
+        # [ADDED] Đảm bảo input cùng kiểu với weight (tránh lỗi FP16 vs FP32)
         X = X.to(self.weight.dtype)
         return F.relu(X @ self.W)
 
@@ -69,13 +78,15 @@ class MiNbaseNet(nn.Module):
         self.args = args
         self.backbone = get_pretrained_backbone(args)
         self.device = args['device']
-        
+        # initiate params
         self.gamma = args['gamma']
         self.buffer_size = args['buffer_size']
-        self.feature_dim = self.backbone.out_dim 
+        self.feature_dim = self.backbone.out_dim  # dim of backbone
+        self.task_prototypes = []
 
         self.buffer = RandomBuffer(in_features=self.feature_dim, buffer_size=self.buffer_size, device=self.device)
 
+        # [MODIFIED] Chuyển toàn bộ sang float32
         factory_kwargs = {"device": self.device, "dtype": torch.float32}
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
@@ -85,220 +96,227 @@ class MiNbaseNet(nn.Module):
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
         self.register_buffer("R", R)
 
+        self.Pinoise_list = nn.ModuleList()
+
         self.normal_fc = None
         self.cur_task = -1
         self.known_class = 0
 
-        # [NEW] Thêm biến để lưu Mean và Covariance
-        self.class_mean = {}
-        self.class_cov = {}
+        self.fc2 = nn.ModuleList()
+        self.class_means = {} 
+        self.class_vars = {}
+
+    # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
+    def set_grad_checkpointing(self, enable=True):
+        if hasattr(self.backbone, 'set_grad_checkpointing'):
+            self.backbone.set_grad_checkpointing(enable)
+        elif hasattr(self.backbone, 'model') and hasattr(self.backbone.model, 'set_grad_checkpointing'):
+             self.backbone.model.set_grad_checkpointing(enable)
+        elif hasattr(self.backbone, 'grad_checkpointing'):
+            self.backbone.grad_checkpointing = enable
+
+    def forward_fc(self, features):
+        features = features.to(self.weight)
+        return features @ self.weight
+
+    @property
+    def in_features(self) -> int:
+        return self.weight.shape[0]
+
+    @property
+    def out_features(self) -> int:
+        return self.weight.shape[1]
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
         self.known_class += nb_classes
-        
         if self.cur_task > 0:
-            new_fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
+            fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
         else:
-            new_fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
-            
-        if self.normal_fc is not None:
-            old_nb_output = self.normal_fc.out_features
-            with torch.no_grad():
-                new_fc.weight[:old_nb_output] = self.normal_fc.weight.data
-                nn.init.constant_(new_fc.weight[old_nb_output:], 0.)
-            
+            fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
+        if self.normal_fc is None:
+            self.normal_fc = fc
+        else:
+            nn.init.constant_(fc.weight, 0.)
+
             del self.normal_fc
-            self.normal_fc = new_fc
-        else:
-            nn.init.constant_(new_fc.weight, 0.)
-            if new_fc.bias is not None:
-                nn.init.constant_(new_fc.bias, 0.)
-            self.normal_fc = new_fc
-
-    # =========================================================================
-    # [NEW SECTION] STATISTICS & PSEUDO SAMPLING
-    # =========================================================================
-    def compute_class_statistics(self, data_loader):
-        """
-        Tính toán Mean và Covariance cho các class trong task hiện tại.
-        Gọi hàm này sau khi train xong mỗi task.
-        """
-        print(f"--> [IncNet] Computing Mean & Covariance for Task {self.cur_task}...")
-        self.eval()
-        
-        # Dictionary tạm để gom features theo class
-        class_features = {}
-        
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(data_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                # Trích xuất đặc trưng từ backbone (chưa qua buffer)
-                features = self.backbone(inputs)
-                
-                for f, t in zip(features, targets):
-                    label = t.item()
-                    if label not in class_features:
-                        class_features[label] = []
-                    class_features[label].append(f.cpu())
-
-        # Tính Mean và Cov
-        for label, feats in class_features.items():
-            feats = torch.stack(feats).to(self.device) # [N, Feature_Dim]
-            
-            # Tính Mean
-            mean = torch.mean(feats, dim=0)
-            self.class_mean[label] = mean
-            
-            # Tính Covariance
-            # Lưu ý: Nếu N nhỏ feature_dim, dùng shrinked cov hoặc diagonal
-            if feats.shape[0] > 1:
-                cov = torch.cov(feats.T) # [Feature_Dim, Feature_Dim]
-                # Thêm nhiễu nhỏ vào đường chéo để tránh lỗi Singular Matrix khi sampling
-                cov = cov + torch.eye(cov.shape[0], device=self.device) * 1e-4
-            else:
-                cov = torch.eye(feats.shape[1], device=self.device) * 1e-4
-                
-            self.class_cov[label] = cov
-            
-        print(f"--> [IncNet] Updated stats for {len(class_features)} classes.")
-
-    def generate_pseudo_features(self, num_samples_per_class=1):
-        """
-        Sinh mẫu giả từ các class CŨ (các class không thuộc task hiện tại).
-        Trả về (Pseudo_Inputs, Pseudo_Labels) đã qua Buffer projection.
-        """
-        pseudo_features = []
-        pseudo_labels = []
-        
-        # Chỉ sinh mẫu cho các class đã học TRƯỚC task này
-        # (Giả sử các class mới nhất chưa cần replay ngay lúc training task đó)
-        # Hoặc sinh cho tất cả các class đã có trong self.class_mean
-        if len(self.class_mean) == 0:
-            return None, None
-
-        for label, mean in self.class_mean.items():
-            cov = self.class_cov[label]
-            
-            # Feature Replay bằng Multivariate Normal
-            # Cần try-catch vì đôi khi Cov matrix bị lỗi số học
-            try:
-                dist = MultivariateNormal(mean, covariance_matrix=cov)
-                samples = dist.sample((num_samples_per_class,))
-            except RuntimeError:
-                # Fallback nếu lỗi: dùng Mean + Standard Normal Noise
-                samples = mean.unsqueeze(0) + torch.randn(num_samples_per_class, mean.shape[0], device=self.device) * 0.1
-                
-            pseudo_features.append(samples)
-            pseudo_labels.append(torch.full((num_samples_per_class,), label, device=self.device, dtype=torch.long))
-            
-        if len(pseudo_features) == 0:
-            return None, None
-            
-        X_pseudo = torch.cat(pseudo_features, dim=0)
-        Y_pseudo = torch.cat(pseudo_labels, dim=0)
-        
-        # Quan trọng: Mẫu giả này là raw feature từ backbone.
-        # Hàm fit() sẽ tự gọi self.buffer(X), nên ta trả về raw feature ở đây là đúng.
-        return X_pseudo, Y_pseudo
-    
-    # =========================================================================
-    
-    def update_noise(self):
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].update_noise()
-
-    def after_task_magmax_merge(self):
-        print(f"--> [IncNet] Task {self.cur_task}: Triggering Parameter-wise MagMax Merging...")
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].after_task_training()
-
-    def unfreeze_noise(self):
-        for j in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[j].unfreeze_incremental()
-
-    def init_unfreeze(self):
-        for j in range(len(self.backbone.noise_maker)):
-            self.backbone.noise_maker[j].unfreeze_task_0()
-            if hasattr(self.backbone.blocks[j], 'norm1'):
-                for p in self.backbone.blocks[j].norm1.parameters(): p.requires_grad = True
-            if hasattr(self.backbone.blocks[j], 'norm2'):
-                for p in self.backbone.blocks[j].norm2.parameters(): p.requires_grad = True
-                
-        if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
-            for p in self.backbone.norm.parameters(): p.requires_grad = True
-
-    def forward_fc(self, features):
-        features = features.to(self.weight.dtype) 
-        return features @ self.weight
+            self.normal_fc = fc
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        try:
-            from torch.amp import autocast
-        except ImportError:
-            from torch.cuda.amp import autocast
+        # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
+        with autocast(enabled=False):
+            X = self.backbone(X).float() # Ép về float32
+            X = self.buffer(X) # Buffer đã sửa thành float32 ở trên
 
-        with autocast('cuda', enabled=False):
-            X = self.backbone(X).float() 
-            X = self.buffer(X) 
-            
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
             num_targets = Y.shape[1]
-            if num_targets > self.weight.shape[1]:
-                increment_size = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
+            if num_targets > self.out_features:
+                increment_size = num_targets - self.out_features
+                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
                 self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.weight.shape[1]:
-                increment_size = self.weight.shape[1] - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device)
+            elif num_targets < self.out_features:
+                increment_size = self.out_features - num_targets
+                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
                 Y = torch.cat((Y, tail), dim=1)
 
-            term = torch.eye(X.shape[0], device=X.device) + X @ self.R @ X.T
+            # [MODIFIED] Thêm Jitter để tránh Singular Matrix (vì dùng float32 kém chính xác hơn double)
+            I = torch.eye(X.shape[0]).to(X)
+            term = I + X @ self.R @ X.T
             jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
             
-            try:
-                K = torch.linalg.solve(term + jitter, X @ self.R)
-                K = K.T 
-            except:
-                K = self.R @ X.T @ torch.inverse(term + jitter)
-
-            self.R -= K @ X @ self.R
-            self.weight += K @ (Y - X @ self.weight)
+            K = torch.inverse(term + jitter)
             
-            del term, jitter, K, X, Y
+            self.R -= self.R @ X.T @ K @ X @ self.R
+            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+    @torch.no_grad()
+    def fit_features(self, features: torch.Tensor, Y: torch.Tensor) -> None:
+        # Không cần self.backbone(X) nữa vì input đã là features rồi
+        # Autocast False để tính RLS chính xác (FP32)
+        with autocast(enabled=False):
+            features = features.float() 
+            
+            # Đi qua Buffer (Quan trọng: Fake data cũng phải qua buffer)
+            features = self.buffer(features) 
 
+            X, Y = features.to(self.weight.device), Y.to(self.weight.device).float()
+
+            # Logic mở rộng weight giống hệt hàm fit cũ
+            num_targets = Y.shape[1]
+            if num_targets > self.out_features:
+                increment_size = num_targets - self.out_features
+                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+            elif num_targets < self.out_features:
+                increment_size = self.out_features - num_targets
+                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                Y = torch.cat((Y, tail), dim=1)
+
+            # RLS Update (Giống hệt cũ)
+            I = torch.eye(X.shape[0]).to(X)
+            term = I + X @ self.R @ X.T
+            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            
+            K = torch.inverse(term + jitter)
+            
+            self.R -= self.R @ X.T @ K @ X @ self.R
+            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+
+    # [THÊM] Hàm tính thống kê (Mean/Var) cho Class mới
+    @torch.no_grad()
+    def update_statistics(self, features, labels):
+        unique_classes = torch.unique(labels).tolist()
+        for c in unique_classes:
+            c = int(c)
+            mask = (labels == c)
+            feats_c = features[mask]
+            
+            # Tính Mean và Variance (dùng Var thay Cov để tiết kiệm mem)
+            mean_c = feats_c.mean(dim=0)
+            var_c = feats_c.var(dim=0)
+            
+            self.class_means[c] = mean_c.detach().cpu() # Lưu CPU cho nhẹ
+            self.class_vars[c] = var_c.detach().cpu()
+
+    # [THÊM] Hàm sinh Fake Data từ thống kê cũ
+    @torch.no_grad()
+    def generate_fake_data(self, samples_per_class=200):
+        fake_features = []
+        fake_labels = []
+        
+        # Chỉ sinh cho các class ĐÃ BIẾT từ trước (không sinh cho task hiện tại)
+        current_known = list(self.class_means.keys())
+        
+        for c in current_known:
+            # Logic: Nếu đang ở Task 1 (class 10-19), ta sinh lại class 0-9
+            # Bạn có thể thêm logic filter nếu muốn
+            
+            mean = self.class_means[c].to(self.device)
+            var = self.class_vars[c].to(self.device)
+            std = torch.sqrt(var + 1e-6)
+            
+            # Gaussian Sampling: Mean + Noise * Std
+            noise = torch.randn(samples_per_class, self.feature_dim, device=self.device)
+            f_fake = mean + noise * std
+            
+            fake_features.append(f_fake)
+            fake_labels.append(torch.full((samples_per_class,), c, device=self.device))
+            
+        if len(fake_features) > 0:
+            return torch.cat(fake_features), torch.cat(fake_labels)
+        else:
+            return None, None
+            
+    # [THÊM] Hàm reset RLS (Cần thiết khi Re-fit toàn bộ)
+    def reset_rls(self):
+        self.weight = torch.zeros((self.buffer_size, self.known_class), device=self.device)
+        self.R = torch.eye(self.buffer_size, device=self.device) / self.gamma
     def forward(self, x, new_forward: bool = False):
+        
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
+        if self.training:
+            print("!!! NOISE IS RUNNING !!!")
+        # [ADDED] Cast về dtype của weight (thường là FP16 nếu đang autocast)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
-        return {'logits': logits}
+        return {
+            'logits': logits
+        }
+    
+    def update_task_prototype(self, prototype):
+        # [MODIFIED] Lưu về CPU
+        if isinstance(prototype, torch.Tensor):
+            self.task_prototypes[-1] = prototype.detach().cpu()
+        else:
+            self.task_prototypes[-1] = prototype # Giả sử đã xử lý ở min.py
+
+    def extend_task_prototype(self, prototype):
+        # [MODIFIED] Lưu về CPU
+        if isinstance(prototype, torch.Tensor):
+            self.task_prototypes.append(prototype.detach().cpu())
+        else:
+            self.task_prototypes.append(prototype)
 
     def extract_feature(self, x):
-        return self.backbone(x)
+        hyper_features = self.backbone(x)
+        return hyper_features
 
     def forward_normal_fc(self, x, new_forward: bool = False):
+
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
         
-        hyper_features = self.buffer(hyper_features.to(self.buffer.weight.dtype))
-        hyper_features = hyper_features.to(self.normal_fc.weight.dtype)
+        # [MODIFIED] Logic ép kiểu an toàn
+        hyper_features = self.buffer(hyper_features)
+        hyper_features = hyper_features.to(self.normal_fc.weight.dtype) 
         
         logits = self.normal_fc(hyper_features)['logits']
-        return {"logits": logits}
+        return {
+            "logits": logits
+        }
 
-    def collect_projections(self, mode='threshold', val=0.95):
-        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
+    def update_noise(self):
         for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+            self.backbone.noise_maker[j].update_noise()
+            self.backbone.noise_maker[j].init_weight_noise(self.task_prototypes)
 
-    def apply_gpm_to_grads(self, scale=1.0):
+    def unfreeze_noise(self):
         for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+            self.backbone.noise_maker[j].unfreeze_noise()
+
+    def init_unfreeze(self):
+        for j in range(self.backbone.layer_num):
+            for param in self.backbone.noise_maker[j].parameters():
+                param.requires_grad = True
+            for p in self.backbone.blocks[j].norm1.parameters():
+                p.requires_grad = True
+            for p in self.backbone.blocks[j].norm2.parameters():
+                p.requires_grad = True
+        for p in self.backbone.norm.parameters():
+            p.requires_grad = True
