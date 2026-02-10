@@ -217,39 +217,47 @@ class MinNet(object):
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
+        
+        # Ngưỡng an toàn cho Backbone Forward (tùy GPU, 64-128 thường ổn với ViT-B)
+        BACKBONE_CHUNK_SIZE = 64 
 
         prog_bar = tqdm(range(self.fit_epoch))
         for _, epoch in enumerate(prog_bar):
             self._network.to(self.device)
+            
             for i, (_, inputs, targets) in enumerate(train_loader):
+                # inputs kích thước lớn (ví dụ 512)
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # [NEW] Sinh mẫu giả (Pseudo Samples) và trộn vào batch
-                if self.cur_task > 0:
-                    # Tính số lượng mẫu giả cần sinh (ví dụ: bằng 1/4 batch size)
-                    num_pseudo = max(1, inputs.shape[0] // 4)
-                    pseudo_x, pseudo_y = self._network.generate_pseudo_features(num_samples_per_class=1) 
+                # [FIX OOM] 1. Extract Features theo từng chunk nhỏ
+                real_features_list = []
+                
+                # Tắt Autocast hoàn toàn để tránh cache memory không cần thiết
+                # và dùng torch.no_grad() cho backbone để tiết kiệm VRAM tối đa
+                with torch.no_grad(): 
+                    # Chia nhỏ inputs thành các chunks
+                    input_chunks = torch.split(inputs, BACKBONE_CHUNK_SIZE)
                     
-                    if pseudo_x is not None:
-                      
-                        pass
-             
-                # TẮT AUTOCAST để tính chính xác
+                    for chunk in input_chunks:
+                        # Forward chunk qua backbone
+                        # Ép kiểu float() ngay sau khi output để giải phóng graph (dù no_grad ko tạo graph nhưng cho chắc)
+                        chunk_feat = self._network.backbone(chunk).float()
+                        real_features_list.append(chunk_feat)
+                
+                # Gộp lại thành batch lớn như cũ
+                real_features = torch.cat(real_features_list, dim=0)
+                
+                # [Replay Logic]
                 with autocast('cuda', enabled=False):
-                    # 1. Real Features
-                    real_features = self._network.backbone(inputs).float()
-                    
-                    # 2. Pseudo Features
                     pseudo_features, pseudo_labels = None, None
                     if self.cur_task > 0:
-                        # Lấy số lượng mẫu giả sao cho cân bằng hoặc tỉ lệ nhỏ
-                        # Ví dụ: Mỗi class cũ lấy 1 mẫu
+                        num_pseudo = max(1, real_features.shape[0] // 4)
                         p_x, p_y = self._network.generate_pseudo_features(num_samples_per_class=1)
                         if p_x is not None:
                             pseudo_features = p_x.float()
                             pseudo_labels = p_y
-                    
-                    # 3. Combine
+
+                    # Combine Real + Pseudo
                     if pseudo_features is not None:
                         combined_features = torch.cat([real_features, pseudo_features], dim=0)
                         combined_targets = torch.cat([targets, pseudo_labels], dim=0)
@@ -257,30 +265,41 @@ class MinNet(object):
                         combined_features = real_features
                         combined_targets = targets
                     
-                    total_classes = self._network.weight.shape[1] 
-                    # Hoặc self.known_class + self.increment nếu weight chưa expand
-                    # Nhưng fit() sẽ tự expand weight.
-                    # Ta lấy max label để tạo one-hot an toàn
+                    # One-hot encoding
+                    # Lưu ý: Cần đảm bảo weight đã đủ lớn
+                    current_dim = self._network.weight.shape[1]
                     max_label = combined_targets.max().item()
-                    current_dim = max(max_label + 1, self._network.weight.shape[1])
-                    
+                    if max_label >= current_dim:
+                         # Nếu label mới lớn hơn dim hiện tại của weight, cần expand logic bên ngoài 
+                         # hoặc dùng max_label + 1. 
+                         # Tuy nhiên fit() thường tự xử lý. Ở đây ta làm thủ công cho RLS:
+                         req_dim = max_label + 1
+                         if req_dim > current_dim:
+                             inc = req_dim - current_dim
+                             tail = torch.zeros((self._network.weight.shape[0], inc), device=self.device)
+                             self._network.weight = torch.cat((self._network.weight, tail), dim=1)
+                             current_dim = req_dim
+
                     Y_onehot = F.one_hot(combined_targets.long(), num_classes=current_dim).float()
                     
-                
-                    
+                    # 2. RLS Update (Trên toàn bộ batch lớn)
+                    # Pass qua Buffer (Random Projection)
                     X_proj = self._network.buffer(combined_features)
+                    
+                    # Dọn dẹp features gốc để tiết kiệm VRAM trước khi tính toán ma trận
+                    del real_features, combined_features, pseudo_features, real_features_list
+                    torch.cuda.empty_cache()
+
                     X_proj, Y_onehot = X_proj.to(self.device), Y_onehot.to(self.device)
                     
-                    # Expand Weight nếu cần
-                    if Y_onehot.shape[1] > self._network.weight.shape[1]:
-                        inc = Y_onehot.shape[1] - self._network.weight.shape[1]
-                        tail = torch.zeros((self._network.weight.shape[0], inc), device=self.device)
-                        self._network.weight = torch.cat((self._network.weight, tail), dim=1)
-                    
-                    # RLS Update Formula
+                    # Công thức RLS (Recursive Least Squares)
+                    # P = (I + X R X^T)^-1
                     term = torch.eye(X_proj.shape[0], device=self.device) + X_proj @ self._network.R @ X_proj.T
                     jitter = 1e-6 * torch.eye(term.shape[0], device=self.device)
+                    
                     try:
+                        # K = R X^T (X R X^T + I)^-1
+                        # Dùng linalg.solve cho ổn định: (Term) K_T = (X R) -> K = K_T.T
                         K = torch.linalg.solve(term + jitter, X_proj @ self._network.R)
                         K = K.T
                     except:
@@ -288,14 +307,15 @@ class MinNet(object):
                         
                     self._network.R -= K @ X_proj @ self._network.R
                     self._network.weight += K @ (Y_onehot - X_proj @ self._network.weight)
-            
-            info = "Task {} --> Update Analytical Classifier (w/ Replay)!".format(
+                    
+                    del term, jitter, K, X_proj, Y_onehot
+
+            info = "Task {} --> Update Analytical Classifier (w/ Chunking)!".format(
                 self.cur_task,
             )
-            self.logger.info(info)
+            # self.logger.info(info) # Log ít lại cho đỡ spam
             prog_bar.set_description(info)
             self._clear_gpu()
-
     def re_fit(self, train_loader, test_loader):
         # Tương tự fit_fc nhưng không cần Replay quá nhiều nếu chỉ là refinement
         # Hoặc copy logic fit_fc xuống đây.
