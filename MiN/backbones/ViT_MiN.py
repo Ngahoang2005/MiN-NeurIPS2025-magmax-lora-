@@ -94,6 +94,7 @@ class PiNoise(torch.nn.Linear):
         # [ADDED] Biến lưu trữ thống kê để tính Loss VIB
         self.current_mu = None
         self.current_log_var = None
+        self.noise_scale = nn.Parameter(torch.tensor(0.01))
 
     def update_noise(self):
 
@@ -136,49 +137,91 @@ class PiNoise(torch.nn.Linear):
             param.requires_grad = True
         for param in self.sigmma[-1].parameters():
             param.requires_grad = True
-    def get_vib_loss(self):
-        """
-        Tính KL(N(mu, sigma^2) || N(0, 1))
-        Loss = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
-        """
-        if self.current_mu is None or self.current_log_var is None:
-            return torch.tensor(0.0, device=self.w_down.device)
-        
-        mu = self.current_mu
-        log_var = self.current_log_var
-        
-        # Công thức KL Divergence chuẩn
-        # Sum over feature dim, mean over batch dim
-        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
-        return kl_loss.mean()
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
 
+        # --- Phần tính toán Noise Accumulation (Giữ nguyên logic của bạn) ---
+        total_mu = 0.0
+        total_var = 0.0
         noise_accumulated = None
 
+        if self.weight_noise is not None:
+            weights = self.weight_noise
+        else:
+            weights = torch.ones(len(self.mu), device=hyper_features.device) / len(self.mu)
+
         for i in range(len(self.mu)):
-            # Lấy tham số phân phối
-            mu = self.mu[i](x_down)
-            log_var = self.sigmma[i](x_down)
+            mu_i = self.mu[i](x_down)
+            log_var_i = self.sigmma[i](x_down)
             
-            # [MODIFIED] Reparameterization Trick
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            
-            # Tạo nhiễu ngẫu nhiên
-            noise_sample = mu + eps * std
-            
-            weight = self.weight_noise[i] if self.weight_noise is not None else 1.0/len(self.mu)
+            var_i = torch.exp(log_var_i)
+            std_i = torch.sqrt(var_i)
+            w_i = weights[i]
+
+            total_mu = total_mu + w_i * mu_i
+            total_var = total_var + (w_i ** 2) * var_i
+
+            eps = torch.randn_like(std_i)
+            noise_component = mu_i + eps * std_i
             
             if noise_accumulated is None:
-                noise_accumulated = noise_sample * weight
+                noise_accumulated = noise_component * w_i
             else:
-                noise_accumulated += noise_sample * weight
+                noise_accumulated += noise_component * w_i
+        
+        # Lưu thống kê hỗn hợp để tính Loss VIB
+        self.mix_mu = total_mu
+        self.mix_log_var = torch.log(total_var + 1e-8)
 
-        noise_out = noise_accumulated @ self.w_up
+        # --- ÁP DỤNG SCALE ---
+        # Nhân scale vào nhiễu tổng hợp
+        noise_scaled = noise_accumulated * self.noise_scale
+        
+        # Chiếu lên không gian gốc
+        noise_out = noise_scaled @ self.w_up
+
+        # ==================================================================
+        # [DEBUG PRINT] - Chỉ in khi đang train và ngẫu nhiên để đỡ spam
+        # ==================================================================
+        if self.training and torch.rand(1).item() < 0.01: # In 1% số lần gọi
+            with torch.no_grad():
+                feat_norm = torch.norm(hyper_features, p=2, dim=1).mean().item()
+                noise_norm = torch.norm(noise_out, p=2, dim=1).mean().item()
+                scale_val = self.noise_scale.item()
+                
+                print(f"\n[DEBUG NOISE] Task {len(self.mu)-1}")
+                print(f"  > Feature Norm (Signal): {feat_norm:.4f}")
+                print(f"  > Noise Norm   (Noise) : {noise_norm:.4f}")
+                print(f"  > Scale Value          : {scale_val:.6f}")
+                print(f"  > Ratio (Noise/Signal) : {noise_norm/feat_norm:.4f}")
+                if noise_norm > feat_norm:
+                    print("  !!! CẢNH BÁO: NHIỄU LỚN HƠN TÍN HIỆU !!!")
+        # ==================================================================
+
         return x1 + noise_out + hyper_features
-
+    
+    def get_vib_loss(self):
+        """
+        Tính KL Divergence cho phân phối HỖN HỢP:
+        KL( N(mix_mu, mix_var) || N(0, 1) )
+        """
+        if self.mix_mu is None or self.mix_log_var is None:
+            return torch.tensor(0.0, device=self.w_down.device)
+        
+        mu = self.mix_mu
+        log_var = self.mix_log_var
+        
+        # Công thức chuẩn: -0.5 * sum(1 + log(var) - mu^2 - var)
+        # Sum theo feature dim (dim=1), Mean theo batch
+        kl_raw = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+        
+        # Free bits (như đã bàn trước đó)
+        kl_mean = kl_raw.mean()
+        free_bits = 0.1
+        kl_loss = torch.max(kl_mean, torch.tensor(free_bits, device=kl_mean.device))
+        
+        return kl_loss
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down

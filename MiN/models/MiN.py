@@ -57,7 +57,7 @@ class MinNet(object):
         
         # [ADDED] Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
-        self.vib_beta = args.get('vib_beta', 0.01)
+        self.vib_beta = args.get('vib_beta', 0.001)
 
     def _clear_gpu(self):
         # [ADDED] Hàm dọn dẹp GPU

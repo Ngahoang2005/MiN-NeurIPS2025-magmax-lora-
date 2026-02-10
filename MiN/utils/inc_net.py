@@ -175,8 +175,7 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        if self.training:
-            print("!!! NOISE IS RUNNING !!!")
+      
         # [ADDED] Cast về dtype của weight (thường là FP16 nếu đang autocast)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
