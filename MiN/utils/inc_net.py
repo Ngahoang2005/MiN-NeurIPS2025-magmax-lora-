@@ -103,8 +103,6 @@ class MiNbaseNet(nn.Module):
         self.known_class = 0
 
         self.fc2 = nn.ModuleList()
-        self.class_means = {} 
-        self.class_vars = {}
 
     # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
     def set_grad_checkpointing(self, enable=True):
@@ -170,88 +168,7 @@ class MiNbaseNet(nn.Module):
             
             self.R -= self.R @ X.T @ K @ X @ self.R
             self.weight += self.R @ X.T @ (Y - X @ self.weight)
-    @torch.no_grad()
-    def fit_features(self, features: torch.Tensor, Y: torch.Tensor) -> None:
-        # Không cần self.backbone(X) nữa vì input đã là features rồi
-        # Autocast False để tính RLS chính xác (FP32)
-        with autocast(enabled=False):
-            features = features.float() 
-            
-            # Đi qua Buffer (Quan trọng: Fake data cũng phải qua buffer)
-            features = self.buffer(features) 
 
-            X, Y = features.to(self.weight.device), Y.to(self.weight.device).float()
-
-            # Logic mở rộng weight giống hệt hàm fit cũ
-            num_targets = Y.shape[1]
-            if num_targets > self.out_features:
-                increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.out_features:
-                increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
-
-            # RLS Update (Giống hệt cũ)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
-            
-            K = torch.inverse(term + jitter)
-            
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
-
-    # [THÊM] Hàm tính thống kê (Mean/Var) cho Class mới
-    @torch.no_grad()
-    def update_statistics(self, features, labels):
-        unique_classes = torch.unique(labels).tolist()
-        for c in unique_classes:
-            c = int(c)
-            mask = (labels == c)
-            feats_c = features[mask]
-            
-            # Tính Mean và Variance (dùng Var thay Cov để tiết kiệm mem)
-            mean_c = feats_c.mean(dim=0)
-            var_c = feats_c.var(dim=0)
-            
-            self.class_means[c] = mean_c.detach().cpu() # Lưu CPU cho nhẹ
-            self.class_vars[c] = var_c.detach().cpu()
-
-    # [THÊM] Hàm sinh Fake Data từ thống kê cũ
-    @torch.no_grad()
-    def generate_fake_data(self, samples_per_class=200):
-        fake_features = []
-        fake_labels = []
-        
-        # Chỉ sinh cho các class ĐÃ BIẾT từ trước (không sinh cho task hiện tại)
-        current_known = list(self.class_means.keys())
-        
-        for c in current_known:
-            # Logic: Nếu đang ở Task 1 (class 10-19), ta sinh lại class 0-9
-            # Bạn có thể thêm logic filter nếu muốn
-            
-            mean = self.class_means[c].to(self.device)
-            var = self.class_vars[c].to(self.device)
-            std = torch.sqrt(var + 1e-6)
-            
-            # Gaussian Sampling: Mean + Noise * Std
-            noise = torch.randn(samples_per_class, self.feature_dim, device=self.device)
-            f_fake = mean + noise * std
-            
-            fake_features.append(f_fake)
-            fake_labels.append(torch.full((samples_per_class,), c, device=self.device))
-            
-        if len(fake_features) > 0:
-            return torch.cat(fake_features), torch.cat(fake_labels)
-        else:
-            return None, None
-            
-    # [THÊM] Hàm reset RLS (Cần thiết khi Re-fit toàn bộ)
-    def reset_rls(self):
-        self.weight = torch.zeros((self.buffer_size, self.known_class), device=self.device)
-        self.R = torch.eye(self.buffer_size, device=self.device) / self.gamma
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
@@ -320,3 +237,13 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+    def get_total_vib_loss(self):
+        total_vib_loss = 0.0
+        # Duyệt qua các layer tạo noise trong backbone
+        # Giả định backbone lưu danh sách noise layers trong self.backbone.noise_maker
+        # (Theo logic code cũ của bạn)
+        if hasattr(self.backbone, 'noise_maker'):
+            for noise_layer in self.backbone.noise_maker:
+                total_vib_loss += noise_layer.get_vib_loss()
+        
+        return total_vib_loss

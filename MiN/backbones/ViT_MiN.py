@@ -91,6 +91,9 @@ class PiNoise(torch.nn.Linear):
         self.reset_parameters()
 
         self.weight_noise = None
+        # [ADDED] Biến lưu trữ thống kê để tính Loss VIB
+        self.current_mu = None
+        self.current_log_var = None
 
     def update_noise(self):
 
@@ -133,40 +136,76 @@ class PiNoise(torch.nn.Linear):
             param.requires_grad = True
         for param in self.sigmma[-1].parameters():
             param.requires_grad = True
-
+    def get_vib_loss(self):
+        """
+        Tính KL(N(mu, sigma^2) || N(0, 1))
+        Loss = -0.5 * sum(1 + log(sigma^2) - mu^2 - sigma^2)
+        """
+        if self.current_mu is None or self.current_log_var is None:
+            return torch.tensor(0.0, device=self.w_down.device)
+        
+        mu = self.current_mu
+        log_var = self.current_log_var
+        
+        # Công thức KL Divergence chuẩn
+        # Sum over feature dim, mean over batch dim
+        kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
+        return kl_loss.mean()
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
-
         x_down = hyper_features @ self.w_down
 
-        noise = None
+        noise_accumulated = None
 
         for i in range(len(self.mu)):
+            # Lấy tham số phân phối
             mu = self.mu[i](x_down)
-            sigmma = self.sigmma[i](x_down)
-            if noise is None:
-                noise = (mu + sigmma) * self.weight_noise[i]
+            log_var = self.sigmma[i](x_down)
+            
+            # [MODIFIED] Reparameterization Trick
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            
+            # Tạo nhiễu ngẫu nhiên
+            noise_sample = mu + eps * std
+            
+            weight = self.weight_noise[i] if self.weight_noise is not None else 1.0/len(self.mu)
+            
+            if noise_accumulated is None:
+                noise_accumulated = noise_sample * weight
             else:
-                noise += (mu + sigmma) * self.weight_noise[i]
+                noise_accumulated += noise_sample * weight
 
-        noise = noise @ self.w_up
-
-        return x1 + noise + hyper_features
+        noise_out = noise_accumulated @ self.w_up
+        return x1 + noise_out + hyper_features
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
-
         x_down = hyper_features @ self.w_down
 
+        # Tính tham số cho task hiện tại
         mu = self.mu[-1](x_down)
-        sigmma = self.sigmma[-1](x_down)
+        log_var = self.sigmma[-1](x_down)
 
-        noise = (mu + sigmma) * self.weight_noise[-1]
+        # [ADDED] Lưu lại để tính Loss VIB
+        self.current_mu = mu
+        self.current_log_var = log_var
 
-        noise = noise @ self.w_up
+        # [MODIFIED] Reparameterization Trick
+        if self.training:
+            std = torch.exp(0.5 * log_var)
+            eps = torch.randn_like(std)
+            noise_sample = mu + eps * std
+        else:
+            # Khi test, thường dùng mean (mu)
+            noise_sample = mu 
 
-        return x1 + noise + hyper_features
+        # Trọng số của task mới nhất (thường lớn nhất hoặc duy nhất đang train)
+        weight = self.weight_noise[-1] if self.weight_noise is not None else 1.0
+        
+        noise_out = (noise_sample * weight) @ self.w_up
 
+        return x1 + noise_out + hyper_features
 
 class Attention(nn.Module):
     fused_attn: Final[bool]

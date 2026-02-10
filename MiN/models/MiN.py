@@ -57,6 +57,7 @@ class MinNet(object):
         
         # [ADDED] Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
+        self.vib_beta = args.get('vib_beta', 0.01)
 
     def _clear_gpu(self):
         # [ADDED] Hàm dọn dẹp GPU
@@ -251,98 +252,20 @@ class MinNet(object):
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
-        
-        print(f"--> [Re-Fit] Computing Statistics & Fitting RLS (OOM-Safe Mode)...")
+        prog_bar = tqdm(train_loader)
+        for i, (_, inputs, targets) in enumerate(prog_bar):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            targets = torch.nn.functional.one_hot(targets)
+            self._network.fit(inputs, targets)
 
-        # --- BƯỚC 1: TÍNH TOÁN MEAN/VAR (ONLINE - KHÔNG LƯU FEATURE) ---
-        # Dictionary tạm để cộng dồn
-        sums = {}
-        sq_sums = {}
-        counts = {}
-        
-        # Reset RLS trước khi học (Quan trọng)
-        self._network.reset_rls()
-        
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Scanning Data")):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # 1. Extract Feature (Batch nhỏ)
-                features = self._network.extract_feature(inputs) # Feature sau backbone
-                
-                # 2. Cập nhật thống kê (Cộng dồn)
-                for c in torch.unique(targets):
-                    c = int(c.item())
-                    mask = (targets == c)
-                    feats_c = features[mask]
-                    
-                    if c not in sums:
-                        sums[c] = torch.zeros(self._network.feature_dim, device=self.device)
-                        sq_sums[c] = torch.zeros(self._network.feature_dim, device=self.device)
-                        counts[c] = 0
-                        
-                    sums[c] += feats_c.sum(dim=0)
-                    sq_sums[c] += (feats_c ** 2).sum(dim=0)
-                    counts[c] += feats_c.shape[0]
-
-                # 3. Fit RLS ngay lập tức với Feature thật (Online Fit)
-                # Không cần lưu feature thật lại, dùng xong vứt luôn
-                targets_onehot = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-                self._network.fit_features(features, targets_onehot)
-
-        # --- BƯỚC 2: CHỐT LẠI MEAN/VAR VÀ LƯU VÀO NETWORK ---
-        for c in sums.keys():
-            N = counts[c]
-            mean = sums[c] / N
-            # Var = E[X^2] - (E[X])^2
-            var = (sq_sums[c] / N) - (mean ** 2)
-            # Fix lỗi Var âm do sai số dấu phẩy động
-            var = torch.clamp(var, min=1e-6)
+            info = "Task {} --> Reupdate Analytical Classifier!".format(
+                self.cur_task,
+            )
             
-            # Lưu vào bộ nhớ của mạng (để dùng cho task sau)
-            self._network.class_means[c] = mean.cpu()
-            self._network.class_vars[c] = var.cpu()
-
-        # --- BƯỚC 3: SINH FAKE DATA TỪ TASK CŨ VÀ FIT RLS ---
-        # Bây giờ mới sinh Fake Data từ những Mean/Var đã lưu của các Task TRƯỚC
-        # (Task hiện tại đã được fit ở Bước 1 rồi, giờ chỉ cần fit thêm fake data cũ)
-        
-        current_task_classes = list(sums.keys()) # Class của task hiện tại
-        known_classes = list(self._network.class_means.keys()) # Tất cả class đã biết
-        old_classes = [c for c in known_classes if c not in current_task_classes]
-        
-        if len(old_classes) > 0:
-            print(f"--> [Re-Fit] Generating & Fitting Fake Data for {len(old_classes)} old classes...")
-            
-            # Tính số lượng mẫu cần sinh (Cân bằng với task hiện tại)
-            total_current_samples = sum(counts.values())
-            avg_samples = int(total_current_samples / len(current_task_classes))
-            samples_per_class = min(avg_samples, 200) # Giới hạn 200 mẫu/class để nhanh
-            
-            # Sinh và Fit theo từng batch nhỏ (Tránh OOM)
-            batch_size_fake = 256
-            
-            for c_old in tqdm(old_classes, desc="Fitting Fake Data"):
-                mean = self._network.class_means[c_old].to(self.device)
-                var = self._network.class_vars[c_old].to(self.device)
-                std = torch.sqrt(var)
-                
-                # Sinh từng batch nhỏ rồi Fit luôn
-                for _ in range(0, samples_per_class, batch_size_fake):
-                    current_batch_size = min(batch_size_fake, samples_per_class)
-                    
-                    # Gaussian Sampling
-                    noise = torch.randn(current_batch_size, self._network.feature_dim, device=self.device)
-                    fake_feats = mean + noise * std
-                    
-                    # Label One-hot
-                    fake_labels = torch.full((current_batch_size,), c_old, device=self.device)
-                    fake_targets = torch.nn.functional.one_hot(fake_labels, num_classes=self._network.known_class)
-                    
-                    # Fit RLS
-                    self._network.fit_features(fake_feats, fake_targets)
-        
+            self.logger.info(info)
+            prog_bar.set_description(info)
         self._clear_gpu()
+
     def run(self, train_loader):
         if self.cur_task == 0:
             epochs = self.init_epochs
@@ -372,6 +295,7 @@ class MinNet(object):
         self._network.to(self.device)
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
+            vib_losses = 0.0
             correct, total = 0, 0
 
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -389,20 +313,28 @@ class MinNet(object):
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
                         logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
+            
                         logits_final = logits2
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
+                       
                         logits_final = logits
+                    cls_loss = F.cross_entropy(logits_final, targets.long())
 
+                    # 2. [ADDED] VIB Loss (Mutual Information)
+                    # Chỉ tính khi đang train noise (Task > 0 hoặc Task 0 tùy setting)
+                    vib_loss = self._network.get_total_vib_loss()
+                    
+                    # 3. Tổng Loss
+                    loss = cls_loss + self.vib_beta * vib_loss
                 # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
                 losses += loss.item()
+                vib_losses += vib_loss.item() if isinstance(vib_loss, torch.Tensor) else vib_loss
 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
