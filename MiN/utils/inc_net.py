@@ -317,7 +317,7 @@ class MiNbaseNet(nn.Module):
             if expert_layer.bias is not None:
                 torch.nn.init.constant_(expert_layer.bias, 0.0)
             
-    print(f">>> [System] Expert {self.cur_task} unfrozen and initialized with small noise.")
+        print(f">>> [System] Expert {self.cur_task} unfrozen and initialized with small noise.")
     def init_unfreeze(self):
         for j in range(self.backbone.layer_num):
             for param in self.backbone.noise_maker[j].parameters(): param.requires_grad = True
