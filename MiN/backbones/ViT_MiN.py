@@ -39,7 +39,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch.jit import Final
-import random
 
 from timm.data import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD, \
     OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
@@ -199,39 +198,18 @@ class PiNoise(torch.nn.Linear):
         x_down = x @ self.w_down
         noise = 0
         
-        # --- DEBUG LOGIC ---
-        # Chỉ in ngẫu nhiên 0.1% số lần gọi để không spam log
-        should_debug = self.training and random.random() < 0.001 
-
         if self.active_task_idx >= 0:
+            # --- Specific Branch ---
             idx = self.active_task_idx
             if idx < len(self.mu):
-                mu_val = self.mu[idx](x_down)
-                sigma_val = self.sigmma[idx](x_down)
-                noise = mu_val + sigma_val
-                
-                if should_debug:
-                    # Kiểm tra Gradient có tồn tại không
-                    has_grad = self.mu[idx].weight.grad is not None
-                    grad_norm = self.mu[idx].weight.grad.norm().item() if has_grad else 0.0
-                    
-                    # So sánh độ lớn Noise và Tín hiệu gốc
-                    noise_mag = (noise @ self.w_up).norm(p=2).mean().item()
-                    signal_mag = x.norm(p=2).mean().item()
-                    ratio = (noise_mag / (signal_mag + 1e-8)) * 100
-                    
-                    print(f"\n[🔍 DEBUG PiNoise] Task Mode: {idx}")
-                    print(f"   - Signal Norm: {signal_mag:.4f} | Noise Norm: {noise_mag:.4f}")
-                    print(f"   - Ratio: {ratio:.4f}% (Mục tiêu: > 0.1%)")
-                    print(f"   - Gradient: {'✅ YES' if has_grad else '❌ NO'} (Norm: {grad_norm:.6f})")
-                    if not has_grad: print("   ⚠️ CẢNH BÁO: Không có Gradient! Kiểm tra Optimizer.")
-
+                noise = self.mu[idx](x_down) + self.sigmma[idx](x_down)
         else:
-            # Universal Mode (-2)
+            # --- Universal Branch ---
+            # Dùng trực tiếp trọng số đã gộp (Nhanh hơn vòng lặp cũ nhiều)
             noise = self.universal_mu(x_down) + self.universal_sigmma(x_down)
-            if should_debug: print(f"[🔍 DEBUG PiNoise] Mode: UNIVERSAL (-2)")
         
         return x_1 + (noise @ self.w_up) + x
+
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
 
