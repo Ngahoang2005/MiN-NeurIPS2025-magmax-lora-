@@ -114,6 +114,20 @@ class MinNet(object):
         for i in range(len(targets)):
             targets[i] = datamanger.map_cat2order(targets[i])
         return targets
+    def merge_noise_experts(self):
+        print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
+        
+        # 1. Truy cập vào Backbone
+        # self._network là MiNbaseNet -> .backbone là ViT
+        if hasattr(self._network.backbone, 'noise_maker'):
+            
+            # 2. Duyệt qua từng lớp PiNoise trong Backbone
+            for m in self._network.backbone.noise_maker:
+                
+                # 3. Gọi hàm merge_noise() (Hàm này nằm trong PiNoise như bạn nói)
+                m.merge_noise()
+                
+        self._clear_gpu()
 
     def init_train(self, data_manger):
         self.cur_task += 1
