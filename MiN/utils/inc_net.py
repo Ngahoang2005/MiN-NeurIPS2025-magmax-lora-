@@ -149,7 +149,8 @@ class MiNbaseNet(nn.Module):
         """Chỉ tích lũy thống kê H và Hy"""
         
         # 1. TRÍCH XUẤT FEATURE: Dùng Autocast (FP16) để tiết kiệm VRAM
-        with autocast('cuda', enabled=True):
+        # [SỬA LỖI] Bỏ tham số 'cuda', chỉ để enabled=True
+        with autocast(enabled=True):
             features = self.backbone(X)
             
         # 2. TÍNH TOÁN RLS: Cast về FP32 để đảm bảo độ chính xác đại số
@@ -172,7 +173,6 @@ class MiNbaseNet(nn.Module):
         # Tích lũy (Vẫn là FP32)
         self.H += X.T @ X 
         self.Hy += X.T @ Y
-    # -----------------------------------------------------------
     # BƯỚC 2: HÀM GIẢI (Chạy đúng 1 lần sau khi hết loader)
     # -----------------------------------------------------------
     def update_analytical_weights(self):
