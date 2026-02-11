@@ -324,6 +324,7 @@ class MinNet(object):
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
+            self._network.set_noise_mode(self.cur_task)
             
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
