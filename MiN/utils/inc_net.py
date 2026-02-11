@@ -103,6 +103,8 @@ class MiNbaseNet(nn.Module):
         self.known_class = 0
 
         self.fc2 = nn.ModuleList()
+        self.register_buffer("H", torch.zeros((self.buffer_size, self.buffer_size), **factory_kwargs))
+        self.register_buffer("Hy", torch.zeros((self.buffer_size, 0), **factory_kwargs)) # Sẽ resize khi cần
 
     # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
     def set_grad_checkpointing(self, enable=True):
@@ -140,35 +142,49 @@ class MiNbaseNet(nn.Module):
             del self.normal_fc
             self.normal_fc = fc
 
+    # [OPTIMIZED FIT] Nhanh hơn RLS cũ rất nhiều
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
-        with autocast(enabled=False):
-            X = self.backbone(X).float() # Ép về float32
-            X = self.buffer(X) # Buffer đã sửa thành float32 ở trên
+        with autocast(enabled=False): # Bắt buộc FP32 cho toán đại số
+            X = self.backbone(X).float()
+            X = self.buffer(X) # [Batch, Dim]
 
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
+            # 1. Mở rộng ma trận Hy và Weight nếu có class mới
             num_targets = Y.shape[1]
-            if num_targets > self.out_features:
-                increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.out_features:
-                increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
+            if num_targets > self.Hy.shape[1]:
+                diff = num_targets - self.Hy.shape[1]
+                self.Hy = torch.cat([self.Hy, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
+                self.weight = torch.cat([self.weight, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
 
-            # [MODIFIED] Thêm Jitter để tránh Singular Matrix (vì dùng float32 kém chính xác hơn double)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            # 2. TÍCH LŨY (Accumulate) - Rất nhanh
+            # H += X^T @ X
+            self.H += X.T @ X 
+            # Hy += X^T @ Y
+            self.Hy += X.T @ Y
+    # [NEW] Hàm chốt hạ trọng số (Gọi 1 lần sau khi chạy hết epoch)
+    def update_analytical_weights(self):
+        print(">>> [System] Solving Linear System for Weights...")
+        with autocast(enabled=False):
+            # Giải hệ phương trình: (H + lambda*I) * W = Hy
+            # W = (H + lambda*I)^-1 @ Hy
             
-            K = torch.inverse(term + jitter)
+            lambda_reg = 100.0 # Ridge regularization (Tăng lên nếu Acc thấp)
+            identity = torch.eye(self.buffer_size, device=self.device)
             
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
-
+            # Dùng cholesky_solve hoặc solve (nhanh hơn inverse trực tiếp)
+            # A = H + lambda*I
+            A = self.H + lambda_reg * identity
+            
+            try:
+                # Cách 1: Solve trực tiếp (Nhanh, ổn định)
+                self.weight = torch.linalg.solve(A, self.Hy)
+                print(">>> [System] Weights updated successfully using linalg.solve.")
+            except:
+                # Fallback: Pseudo-inverse nếu ma trận suy biến
+                print(">>> [Warning] Matrix singular, using pinverse.")
+                self.weight = torch.linalg.pinv(A) @ self.Hy
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
