@@ -301,16 +301,23 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].init_weight_noise(self.task_prototypes)
 
     def unfreeze_noise(self):
-        # Duyệt qua từng lớp Noise Maker trong Backbone
+    # Duyệt qua từng lớp Noise Maker trong Backbone
         for m in self.backbone.noise_maker:
-            # m.mu là một nn.ModuleList chứa các lớp Linear
-            # Chúng ta phải kích hoạt requires_grad cho lớp Expert hiện tại
-            expert_layer = m.mu[self.cur_task]
+            # 1. Lấy Expert hiện tại trong ModuleList
+            expert_layer = m.mu[self.cur_task] 
+            
+            # 2. KÍCH HOẠT GRADIENT
             for param in expert_layer.parameters():
                 param.requires_grad = True
                 
-        # Đừng quên kiểm tra cả init_unfreeze cho Task 0
-        print(f">>> [DEBUG] Unfrozen Expert {self.cur_task} weights.")
+            # 3. KHỞI TẠO NÓNG (Crucial Step)
+            # Khởi tạo trọng số với một lượng nhiễu cực nhỏ (Xavier hoặc Normal)
+            # Điều này giúp SGD có "đà" để tối ưu ngay từ batch đầu tiên
+            torch.nn.init.normal_(expert_layer.weight, std=0.001) 
+            if expert_layer.bias is not None:
+                torch.nn.init.constant_(expert_layer.bias, 0.0)
+            
+    print(f">>> [System] Expert {self.cur_task} unfrozen and initialized with small noise.")
     def init_unfreeze(self):
         for j in range(self.backbone.layer_num):
             for param in self.backbone.noise_maker[j].parameters(): param.requires_grad = True
