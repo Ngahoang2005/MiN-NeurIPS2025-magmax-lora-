@@ -334,3 +334,11 @@ class MiNbaseNet(nn.Module):
         self.set_noise_mode(-2) 
         if was_training: self.train()
         return {'logits': final_logits}
+    # --- DÁN VÀO TRONG CLASS MinNet ---
+    def merge_noise_experts(self):
+        print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
+        # Duyệt qua backbone để gọi hàm merge của từng lớp PiNoise
+        if hasattr(self._network.backbone, 'noise_maker'):
+            for m in self._network.backbone.noise_maker:
+                m.merge_noise()
+        self._clear_gpu()
