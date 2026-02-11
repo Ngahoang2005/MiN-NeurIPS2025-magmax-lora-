@@ -178,7 +178,7 @@ class MinNet(object):
 
     def increment_train(self, data_manger):
         self.cur_task += 1
-        train_list, test_list, _ = data_manger.get_task_list(self.cur_task)
+        train_list, test_list, train_list_name = data_manger.get_task_list(self.cur_task)
         self.logger.info(f"Task {self.cur_task} Order: {train_list}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
@@ -192,27 +192,30 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
         
-        # Fit RLS on new data first (Standard method)
+        # [SỬA LỖI QUAN TRỌNG] Phải update FC (mở rộng mạng) TRƯỚC KHI gọi fit_fc
+        # Nếu không, one_hot sẽ bị lỗi index out of bounds vì nhãn mới > số class cũ
+        self._network.update_fc(self.increment)
+        self._network.update_noise()
+
+        # 1. Fit RLS Universal (Giờ mạng đã đủ lớn để chứa class mới)
         self._network.set_noise_mode(-2)
         self.fit_fc(train_loader, test_loader)
-
-        self._network.update_fc(self.increment)
         
+        # 2. Train SGD Specific
         train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-        self._network.update_noise()
         
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader_run)
         self._network.extend_task_prototype(prototype)
         
-        self.run(train_loader_run) # Train SGD (Orthogonal Loss applied here)
+        self.run(train_loader_run) # Train SGD
         self.merge_noise_experts()
         
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader_run)
         self._network.update_task_prototype(prototype)
 
-        # Final Refit
+        # 3. Final Refit
         del train_set
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
@@ -220,11 +223,12 @@ class MinNet(object):
         
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
+            
         self._network.set_noise_mode(self.cur_task)
         self.re_fit(train_loader_clean, test_loader)
 
-        del train_set_clean, test_set; self._clear_gpu()
-    
+        del train_set_clean, test_set
+        self._clear_gpu()
     
     def fit_fc(self, train_loader, test_loader):
         self._network.eval()
