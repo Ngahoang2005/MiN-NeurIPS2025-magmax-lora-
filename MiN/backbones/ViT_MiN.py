@@ -59,47 +59,6 @@ class Noise_weigh(nn.Module):
 
     def forward(self, x):
         return x * self.weight
-def emr_merge_tensors(tensor_list):
-    """
-    Gộp danh sách các tensor trọng số bằng thuật toán Elect-Mask-Rescale (TUNA).
-    tensor_list: List các tensor [N_task, Out, In]
-    """
-    if len(tensor_list) == 0: return None
-    if len(tensor_list) == 1: return tensor_list[0].clone()
-
-    # Stack lại: [N, ...]
-    stacked = torch.stack(tensor_list, dim=0) 
-    
-    # 1. ELECT: Tìm hướng đồng thuận (Mean direction)
-    mean_param = stacked.mean(dim=0)
-    flag = (mean_param > 0).float() * 2 - 1 # Sign vector (+1 hoặc -1)
-    
-    # 2. MASK: Chỉ giữ lại tham số cùng dấu với hướng đồng thuận
-    masks = ((stacked * flag) > 0).float()
-    masked_params = stacked * masks 
-    
-    # Chọn giá trị tuyệt đối lớn nhất tại mỗi vị trí (Max Absolute)
-    param_abs = torch.abs(masked_params)
-    max_values, _ = torch.max(param_abs, dim=0)
-    unified_param = max_values * flag # Khôi phục dấu
-    
-    # 3. RESCALE: Cân bằng độ lớn (Magnitude)
-    # Tổng độ lớn trung bình ban đầu của các task
-    original_magnitude = torch.mean(torch.abs(stacked), dim=[1, 2] if len(stacked.shape) > 2 else [1])
-    original_scale = original_magnitude.sum()
-    
-    # Độ lớn của vector gộp khi chiếu ngược lại các mask cũ
-    current_scale = 0
-    for i in range(len(tensor_list)):
-        p = unified_param * masks[i]
-        current_scale += torch.mean(torch.abs(p))
-    
-    if current_scale == 0: 
-        return unified_param 
-    
-    rescaler = original_scale / (current_scale + 1e-8)
-    return unified_param * rescaler
-
 class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(torch.nn.Linear, self).__init__()
@@ -131,13 +90,6 @@ class PiNoise(torch.nn.Linear):
 
         self.weight_noise = None
         self.active_task_idx = -2
-        # [NEW] Expert Tổng Quát (Universal) - Là một mạng vật lý
-        self.universal_mu = nn.Linear(hidden_dim, hidden_dim).to(device)
-        self.universal_sigmma = nn.Linear(hidden_dim, hidden_dim).to(device)
-        
-        # Init Universal bằng 0 ban đầu
-        nn.init.zeros_(self.universal_mu.weight); nn.init.zeros_(self.universal_mu.bias)
-        nn.init.zeros_(self.universal_sigmma.weight); nn.init.zeros_(self.universal_sigmma.bias)
 
     def update_noise(self):
         # [MODIFIED] Luôn khởi tạo Expert mới về 0 (Zero Init)
@@ -148,25 +100,6 @@ class PiNoise(torch.nn.Linear):
         torch.nn.init.constant_(self.mu[-1].bias, 0.)
         torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
         torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
-    def merge_noise(self):
-        """Hàm gộp trọng số TUNA, gọi sau khi train xong"""
-        if len(self.mu) == 0: return
-
-        print(f"  -> Merging {len(self.mu)} experts via EMR...")
-        with torch.no_grad():
-            # 1. Gộp MU
-            mu_weights = [m.weight.data for m in self.mu]
-            mu_biases = [m.bias.data for m in self.mu]
-            
-            self.universal_mu.weight.copy_(emr_merge_tensors(mu_weights))
-            self.universal_mu.bias.copy_(emr_merge_tensors(mu_biases))
-
-            # 2. Gộp SIGMA
-            sigma_weights = [s.weight.data for s in self.sigmma]
-            sigma_biases = [s.bias.data for s in self.sigmma]
-            
-            self.universal_sigmma.weight.copy_(emr_merge_tensors(sigma_weights))
-            self.universal_sigmma.bias.copy_(emr_merge_tensors(sigma_biases))
     
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
@@ -193,22 +126,29 @@ class PiNoise(torch.nn.Linear):
         for param in self.sigmma[-1].parameters():
             param.requires_grad = True
 
-    def forward(self, x):
-        x_1 = self.MLP(x)
-        x_down = x @ self.w_down
-        noise = 0
-        
+    def forward(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+        x_down = hyper_features @ self.w_down
+        noise = 0 # [MODIFIED] Khởi tạo noise bằng 0
+
+        # [MODIFIED] Logic rẽ nhánh Hybrid TUNA
         if self.active_task_idx >= 0:
-            # --- Specific Branch ---
-            idx = self.active_task_idx
-            if idx < len(self.mu):
-                noise = self.mu[idx](x_down) + self.sigmma[idx](x_down)
+            # Chế độ Specific: Chỉ dùng đúng bộ Expert được chọn
+            if self.active_task_idx < len(self.mu):
+                noise = self.mu[self.active_task_idx](x_down) + self.sigmma[self.active_task_idx](x_down)
         else:
-            # --- Universal Branch ---
-            # Dùng trực tiếp trọng số đã gộp (Nhanh hơn vòng lặp cũ nhiều)
-            noise = self.universal_mu(x_down) + self.universal_sigmma(x_down)
-        
-        return x_1 + (noise @ self.w_up) + x
+            # Chế độ Universal (Gộp/Mixture): Trộn tất cả Expert bằng weight_noise
+            if self.weight_noise is not None:
+                # Đảm bảo weight_noise sum = 1
+                w = torch.softmax(self.weight_noise, dim=-1)
+                for i in range(len(self.mu)):
+                    noise += (self.mu[i](x_down) + self.sigmma[i](x_down)) * w[i]
+            else:
+                # Fallback nếu chưa có weight_noise
+                noise = self.mu[-1](x_down) + self.sigmma[-1](x_down)
+
+        noise = noise @ self.w_up
+        return x1 + noise + hyper_features
 
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
@@ -223,7 +163,6 @@ class PiNoise(torch.nn.Linear):
         noise = noise @ self.w_up
 
         return x1 + noise + hyper_features
-
 
 class Attention(nn.Module):
     fused_attn: Final[bool]

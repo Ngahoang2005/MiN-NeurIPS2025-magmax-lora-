@@ -16,7 +16,6 @@ from utils.toolkit import tensor2numpy, count_parameters
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-import matplotlib.pyplot as plt  ############# [ADDED] Để vẽ biểu đồ
 
 # [ADDED] Import Mixed Precision
 from torch.amp import autocast, GradScaler
@@ -58,12 +57,7 @@ class MinNet(object):
         
         # [ADDED] Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
-    def merge_noise_experts(self):
-        print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
-        if hasattr(self._network.backbone, 'noise_maker'):
-            for m in self._network.backbone.noise_maker:
-                m.merge_noise()
-        self._clear_gpu()
+
     def _clear_gpu(self):
         # [ADDED] Hàm dọn dẹp GPU
         gc.collect()
@@ -88,14 +82,28 @@ class MinNet(object):
         self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.analyze_entropy_accuracy(test_loader)
-        self.analyze_universal_correlation(test_loader)
         del test_set
-
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
 
+    def compute_test_acc(self, test_loader):
+        model = self._network.eval()
+        correct, total = 0, 0
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(test_loader):
+                inputs = inputs.to(self.device)
+                if self.cur_task > 0:
+                    outputs = model.forward_tuna_combined(inputs)
+                else:
+                    model.set_noise_mode(-2)
+                    outputs = model(inputs)
+                
+                logits = outputs["logits"]
+                predicts = torch.max(logits, dim=1)[1]
+                correct += (predicts.cpu() == targets).sum()
+                total += len(targets)
+        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     @staticmethod
     def cat2order(targets, datamanger):
@@ -132,9 +140,8 @@ class MinNet(object):
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
-        self._network.set_noise_mode(0)
+        self._network.set_noise_mode(-2)
         self.run(train_loader)
-        self.merge_noise_experts()
         
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
@@ -185,7 +192,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-        self._network.set_noise_mode(-2)
+
         self.fit_fc(train_loader, test_loader)
 
         self._network.update_fc(self.increment)
@@ -197,9 +204,9 @@ class MinNet(object):
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
-        self._network.set_noise_mode(self.cur_task)
+        
         self.run(train_loader)
-        self.merge_noise_experts()
+        
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
@@ -217,7 +224,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-        self._network.set_noise_mode(self.cur_task)
+
         self.re_fit(train_loader, test_loader)
 
         del train_set, test_set
@@ -289,7 +296,7 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        self._network.set_noise_mode(self.cur_task)
+        self._network.set_noise_mode(-2)
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -351,57 +358,32 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
-        
-        # [MODIFIED] Inference Loop
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
                 
+                # [MODIFIED] Logic Selection
                 if self.cur_task > 0:
-                    # Gọi hàm Hybrid (Universal + Selection)
                     outputs = model.forward_tuna_combined(inputs)
                 else:
-                    # Task 0 chưa có gộp, chạy mode Universal mặc định (hoặc mode 0)
-                    model.set_noise_mode(-2)
+                    self._network.set_noise_mode(-2)
                     outputs = model(inputs)
 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
-                pred.extend(predicts.cpu().numpy())
-                label.extend(targets.cpu().numpy())
+                pred.extend([int(predicts[i].cpu().numpy()) for i in range(predicts.shape[0])])
+                label.extend(int(targets[i].cpu().numpy()) for i in range(targets.shape[0]))
         
-        # [MODIFIED] Tính toán metrics và map key đúng định dạng cũ
         class_info = calculate_class_metrics(pred, label)
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
-        
-        # Trả về dictionary đầy đủ key để after_train không bị lỗi Key Error
         return {
-            "all_class_accy": class_info['all_accy'],  # <--- Key này quan trọng nhất
+            "all_class_accy": class_info['all_accy'],
             "class_accy": class_info['class_accy'],
             "class_confusion": class_info['class_confusion_matrices'],
             "task_accy": task_info['all_accy'],
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-
-    def compute_test_acc(self, test_loader):
-        model = self._network.eval()
-        correct, total = 0, 0
-        with torch.no_grad(), autocast('cuda'):
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                
-                if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
-                else:
-                    model.set_noise_mode(-2)
-                    outputs = model(inputs)
-
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                correct += (predicts.cpu() == targets).sum()
-                total += len(targets)
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
     # =========================================================================
     # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
     # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
@@ -434,159 +416,3 @@ class MinNet(object):
         
         self._clear_gpu()
         return prototype
-    def analyze_entropy_accuracy(self, test_loader):
-        self._network.eval()
-        all_entropies = []
-        all_correct_flags = []
-    
-        print(f">>> [DEBUG] Analyzing Entropy vs Accuracy for Task {self.cur_task}...")
-        
-        # Giới hạn mẫu để vẽ cho nhanh (lấy khoảng 500-1000 mẫu)
-        max_samples = 1000 
-        current_samples = 0
-    
-        with torch.no_grad():
-            for _, inputs, targets in tqdm(test_loader, desc="Collecting Entropy Data"):
-                if current_samples >= max_samples: break
-                
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # Chúng ta sẽ kiểm tra xem Expert của Task hiện tại hoạt động thế nào
-                # Set noise mode về task hiện tại
-                self._network.set_noise_mode(self.cur_task)
-                
-                # Forward thủ công để lấy Logits từ nhánh Specific (RLS Weights)
-                # Lưu ý: Code của bạn dùng forward_fc (RLS weights) trong forward_tuna_combined
-                feat = self._network.extract_feature(inputs)
-                feat = self._network.buffer(feat) # Qua buffer
-                logits = self._network.forward_fc(feat) # Qua RLS weights
-                
-                # Chỉ lấy các cột thuộc về task hiện tại để tính Entropy
-                # (Vì expert này chuyên trách task này)
-                # Nếu chưa có task_class_indices, ta tính trên toàn bộ output hiện có
-                # Nhưng chuẩn nhất là Mask vào các class của task đó.
-                
-                # Tính Entropy
-                prob = torch.softmax(logits, dim=1)
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                
-                # Tính Accuracy (Correct/Incorrect)
-                predicts = torch.max(logits, dim=1)[1]
-                correct = (predicts == targets).float()
-    
-                all_entropies.extend(entropy.cpu().numpy())
-                all_correct_flags.extend(correct.cpu().numpy())
-                
-                current_samples += inputs.shape[0]
-    
-        self._plot_tuna_proof(all_entropies, all_correct_flags)
-
-    def _plot_tuna_proof(self, entropies, correct_flags, num_bins=10):
-        """Vẽ biểu đồ: Trục hoành là Accuracy, Trục tung là Entropy"""
-        try:
-            entropies = np.array(entropies)
-            correct_flags = np.array(correct_flags)
-        
-            # Chia bins theo Entropy (từ thấp đến cao)
-            # Entropy thấp = Tự tin cao
-            if len(entropies) == 0: return
-
-            min_e, max_e = entropies.min(), entropies.max()
-            if min_e == max_e: max_e += 1e-5
-            
-            bin_edges = np.linspace(min_e, max_e, num_bins + 1)
-            accuracies = []
-            avg_entropies = []
-        
-            for i in range(num_bins):
-                mask = (entropies >= bin_edges[i]) & (entropies < bin_edges[i+1])
-                if mask.any():
-                    accuracies.append(correct_flags[mask].mean() * 100) # Acc %
-                    avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
-        
-            plt.figure(figsize=(8, 6))
-            plt.plot(accuracies, avg_entropies, marker='o', color='red', linewidth=2, label='Specific Expert')
-            plt.xlabel('Accuracy (%)', fontsize=12)
-            plt.ylabel('Entropy (Uncertainty)', fontsize=12)
-            plt.title(f'Debug: Entropy vs Accuracy (Task {self.cur_task})\n(Expert {self.cur_task} Confidence Analysis)', fontsize=14)
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.gca().invert_yaxis() # Đảo trục Y: Entropy thấp (Tốt) nằm ở trên
-            plt.legend()
-            
-            save_path = f'tuna_debug_task_{self.cur_task}.png'
-            plt.savefig(save_path)
-            plt.close()
-            print(f">>> [DEBUG] Biểu đồ Entropy đã lưu tại: {save_path}")
-        except Exception as e:
-            print(f">>> [ERROR] Không vẽ được biểu đồ: {e}")
-
-    # -------------------------------------------------------------------------
-    # HÀM DEBUG 2: Kiểm tra nhánh Universal (So sánh với Specific)
-    # -------------------------------------------------------------------------
-    def analyze_universal_correlation(self, test_loader):
-        self._network.eval()
-        all_entropies = []
-        all_correct_flags = []
-    
-        print(f">>> [DEBUG] Analyzing Universal Branch for Task {self.cur_task}...")
-        max_samples = 1000
-        current_samples = 0
-        
-        with torch.no_grad():
-            for _, inputs, targets in tqdm(test_loader, desc="Collecting Universal Data"):
-                if current_samples >= max_samples: break
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # Chuyển sang Universal Mode (-2)
-                self._network.set_noise_mode(-2)
-                
-                feat = self._network.extract_feature(inputs)
-                feat = self._network.buffer(feat)
-                logits = self._network.forward_fc(feat)
-                
-                prob = torch.softmax(logits, dim=1)
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                
-                predicts = torch.max(logits, dim=1)[1]
-                correct = (predicts == targets).float()
-    
-                all_entropies.extend(entropy.cpu().numpy())
-                all_correct_flags.extend(correct.cpu().numpy())
-                current_samples += inputs.shape[0]
-    
-        self._plot_universal_proof(all_entropies, all_correct_flags)
-
-    def _plot_universal_proof(self, entropies, correct_flags, num_bins=10):
-        try:
-            entropies = np.array(entropies)
-            correct_flags = np.array(correct_flags)
-            if len(entropies) == 0: return
-
-            min_e, max_e = entropies.min(), entropies.max()
-            if min_e == max_e: max_e += 1e-5
-
-            bin_edges = np.linspace(min_e, max_e, num_bins + 1)
-            accuracies = []
-            avg_entropies = []
-        
-            for i in range(num_bins):
-                mask = (entropies >= bin_edges[i]) & (entropies < bin_edges[i+1])
-                if mask.any():
-                    accuracies.append(correct_flags[mask].mean() * 100)
-                    avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
-        
-            plt.figure(figsize=(8, 6))
-            plt.plot(accuracies, avg_entropies, marker='s', color='blue', linestyle='--', linewidth=2, label='Universal')
-            plt.xlabel('Accuracy (%)', fontsize=12)
-            plt.ylabel('Entropy', fontsize=12)
-            plt.title(f'Debug: Universal Branch Analysis (Task {self.cur_task})', fontsize=14)
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.gca().invert_yaxis() 
-            plt.legend()
-            
-            save_path = f'universal_debug_task_{self.cur_task}.png'
-            plt.savefig(save_path)
-            plt.close()
-            print(f">>> [DEBUG] Biểu đồ Universal đã lưu tại: {save_path}")
-        except Exception as e:
-             print(f">>> [ERROR] Không vẽ được biểu đồ Uni: {e}")
