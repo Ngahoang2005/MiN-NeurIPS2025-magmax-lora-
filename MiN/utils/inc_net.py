@@ -143,35 +143,35 @@ class MiNbaseNet(nn.Module):
 
             del self.normal_fc
             self.normal_fc = fc
+    # [OPTIMIZED] Hybrid Precision: Backbone chạy FP16, Toán RLS chạy FP32
+    @torch.no_grad()
     def fit_batch(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """Chỉ tích lũy thống kê, KHÔNG tính nghịch đảo ở đây"""
-        with autocast(enabled=False): # Bắt buộc FP32
-            X = self.backbone(X).float()
-            X = self.buffer(X) # [Batch, Dim]
-            X, Y = X.to(self.device), Y.to(self.device).float()
-
-            # 1. Mở rộng chiều của Hy và Weight nếu gặp class mới
-            num_targets = Y.shape[1]
-            curr_cols = self.Hy.shape[1]
-            if num_targets > curr_cols:
-                diff = num_targets - curr_cols
-                zeros_hy = torch.zeros((self.buffer_size, diff), device=self.device)
-                self.Hy = torch.cat([self.Hy, zeros_hy], dim=1)
-                
-                zeros_w = torch.zeros((self.buffer_size, diff), device=self.device)
-                self.weight = torch.cat([self.weight, zeros_w], dim=1)
-
-            # 2. PHÉP TÍNH CHÍNH (Accumulate)
-            # H += X^T @ X
-            self.H += X.T @ X 
-            # Hy += X^T @ Y (cần đảm bảo Y cùng chiều với Hy hiện tại)
-            # Pad Y nếu batch này thiếu class (trường hợp hiếm nhưng cần an toàn)
-            if Y.shape[1] < self.Hy.shape[1]:
-                pad = torch.zeros((Y.shape[0], self.Hy.shape[1] - Y.shape[1]), device=self.device)
-                Y = torch.cat([Y, pad], dim=1)
+        """Chỉ tích lũy thống kê H và Hy"""
+        
+        # 1. TRÍCH XUẤT FEATURE: Dùng Autocast (FP16) để tiết kiệm VRAM
+        with autocast('cuda', enabled=True):
+            features = self.backbone(X)
             
-            self.Hy += X.T @ Y
+        # 2. TÍNH TOÁN RLS: Cast về FP32 để đảm bảo độ chính xác đại số
+        X = features.float() 
+        X = self.buffer(X) # Buffer layer
+        
+        X, Y = X.to(self.device), Y.to(self.device).float()
 
+        # Resize nếu có class mới (Logic cũ giữ nguyên)
+        if Y.shape[1] > self.Hy.shape[1]:
+            diff = Y.shape[1] - self.Hy.shape[1]
+            self.Hy = torch.cat([self.Hy, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
+            self.weight = torch.cat([self.weight, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
+        
+        # Pad Y nếu batch thiếu class
+        if Y.shape[1] < self.Hy.shape[1]:
+            pad = torch.zeros((Y.shape[0], self.Hy.shape[1] - Y.shape[1]), device=self.device)
+            Y = torch.cat([Y, pad], dim=1)
+
+        # Tích lũy (Vẫn là FP32)
+        self.H += X.T @ X 
+        self.Hy += X.T @ Y
     # -----------------------------------------------------------
     # BƯỚC 2: HÀM GIẢI (Chạy đúng 1 lần sau khi hết loader)
     # -----------------------------------------------------------
