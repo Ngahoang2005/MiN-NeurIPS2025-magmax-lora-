@@ -59,7 +59,46 @@ class Noise_weigh(nn.Module):
 
     def forward(self, x):
         return x * self.weight
+def emr_merge_tensors(tensor_list):
+    """
+    Gộp danh sách các tensor trọng số bằng thuật toán Elect-Mask-Rescale (TUNA).
+    tensor_list: List các tensor [N_task, Out, In]
+    """
+    if len(tensor_list) == 0: return None
+    if len(tensor_list) == 1: return tensor_list[0].clone()
 
+    # Stack lại: [N, ...]
+    stacked = torch.stack(tensor_list, dim=0) 
+    
+    # 1. ELECT: Tìm hướng đồng thuận (Mean direction)
+    mean_param = stacked.mean(dim=0)
+    flag = (mean_param > 0).float() * 2 - 1 # Sign vector (+1 hoặc -1)
+    
+    # 2. MASK: Chỉ giữ lại tham số cùng dấu với hướng đồng thuận
+    masks = ((stacked * flag) > 0).float()
+    masked_params = stacked * masks 
+    
+    # Chọn giá trị tuyệt đối lớn nhất tại mỗi vị trí (Max Absolute)
+    param_abs = torch.abs(masked_params)
+    max_values, _ = torch.max(param_abs, dim=0)
+    unified_param = max_values * flag # Khôi phục dấu
+    
+    # 3. RESCALE: Cân bằng độ lớn (Magnitude)
+    # Tổng độ lớn trung bình ban đầu của các task
+    original_magnitude = torch.mean(torch.abs(stacked), dim=[1, 2] if len(stacked.shape) > 2 else [1])
+    original_scale = original_magnitude.sum()
+    
+    # Độ lớn của vector gộp khi chiếu ngược lại các mask cũ
+    current_scale = 0
+    for i in range(len(tensor_list)):
+        p = unified_param * masks[i]
+        current_scale += torch.mean(torch.abs(p))
+    
+    if current_scale == 0: 
+        return unified_param 
+    
+    rescaler = original_scale / (current_scale + 1e-8)
+    return unified_param * rescaler
 
 class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
@@ -91,165 +130,73 @@ class PiNoise(torch.nn.Linear):
         self.reset_parameters()
 
         self.weight_noise = None
-        # [ADDED] Biến lưu trữ thống kê để tính Loss VIB
-        self.current_mu = None
-        self.current_log_var = None
-        self.noise_scale = nn.Parameter(torch.tensor(0.01))
-
+        self.active_task_idx = -2
+        self.universal_mu = nn.Linear(hidden_dim, hidden_dim).to(device)
+        self.universal_sigmma = nn.Linear(hidden_dim, hidden_dim).to(device)
+        nn.init.zeros_(self.universal_mu.weight); nn.init.zeros_(self.universal_mu.bias)
+        nn.init.zeros_(self.universal_sigmma.weight); nn.init.zeros_(self.universal_sigmma.bias)
     def update_noise(self):
+        # Zero Init cho Expert mới
+        self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+        self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+        
+        torch.nn.init.constant_(self.mu[-1].weight, 0.)
+        torch.nn.init.constant_(self.mu[-1].bias, 0.)
+        torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+        torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
 
-        if len(self.mu) == 0:
-            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.mu[0].weight, 0.)
-            torch.nn.init.constant_(self.mu[0].bias, 0.)
-            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.sigmma[0].weight, 0.)
-            torch.nn.init.constant_(self.sigmma[0].bias, 0.)
-        else:
-            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.mu[-1].weight, 0.)
-            torch.nn.init.constant_(self.mu[-1].bias, 0.)
-            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
-            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+    def merge_noise(self):
+        """TUNA EMR Merge"""
+        if len(self.mu) == 0: return
+        # print(f"  -> Merging {len(self.mu)} experts via EMR...")
+        with torch.no_grad():
+            mu_weights = [m.weight.data for m in self.mu]
+            mu_biases = [m.bias.data for m in self.mu]
+            self.universal_mu.weight.copy_(emr_merge_tensors(mu_weights))
+            self.universal_mu.bias.copy_(emr_merge_tensors(mu_biases))
+
+            sigma_weights = [s.weight.data for s in self.sigmma]
+            sigma_biases = [s.bias.data for s in self.sigmma]
+            self.universal_sigmma.weight.copy_(emr_merge_tensors(sigma_weights))
+            self.universal_sigmma.bias.copy_(emr_merge_tensors(sigma_biases))
     
     def init_weight_noise(self, prototypes):
-        if len(prototypes) <= 1:
-            # Code cũ: torch.zeros -> Code mới: torch.ones
-            self.weight_noise = torch.ones(len(self.mu), requires_grad=True, device=self.w_down.device)
-        else:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
-            weight = torch.ones(len(self.mu))
-            for i in range(len(prototypes)):
-                mu_t = prototypes[-1]
-                mu_i = prototypes[i]
-                dot_product = torch.dot(mu_t, mu_i)
-                norm_t = torch.norm(mu_t)
-                norm_i = torch.norm(mu_i)
-                s_i = dot_product / (norm_t * norm_i)
-                weight[i] = s_i.detach().clone()
-            weight = torch.softmax(weight, dim=-1)
-            self.weight_noise = weight
-            self.weight_noise.requires_grad = True
-            
+        pass # Không dùng mixing weight nữa
+
     def unfreeze_noise(self):
+        for param in self.mu[-1].parameters(): param.requires_grad = True
+        for param in self.sigmma[-1].parameters(): param.requires_grad = True
 
-        for param in self.mu[-1].parameters():
-            param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
-            param.requires_grad = True
-    def forward(self, hyper_features):
-        x1 = self.MLP(hyper_features)
-        x_down = hyper_features @ self.w_down
-
-        # --- Phần tính toán Noise Accumulation (Giữ nguyên logic của bạn) ---
-        total_mu = 0.0
-        total_var = 0.0
-        noise_accumulated = None
-
-        if self.weight_noise is not None:
-            weights = self.weight_noise
+    def forward(self, x):
+        x_1 = self.MLP(x)
+        x_down = x @ self.w_down
+        noise = 0
+        
+        if self.active_task_idx >= 0:
+            # --- Specific Branch (Dùng cho Train & Routing) ---
+            idx = self.active_task_idx
+            if idx < len(self.mu):
+                noise = self.mu[idx](x_down) + self.sigmma[idx](x_down)
         else:
-            weights = torch.ones(len(self.mu), device=hyper_features.device) / len(self.mu)
-
-        for i in range(len(self.mu)):
-            mu_i = self.mu[i](x_down)
-            log_var_i = self.sigmma[i](x_down)
-            
-            var_i = torch.exp(log_var_i)
-            std_i = torch.sqrt(var_i)
-            w_i = weights[i]
-
-            total_mu = total_mu + w_i * mu_i
-            total_var = total_var + (w_i ** 2) * var_i
-
-            eps = torch.randn_like(std_i)
-            noise_component = mu_i + eps * std_i
-            
-            if noise_accumulated is None:
-                noise_accumulated = noise_component * w_i
-            else:
-                noise_accumulated += noise_component * w_i
+            # --- Universal Branch (Dùng cho Base Prediction) ---
+            noise = self.universal_mu(x_down) + self.universal_sigmma(x_down)
         
-        # Lưu thống kê hỗn hợp để tính Loss VIB
-        self.mix_mu = total_mu
-        self.mix_log_var = torch.log(total_var + 1e-8)
-
-        # --- ÁP DỤNG SCALE ---
-        # Nhân scale vào nhiễu tổng hợp
-        noise_scaled = noise_accumulated * self.noise_scale
-        
-        # Chiếu lên không gian gốc
-        noise_out = noise_scaled @ self.w_up
-
-        # ==================================================================
-        # [DEBUG PRINT] - Chỉ in khi đang train và ngẫu nhiên để đỡ spam
-        # ==================================================================
-        if self.training and torch.rand(1).item() < 0.01: # In 1% số lần gọi
-            with torch.no_grad():
-                feat_norm = torch.norm(hyper_features, p=2, dim=1).mean().item()
-                noise_norm = torch.norm(noise_out, p=2, dim=1).mean().item()
-                scale_val = self.noise_scale.item()
-                
-                print(f"\n[DEBUG NOISE] Task {len(self.mu)-1}")
-                print(f"  > Feature Norm (Signal): {feat_norm:.4f}")
-                print(f"  > Noise Norm   (Noise) : {noise_norm:.4f}")
-                print(f"  > Scale Value          : {scale_val:.6f}")
-                print(f"  > Ratio (Noise/Signal) : {noise_norm/feat_norm:.4f}")
-                if noise_norm > feat_norm:
-                    print("  !!! CẢNH BÁO: NHIỄU LỚN HƠN TÍN HIỆU !!!")
-        # ==================================================================
-
-        return x1 + noise_out + hyper_features
+        return x_1 + (noise @ self.w_up) + x
     
-    def get_vib_loss(self):
-        """
-        Tính KL Divergence cho phân phối HỖN HỢP:
-        KL( N(mix_mu, mix_var) || N(0, 1) )
-        """
-        if self.mix_mu is None or self.mix_log_var is None:
-            return torch.tensor(0.0, device=self.w_down.device)
-        
-        mu = self.mix_mu
-        log_var = self.mix_log_var
-        
-        # Công thức chuẩn: -0.5 * sum(1 + log(var) - mu^2 - var)
-        # Sum theo feature dim (dim=1), Mean theo batch
-        kl_raw = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=1)
-        
-        # Free bits (như đã bàn trước đó)
-        kl_mean = kl_raw.mean()
-        free_bits = 0.1
-        kl_loss = torch.max(kl_mean, torch.tensor(free_bits, device=kl_mean.device))
-        
-        return kl_loss
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
+
         x_down = hyper_features @ self.w_down
 
-        # Tính tham số cho task hiện tại
         mu = self.mu[-1](x_down)
-        log_var = self.sigmma[-1](x_down)
+        sigmma = self.sigmma[-1](x_down)
 
-        # [ADDED] Lưu lại để tính Loss VIB
-        self.current_mu = mu
-        self.current_log_var = log_var
+        noise = (mu + sigmma) * self.weight_noise[-1]
 
-        # [MODIFIED] Reparameterization Trick
-        if self.training:
-            std = torch.exp(0.5 * log_var)
-            eps = torch.randn_like(std)
-            noise_sample = mu + eps * std
-        else:
-            # Khi test, thường dùng mean (mu)
-            noise_sample = mu 
+        noise = noise @ self.w_up
 
-        # Trọng số của task mới nhất (thường lớn nhất hoặc duy nhất đang train)
-        weight = self.weight_noise[-1] if self.weight_noise is not None else 1.0
-        
-        noise_out = (noise_sample * weight) @ self.w_up
+        return x1 + noise + hyper_features
 
-        return x1 + noise_out + hyper_features
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
