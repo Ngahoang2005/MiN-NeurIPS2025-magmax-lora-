@@ -299,7 +299,7 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        self._network.set_noise_mode(-2)
+        self._network.set_noise_mode(self.cur_task) # Train expert của task hiện tại
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct, total = 0, 0
@@ -312,6 +312,7 @@ class MinNet(object):
 
                 # [ADDED] Autocast để giảm 50% VRAM khi train
                 with autocast('cuda'):
+                    # 1. Main Loss (Cross Entropy)
                     if self.cur_task > 0:
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
@@ -319,13 +320,36 @@ class MinNet(object):
                         outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits2 = outputs2['logits']
                         logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
+                        loss_ce = F.cross_entropy(logits2, targets.long())
                         logits_final = logits2
                     else:
                         outputs = self._network.forward_normal_fc(inputs, new_forward=False)
                         logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
+                        loss_ce = F.cross_entropy(logits, targets.long())
                         logits_final = logits
+
+                    # 2. [ADDED] ORTHOGONAL LOSS
+                    loss_orth = torch.tensor(0.0, device=self.device)
+                    if self.cur_task > 0:
+                        for m in self._network.backbone.noise_maker:
+                            curr_mu = m.mu[self.cur_task].weight.flatten()
+                            # Gom các vector cũ
+                            prev_mus = []
+                            for t in range(self.cur_task):
+                                prev_mus.append(m.mu[t].weight.flatten())
+                            
+                            if len(prev_mus) > 0:
+                                prev_stack = torch.stack(prev_mus)
+                                # Normalize
+                                curr_norm = F.normalize(curr_mu.unsqueeze(0), p=2, dim=1)
+                                prev_norm = F.normalize(prev_stack, p=2, dim=1)
+                                # Cos Sim: [1, D] @ [D, N_prev] -> [1, N_prev]
+                                cos_sim = torch.mm(curr_norm, prev_norm.t())
+                                # Phạt độ tương đồng
+                                loss_orth += torch.sum(torch.abs(cos_sim))
+
+                    lambda_orth = 1.0 # Hệ số phạt (tùy chỉnh)
+                    loss = loss_ce + lambda_orth * loss_orth
 
                 # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
@@ -344,11 +368,12 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
+            info = "Task {} --> Epoch {}/{} => Loss {:.3f} (Orth {:.3f}), Acc {:.2f}%".format(
                 self.cur_task,
                 epoch + 1,
                 epochs,
                 losses / len(train_loader),
+                loss_orth.item(),
                 train_acc,
             )
             self.logger.info(info)
@@ -388,64 +413,75 @@ class MinNet(object):
             "all_task_accy": task_info['task_accy'],
         }
     # =========================================================================
-    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
-    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
+    # [MODIFIED] TÍNH CLASS PROTOTYPE THAY VÌ TASK PROTOTYPE
     # =========================================================================
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
-        features = []
         
-        # 1. Thu thập features (CHUYỂN VỀ CPU NGAY LẬP TỨC)
+        all_features = []
+        all_targets = []
+        
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
-                
-                # Dùng autocast khi extract feature để nhanh hơn
                 with autocast('cuda'):
                     feature = model.extract_feature(inputs)
                 
-                # .detach().cpu() là chìa khóa để tránh OOM
-                features.append(feature.detach().cpu())
+                all_features.append(feature.detach().cpu())
+                all_targets.append(targets.cpu())
         
-        # 2. Concat trên CPU (RAM thường lớn hơn VRAM)
-        all_features = torch.cat(features, dim=0)
+        # Concat toàn bộ
+        all_features = torch.cat(all_features, dim=0) # [N, D]
+        all_targets = torch.cat(all_targets, dim=0)   # [N]
         
-        # 3. Tính Mean (Vẫn tính trên CPU hoặc đưa về GPU nếu cần)
-        # Vì chỉ tính mean của 1 tensor lớn, đưa về GPU tính sẽ nhanh, 
-        # nhưng nếu tensor quá lớn > VRAM thì tính trên CPU luôn.
-        # Ở đây tôi để tính trên GPU cho nhanh, nếu vẫn OOM thì xóa .to(self.device)
-        prototype = torch.mean(all_features, dim=0).to(self.device)
+        # Tính Mean cho từng class có trong tập train này
+        unique_classes = torch.unique(all_targets)
+        unique_classes = unique_classes.sort()[0] # Sắp xếp để đúng thứ tự
+        
+        class_prototypes = []
+        for c in unique_classes:
+            mask = (all_targets == c)
+            class_mean = all_features[mask].mean(dim=0) # [D]
+            class_prototypes.append(class_mean)
+            
+        # Stack lại: [Num_Class, D]
+        prototypes = torch.stack(class_prototypes).to(self.device)
         
         self._clear_gpu()
-        return prototype
+        return prototypes
+
     def analyze_cosine_accuracy(self, test_loader):
         """Thu thập dữ liệu Cosine Similarity và Accuracy tương ứng"""
         self._network.eval()
         all_sims = []
         all_corrects = []
         
-        # Lấy prototype của task hiện tại để làm mốc so sánh
-        curr_proto = self._network.task_prototypes[self.cur_task].to(self.device)
-        curr_proto_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
+        # Lấy class prototypes của task hiện tại [Num_Class, D]
+        curr_protos = self._network.task_prototypes[self.cur_task].to(self.device)
+        curr_protos_norm = F.normalize(curr_protos, p=2, dim=1)
 
-        print(f">>> [DEBUG] Analyzing Cosine vs Acc for Task {self.cur_task}...")
+        print(f">>> [DEBUG] Analyzing Class-based Cosine vs Acc for Task {self.cur_task}...")
         with torch.no_grad():
             for _, inputs, targets in tqdm(test_loader, desc="Testing Bins"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # 1. Tính Similarity thực tế (trước buffer)
                 self._network.set_noise_mode(-2)
                 feat = self._network.extract_feature(inputs)
-                feat_norm = F.normalize(feat, p=2, dim=1)
-                sim = torch.mm(feat_norm, curr_proto_norm.t()).squeeze(1)
+                feat_norm = F.normalize(feat, p=2, dim=1) # [B, D]
                 
-                # 2. Lấy dự đoán từ Routing
+                # Tính Sim với tất cả class của task hiện tại
+                # [B, D] @ [D, Nc] -> [B, Nc]
+                sim_matrix = torch.mm(feat_norm, curr_protos_norm.t())
+                
+                # Lấy Max Sim (giả sử mẫu thuộc về class giống nhất trong task này)
+                max_sim, _ = sim_matrix.max(dim=1)
+                
                 outputs = self._network.forward_tuna_combined(inputs)
                 preds = outputs['logits'].argmax(dim=1)
                 correct = (preds == targets).float()
 
-                all_sims.extend(sim.cpu().numpy())
+                all_sims.extend(max_sim.cpu().numpy())
                 all_corrects.extend(correct.cpu().numpy())
 
         self._plot_cosine_acc_chart(all_sims, all_corrects)
@@ -469,9 +505,9 @@ class MinNet(object):
         plt.bar(bin_centers, acc_per_bin, width=0.08, color='skyblue', edgecolor='black', alpha=0.7)
         plt.plot(bin_centers, acc_per_bin, marker='o', color='blue', linewidth=2)
         
-        plt.xlabel('Cosine Similarity to Correct Task Prototype', fontsize=12)
+        plt.xlabel('Max Cosine Similarity to Class Prototypes', fontsize=12)
         plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title(f'Reliability: Similarity vs Acc (Task {self.cur_task})', fontsize=14)
+        plt.title(f'Reliability: Class-Sim vs Acc (Task {self.cur_task})', fontsize=14)
         plt.grid(axis='y', linestyle='--', alpha=0.6)
         plt.ylim(0, 105)
         

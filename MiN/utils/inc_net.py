@@ -103,6 +103,8 @@ class MiNbaseNet(nn.Module):
         self.known_class = 0
 
         self.fc2 = nn.ModuleList()
+        # task_prototypes sẽ là list các tensor [Num_Classes, Dim]
+        self.task_prototypes = []
 
     # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
     def set_grad_checkpointing(self, enable=True):
@@ -172,29 +174,16 @@ class MiNbaseNet(nn.Module):
             # X @ R @ X.T chính là X @ (R @ X.T) -> X @ R_XT
             # Kích thước: (Batch_Size, Batch_Size)
             term = X @ R_XT
-            
-            # [Tối ưu 3] Thêm Jitter và Identity bằng phép cộng tại chỗ (In-place)
-            # Nhanh hơn nhiều so với việc tạo ma trận I và ma trận Jitter mới rồi cộng vào
             term.diagonal().add_(1.0 + 1e-6)
 
             # Nghịch đảo (Giữ nguyên logic inverse)
             K_inv = torch.inverse(term)
 
-            # [Tối ưu 4] Tính Kalman Gain (K_gain)
-            # K_gain = R_new @ X.T = (R_old @ X.T) @ inv(term)
-            # Việc này giúp ta update weight và R mà không cần nhân lại ma trận lớn
             Gain = R_XT @ K_inv
 
-            # Update R (Covariance Matrix)
-            # Công thức gốc: R_new = R - R @ X.T @ K @ X @ R
-            # Tối ưu: R_new = R - Gain @ R_XT.T
-            # (Vì X @ R chính là transpose của R @ X.T)
             self.R -= Gain @ R_XT.T
 
-            # Update Weight
-            # Công thức gốc: W_new = W + R_new @ X.T @ (Y - X @ W)
-            # Tối ưu: W_new = W + Gain @ (Y - X @ W)
-            # (Vì Gain chính là R_new @ X.T đã tính ở trên)
+          
             self.weight += Gain @ (Y - X @ self.weight)
     def forward(self, x, new_forward: bool = False):
         
@@ -202,9 +191,7 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        if self.training:
-            print("!!! NOISE IS RUNNING !!!")
-        # [ADDED] Cast về dtype của weight (thường là FP16 nếu đang autocast)
+     
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
         return {
@@ -246,9 +233,16 @@ class MiNbaseNet(nn.Module):
         }
 
     def update_noise(self):
+        # Lấy mean của các class vectors để init noise (đơn giản hóa)
+        task_means = []
+        if len(self.task_prototypes) > 0:
+            for p in self.task_prototypes:
+                # p là [Num_Class, Dim], lấy mean thành [Dim]
+                task_means.append(p.mean(dim=0))
+        
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
-            self.backbone.noise_maker[j].init_weight_noise(self.task_prototypes)
+            self.backbone.noise_maker[j].init_weight_noise(task_means)
 
     def unfreeze_noise(self):
         for j in range(self.backbone.layer_num):
@@ -272,7 +266,7 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    # [ADDED] Logic tìm kết quả tự tin nhất (Max Logit)
+    # [ADDED] Logic Routing dựa trên CLASS SIMILARITY
     def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
@@ -286,34 +280,59 @@ class MiNbaseNet(nn.Module):
             feat_buffer = self.buffer(feat_backbone)
             logits_uni = self.forward_fc(feat_buffer)
 
-        # 2. COSINE SIMILARITY ROUTING (Chọn Expert dựa trên không gian vector)
+        # 2. CLASS-BASED COSINE ROUTING
+        # Thay vì so sánh với 1 vector task, ta so sánh với tất cả vector class của task đó
+        # và lấy Max Sim.
+        best_logits_spec = torch.zeros_like(logits_uni)
+        max_sim_values = torch.zeros((batch_size, 1), device=x.device)
         selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
+
         if num_tasks > 0:
             with torch.no_grad():
-                # Chuẩn hóa để tính Cosine nhanh
                 feat_norm = F.normalize(feat_backbone, p=2, dim=1) # [B, D]
-                all_protos = torch.stack(self.task_prototypes).to(x.device) # [N_task, D]
-                all_protos_norm = F.normalize(all_protos, p=2, dim=1)
                 
-                # Sim matrix: [B, N_task]
-                sim_matrix = torch.mm(feat_norm, all_protos_norm.t())
-                # Lấy index của Task giống nhất
-                selected_task_ids = sim_matrix.argmax(dim=1)
+                task_scores = []
+                # Duyệt qua từng task vì số lượng class mỗi task có thể khác nhau
+                for t_idx, protos in enumerate(self.task_prototypes):
+                    # protos: [Num_Class_In_Task, D]
+                    p_gpu = protos.to(x.device)
+                    p_norm = F.normalize(p_gpu, p=2, dim=1)
+                    
+                    # Sim matrix: [B, D] @ [D, Nc] -> [B, Nc]
+                    sim_c = torch.mm(feat_norm, p_norm.t())
+                    
+                    # Lấy Max Sim trong các class của task này để làm điểm của Task
+                    # [B]
+                    sim_t, _ = sim_c.max(dim=1) 
+                    task_scores.append(sim_t)
+                
+                # Stack lại: [B, Num_Tasks]
+                if len(task_scores) > 0:
+                    all_task_scores = torch.stack(task_scores, dim=1)
+                    # Chọn Task có điểm cao nhất
+                    max_sim, selected_task_ids = all_task_scores.max(dim=1)
+                    
+                    # Sim dùng làm trọng số (Weighted Ensemble)
+                    max_sim_values = F.relu(max_sim).unsqueeze(1) 
 
         # 3. SPECIFIC FORWARD (Chỉ chạy Expert cho mẫu tương ứng)
-        best_logits_spec = torch.zeros_like(logits_uni)
-        with torch.no_grad():
-            unique_tasks = selected_task_ids.unique()
-            for t in unique_tasks:
-                mask = (selected_task_ids == t)
-                self.set_noise_mode(t.item()) # Bật Expert t
-                # Re-forward Backbone chỉ cho những mẫu thuộc task t
-                feat_t = self.backbone(x[mask])
-                l_t = self.forward_fc(self.buffer(feat_t))
-                best_logits_spec[mask] = l_t
+        if num_tasks > 0:
+            with torch.no_grad():
+                unique_tasks = selected_task_ids.unique()
+                for t in unique_tasks:
+                    mask = (selected_task_ids == t)
+                    self.set_noise_mode(t.item()) # Bật Expert t
+                    
+                    # Re-forward Backbone chỉ cho những mẫu thuộc task t
+                    feat_t = self.backbone(x[mask])
+                    l_t = self.forward_fc(self.buffer(feat_t))
+                    best_logits_spec[mask] = l_t
 
-        # 4. Cộng gộp kết quả (Ensemble)
-        final_logits = logits_uni + best_logits_spec
+        # 4. Cộng gộp kết quả (Weighted Ensemble)
+        # Final = Universal + (MaxSim * Specific)
+        alpha = 1.0
+        weighted_spec = best_logits_spec * max_sim_values * alpha
+        final_logits = logits_uni + weighted_spec
 
         self.set_noise_mode(-2)
         if was_training: self.train()
