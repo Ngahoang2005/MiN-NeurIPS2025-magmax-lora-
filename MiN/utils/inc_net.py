@@ -103,10 +103,6 @@ class MiNbaseNet(nn.Module):
         self.known_class = 0
 
         self.fc2 = nn.ModuleList()
-        # Ma trận Hiệp phương sai (Covariance Matrix)
-        self.register_buffer("H", torch.zeros((self.buffer_size, self.buffer_size), **factory_kwargs))
-        # Ma trận Tương quan chéo (Cross-Correlation Vector)
-        self.register_buffer("Hy", torch.zeros((self.buffer_size, 0), **factory_kwargs))
 
     # [ADDED] Hỗ trợ Gradient Checkpointing (Cứu cánh cho OOM)
     def set_grad_checkpointing(self, enable=True):
@@ -143,58 +139,7 @@ class MiNbaseNet(nn.Module):
 
             del self.normal_fc
             self.normal_fc = fc
-    # [OPTIMIZED] Hybrid Precision: Backbone chạy FP16, Toán RLS chạy FP32
-    @torch.no_grad()
-    def fit_batch(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """Chỉ tích lũy thống kê H và Hy"""
-        
-        # 1. TRÍCH XUẤT FEATURE: Dùng Autocast (FP16) để tiết kiệm VRAM
-        # [SỬA LỖI] Bỏ tham số 'cuda', chỉ để enabled=True
-        with autocast(enabled=True):
-            features = self.backbone(X)
-            
-        # 2. TÍNH TOÁN RLS: Cast về FP32 để đảm bảo độ chính xác đại số
-        X = features.float() 
-        X = self.buffer(X) # Buffer layer
-        
-        X, Y = X.to(self.device), Y.to(self.device).float()
 
-        # Resize nếu có class mới (Logic cũ giữ nguyên)
-        if Y.shape[1] > self.Hy.shape[1]:
-            diff = Y.shape[1] - self.Hy.shape[1]
-            self.Hy = torch.cat([self.Hy, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
-            self.weight = torch.cat([self.weight, torch.zeros((self.buffer_size, diff), device=self.device)], dim=1)
-        
-        # Pad Y nếu batch thiếu class
-        if Y.shape[1] < self.Hy.shape[1]:
-            pad = torch.zeros((Y.shape[0], self.Hy.shape[1] - Y.shape[1]), device=self.device)
-            Y = torch.cat([Y, pad], dim=1)
-
-        # Tích lũy (Vẫn là FP32)
-        self.H += X.T @ X 
-        self.Hy += X.T @ Y
-    # BƯỚC 2: HÀM GIẢI (Chạy đúng 1 lần sau khi hết loader)
-    # -----------------------------------------------------------
-    def update_analytical_weights(self):
-        """Giải hệ phương trình tuyến tính: (H + lambda*I) * W = Hy"""
-        print(">>> [System] Solving Linear System for Weights (Fast RLS)...")
-        with autocast(enabled=False):
-            # Ridge Regression parameter (Tương đương với việc khởi tạo R = I/gamma cũ)
-            lambda_reg = 10.0
-            
-            I = torch.eye(self.buffer_size, device=self.device)
-            
-            # A = H + lambda*I
-            A = self.H + lambda_reg * I
-            
-            # Giải phương trình: A * W = Hy  => W = A^-1 * Hy
-            # Dùng torch.linalg.solve nhanh và ổn định hơn inverse trực tiếp
-            try:
-                self.weight = torch.linalg.solve(A, self.Hy)
-            except RuntimeError:
-                # Fallback nếu ma trận suy biến (hiếm gặp)
-                print(">>> [Warning] Singular matrix, utilizing Pseudo-Inverse.")
-                self.weight = torch.linalg.pinv(A) @ self.Hy
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
@@ -230,7 +175,9 @@ class MiNbaseNet(nn.Module):
             hyper_features = self.backbone(x, new_forward=True)
         else:
             hyper_features = self.backbone(x)
-        
+        if self.training:
+            print("!!! NOISE IS RUNNING !!!")
+        # [ADDED] Cast về dtype của weight (thường là FP16 nếu đang autocast)
         hyper_features = hyper_features.to(self.weight.dtype)
         logits = self.forward_fc(self.buffer(hyper_features))
         return {
@@ -303,56 +250,38 @@ class MiNbaseNet(nn.Module):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
-        num_tasks = len(self.task_prototypes)
+        num_tasks = len(self.backbone.noise_maker[0].mu)
         
-        # 1. Trích xuất Base Feature (Mode -2: Universal)
+        # 1. Lấy Universal Logits (Mode -2)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_backbone = self.backbone(x) # [Batch, 768]
-            feat_buffer = self.buffer(feat_backbone)
-            logits_uni = self.forward_fc(feat_buffer) # Logits nền
+            features_uni = self.backbone(x)
+            logits_uni = self.forward_fc(self.buffer(features_uni))
 
-        # 2. COSINE SIMILARITY ROUTING (Dùng Base Feature để match Task)
-        selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
-        if num_tasks > 0:
-            with torch.no_grad():
-                # Chuẩn hóa feature
-                feat_norm = F.normalize(feat_backbone, p=2, dim=1) # [B, D]
-                # Concat các prototype thành ma trận để tính nhanh
-                all_protos = torch.stack(self.task_prototypes).to(x.device) # [N_task, D]
-                all_protos_norm = F.normalize(all_protos, p=2, dim=1)
-                
-                # Sim matrix: [B, D] @ [D, N_task] -> [B, N_task]
-                sim_matrix = torch.mm(feat_norm, all_protos_norm.t())
-                # Chọn Task có Similarity cao nhất
-                selected_task_ids = sim_matrix.argmax(dim=1)
-
-        # 3. SPECIFIC INFERENCE (Chỉ forward Expert được chọn - Tối ưu 90% tốc độ)
+        # 2. Tìm Best Specific Logits dựa trên ENTROPY
         best_logits_spec = torch.zeros_like(logits_uni)
-        
-        with torch.no_grad():
-            # Duyệt qua các Task IDs xuất hiện trong batch
-            unique_tasks = selected_task_ids.unique()
-            for t in unique_tasks:
-                mask = (selected_task_ids == t)
-                # Bật đúng Expert cho task đó
-                self.set_noise_mode(t.item())
-                # Chỉ re-forward những mẫu thuộc task t
-                feat_t = self.backbone(x[mask])
-                l_t = self.forward_fc(self.buffer(feat_t))
-                best_logits_spec[mask] = l_t
+        min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
 
-        # 4. Cộng gộp (TUNA Ensemble)
+        with torch.no_grad():
+            for t in range(num_tasks):
+                self.set_noise_mode(t) # Mode Specific
+                
+                # Forward
+                l_t = self.forward_fc(self.buffer(self.backbone(x)))
+                
+                # Tính Entropy: -sum(p * log(p))
+                prob = torch.softmax(l_t, dim=1)
+                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
+                
+                # Nếu entropy thấp hơn (tự tin hơn) -> Chọn task này
+                mask = entropy < min_entropy
+                min_entropy[mask] = entropy[mask]
+                best_logits_spec[mask] = l_t[mask]
+
+        # 3. Cộng gộp kết quả: Universal + Best Specific
         final_logits = logits_uni + best_logits_spec
 
-        self.set_noise_mode(-2)
+        self.set_noise_mode(-2) # Reset về mặc định
         if was_training: self.train()
+        
         return {'logits': final_logits}
-    
-    def merge_noise_experts(self):
-        print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
-        # Duyệt qua backbone để gọi hàm merge của từng lớp PiNoise
-        if hasattr(self._network.backbone, 'noise_maker'):
-            for m in self._network.backbone.noise_maker:
-                m.merge_noise()
-        self._clear_gpu()
