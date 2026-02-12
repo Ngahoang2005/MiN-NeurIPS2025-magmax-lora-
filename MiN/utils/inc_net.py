@@ -34,7 +34,11 @@ class BaseIncNet(nn.Module):
             fc.bias.data[:nb_output] = bias
         del self.fc
         self.fc = fc
-
+        start = self.known_class
+        end = self.known_class + nb_classes
+        if not hasattr(self, 'task_class_indices'):
+            self.task_class_indices = []
+        self.task_class_indices.append(list(range(start, end)))
     @staticmethod
     def generate_fc(in_dim, out_dim):
         fc = SimpleLinear(in_dim, out_dim)
@@ -221,66 +225,83 @@ class MiNbaseNet(nn.Module):
                 m.active_task_idx = mode
 
     # [FIXED] Dùng mode -2 cho Uni khi Infer và kết hợp với Expert, dùng expert để tính prototype
+    # [FIXED LOGIC] Single Pass Expert Routing + Logit Masking
     def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # 1. Universal (Mode -2) - Vẫn giữ để làm nền tảng
+        # 1. Universal (Nền tảng)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_backbone = self.backbone(x)
-            feat_buffer = self.buffer(feat_backbone)
-            logits_uni = self.forward_fc(feat_buffer)
+            feat_uni = self.backbone(x)
+            logits_uni = self.forward_fc(self.buffer(feat_uni))
 
-        # Nếu chưa có task nào (Task 0 chưa train xong?), trả về Universal
         if num_tasks == 0:
             if was_training: self.train()
             return {'logits': logits_uni}
 
-        # 2. SINGLE PASS: Vừa tính Sim, Vừa tính Logit
+        # 2. Expert Routing & Logit Calculation
         task_scores = []
-        task_logits = []
+        task_logits_masked = [] # Lưu logit đã được mask
 
         with torch.no_grad():
             for t_idx, protos in enumerate(self.task_prototypes):
-                # A. Bật Expert & Forward
+                # A. Bật Expert t
                 self.set_noise_mode(t_idx)
-                feat_expert = self.backbone(x) 
                 
-                # B. Tính luôn Logit cho Expert này (LƯU LẠI NGAY)
-                # Feature -> Buffer -> FC
-                l_t = self.forward_fc(self.buffer(feat_expert))
-                task_logits.append(l_t)
+                # B. Forward 1 lần duy nhất
+                feat_expert = self.backbone(x)
+                
+                # C. Tính Logit & MASKING NGAY LẬP TỨC
+                # Expert t chỉ được phép có ý kiến về class thuộc Task t
+                raw_logits = self.forward_fc(self.buffer(feat_expert))
+                
+                # --- MASKING LOGIC ---
+                # Tạo mask số 0. Những class nào thuộc task t thì giữ nguyên, còn lại = 0
+                # Lý do = 0: Vì đây là Residual (Cộng thêm). Cộng 0 nghĩa là "không có ý kiến".
+                masked_l = torch.zeros_like(raw_logits)
+                
+                # Giả sử bạn có biến self.task_class_indices là list các list class index
+                # Ví dụ: Task 0 là [0,1,2,3,4], Task 1 là [5,6,7,8,9]
+                if hasattr(self, 'task_class_indices') and t_idx < len(self.task_class_indices):
+                    idx = self.task_class_indices[t_idx] # List indices
+                    masked_l[:, idx] = raw_logits[:, idx] 
+                else:
+                    # Fallback nếu chưa setup indices (chạy full như cũ - nguy hiểm)
+                    masked_l = raw_logits 
+                
+                task_logits_masked.append(masked_l)
 
-                # C. Tính Similarity (như cũ)
+                # D. Tính Similarity (Dùng cho Routing)
                 feat_norm = F.normalize(feat_expert, p=2, dim=1)
                 p_gpu = protos.to(x.device)
                 p_norm = F.normalize(p_gpu, p=2, dim=1)
-                
                 sim_c = torch.mm(feat_norm, p_norm.t())
-                sim_t, _ = sim_c.max(dim=1) # [Batch]
+                sim_t, _ = sim_c.max(dim=1)
                 task_scores.append(sim_t)
             
-            # 3. SELECT & GATHER (Không cần Forward lại)
-            # Stack Scores: [Batch, Num_Tasks]
-            all_task_scores = torch.stack(task_scores, dim=1)
-            # Chọn Task tốt nhất: [Batch]
-            _, selected_task_ids = all_task_scores.max(dim=1)
+            # 3. Selection
+            # Chọn Task nào có Sim cao nhất
+            all_scores = torch.stack(task_scores, dim=1) # [B, N_Task]
+            max_sim, selected_task_ids = all_scores.max(dim=1)
             
-            # Stack Logits: [Batch, Num_Tasks, Num_Classes]
-            all_logits_stack = torch.stack(task_logits, dim=1)
+            # Lấy Logit (đã mask) của Task thắng cuộc
+            all_logits_stack = torch.stack(task_logits_masked, dim=1) # [B, N_Task, N_Class]
+            row_idx = torch.arange(batch_size, device=x.device)
+            best_logits_spec = all_logits_stack[row_idx, selected_task_ids]
             
-            # Dùng Advanced Indexing để lấy Logit đúng Task cho từng mẫu
-            # Tạo index hàng: [0, 1, 2, ..., Batch-1]
-            row_indices = torch.arange(batch_size, device=x.device)
-            
-            # Chọn: Hàng i, Task selected_task_ids[i]
-            best_logits_spec = all_logits_stack[row_indices, selected_task_ids]
+            # [TÙY CHỌN] Sharpening Weight (để tin tưởng Expert hơn nếu Sim cao)
+            # weight = F.relu(max_sim).unsqueeze(1) 
+            # Hoặc đơn giản là 1.0 nếu đã tin tưởng Routing
+            weight = 1.0
 
-        # 4. Final Output
-        # Code của bạn đang chỉ lấy best_logits_spec
-        final_logits = best_logits_spec 
+        # 4. Ensemble: Universal + Expert (Đã Mask)
+        # Vì đã Mask = 0 ở các class lạ, nên Expert sẽ không làm nhiễu Universal ở các task khác
+        alpha = 1.0 
+        final_logits = logits_uni + (best_logits_spec * weight * alpha)
+        
+        self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
