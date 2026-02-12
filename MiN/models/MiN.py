@@ -284,7 +284,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 1e-3
+        max_beta = 1e-2
         
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
@@ -317,8 +317,6 @@ class MinNet(object):
                 if targets.dim() > 1: targets = targets.reshape(-1)
                 targets = targets.long() # Bắt buộc là LongTensor
 
-                # [DEBUG KHẨN CẤP] - Nếu vẫn lỗi, dòng này sẽ hiện nguyên nhân
-                print(f"DEBUG: Logits {logits_final.shape} ({logits_final.dtype}) | Targets {targets.shape} ({targets.dtype})")
                 
                 # Tính Loss (bên ngoài autocast)
                 ce_loss = F.cross_entropy(logits_final, targets)
