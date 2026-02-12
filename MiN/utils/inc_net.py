@@ -256,62 +256,66 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    # [FIXED] Dùng mode -2 cho Uni khi Infer và kết hợp với Expert, dùng expert để tính prototype
-    # [FIXED LOGIC] Single Pass Expert Routing + Logit Masking
-    def forward_tuna_combined(self, x):
-        was_training = self.training
+    def forward_tuna_combined(self, x, targets=None):
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # BƯỚC 1: LẤY LOGIT UNIVERSAL (MODE -2)
+        # BƯỚC 1: UNIVERSAL BASELINE (W CHUNG)
         self.set_noise_mode(-2)
         with torch.no_grad():
             feat_uni = self.backbone(x)
             logits_uni = self.forward_fc(self.buffer(feat_uni))
 
-        if num_tasks == 0:
-            if was_training: self.train()
-            return {'logits': logits_uni}
+        if num_tasks == 0: return {'logits': logits_uni}
 
-        # BƯỚC 2: ROUTING TRONG KHÔNG GIAN SẠCH (MODE -3)
+        # BƯỚC 2: ROUTING (MODE -3)
         self.set_noise_mode(-3)
         with torch.no_grad():
-            feat_clean = self.backbone(x) 
+            feat_clean = self.backbone(x)
             feat_norm = F.normalize(feat_clean, p=2, dim=1)
             
             task_scores = []
             for t_idx, protos in enumerate(self.task_prototypes):
-                p_norm = F.normalize(protos.to(x.device), p=2, dim=1)
-                # Tính sim của feature sạch với prototype sạch
+                p_norm = F.normalize(protos.to(self.device), p=2, dim=1)
                 sim_t, _ = torch.mm(feat_norm, p_norm.t()).max(dim=1)
                 task_scores.append(sim_t)
             
             selected_task_ids = torch.stack(task_scores, dim=1).argmax(dim=1)
 
-        # BƯỚC 3: LẤY LOGIT EXPERT (ĐÂY LÀ CHỖ BỊ LỖI NAMEERROR)
+        # --- [BỔ SUNG] TÍNH TỶ LỆ CHỌN ĐÚNG EXPERT ---
+        routing_acc = -1.0
+        if targets is not None:
+            # Xác định Task ID thực tế từ targets (dựa trên class ranges)
+            true_task_ids = torch.zeros_like(selected_task_ids)
+            for t_idx, indices in enumerate(self.task_class_indices):
+                # Nếu target nằm trong range class của task t_idx
+                mask_t = (targets >= indices[0]) & (targets <= indices[-1])
+                true_task_ids[mask_t] = t_idx
+            routing_acc = (selected_task_ids == true_task_ids).float().mean().item() * 100
+
+        # BƯỚC 3: EXPERT INFERENCE (W RIÊNG TỪNG TASK)
         best_logits_spec = torch.zeros_like(logits_uni)
         with torch.no_grad():
-            unique_tasks = selected_task_ids.unique()
-            for t in unique_tasks:
-                t_val = t.item()
+            for t in selected_task_ids.unique():
+                t_idx = t.item()
                 mask = (selected_task_ids == t)
-                self.set_noise_mode(t_val)
                 
-                feat_spec = self.backbone(x[mask])
-                feat_buf_spec = self.buffer(feat_spec)
+                self.set_noise_mode(t_idx)
+                feat_expert = self.backbone(x[mask])
+                feat_buf = self.buffer(feat_expert)
                 
-                # [THAY ĐỔI] Dùng W chuyên biệt của task t
-                # Phép nhân này trả về logit chỉ cho các class của task đó
-                raw_logits_task = feat_buf_spec @ self.task_weights[t_val]
+                # Dùng W riêng của task t
+                raw_logits_task = feat_buf @ self.task_weights[t_idx]
                 
-                # Điền vào đúng vị trí class của task t trong tensor tổng
-                idx = self.task_class_indices[t_val]
-                best_logits_spec[mask.bool()[:, None].expand(-1, len(idx)), torch.tensor(idx, device=self.device)] = raw_logits_task
+                # [FIX INDEXERROR] Gán giá trị bằng cách xác định đúng hàng và cột
+                idx = torch.tensor(self.task_class_indices[t_idx], device=self.device)
+                # rows = các hàng đang được chọn bởi mask; cols = các cột của task t
+                rows = torch.where(mask)[0].reshape(-1, 1)
+                best_logits_spec[rows, idx] = raw_logits_task
 
         # BƯỚC 4: ENSEMBLE
-        # final_logits = best_logits_spec # Nếu ông chỉ muốn test expert
-        final_logits = logits_uni + best_logits_spec # Nếu muốn gộp
+        final_logits = logits_uni + best_logits_spec 
         
         self.set_noise_mode(-2)
-        return {'logits': final_logits}
+        return {'logits': final_logits, 'routing_acc': routing_acc}

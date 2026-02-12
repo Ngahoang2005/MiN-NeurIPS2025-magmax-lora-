@@ -288,16 +288,16 @@ class MinNet(object):
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
+        routing_accuracies = []
         with torch.no_grad(), autocast('cuda'):
             for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # Inference dùng Combined (Universal + Expert)
-                if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
-                else:
-                    self._network.set_noise_mode(-2)
-                    outputs = model(inputs)
+                # Truyền targets vào để hàm forward tính luôn routing_acc
+                outputs = model.forward_tuna_combined(inputs, targets=targets)
+                
+                if outputs['routing_acc'] >= 0:
+                    routing_accuracies.append(outputs['routing_acc'])
 
                 logits = outputs["logits"]
                 predicts = torch.max(logits, dim=1)[1]
@@ -306,6 +306,10 @@ class MinNet(object):
         
         class_info = calculate_class_metrics(pred, label)
         task_info = calculate_task_metrics(pred, label, self.init_class, self.increment)
+        if len(routing_accuracies) > 0:
+            avg_routing = sum(routing_accuracies) / len(routing_accuracies)
+            self.logger.info(f">>> [ROUTING] Expert Selection Accuracy: {avg_routing:.2f}%")
+            print(f">>> [ROUTING] Expert Selection Accuracy: {avg_routing:.2f}%")
         return {
             "all_class_accy": class_info['all_accy'],
             "class_accy": class_info['class_accy'],
