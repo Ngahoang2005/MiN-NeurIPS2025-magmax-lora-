@@ -626,85 +626,88 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    def forward_tuna_combined(self, x, targets=None, top_k=3, tau=0.1):
+    def forward_tuna_combined(self, x, targets=None, top_k=5, tau=0.1):
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # BƯỚC 1: LẤY LOGIT UNIVERSAL (Mode -2: Mixture) [cite: 31, 186]
+        # BƯỚC 1: LẤY LOGIT UNIVERSAL (Mode -2)
         self.set_noise_mode(-2)
         with torch.no_grad():
             feat_uni = self.backbone(x)
             feat_buf_uni = self.buffer(feat_uni)
-            # Giữ nguyên đặc trưng thô để nhân với FC chung [cite: 77]
             logits_uni = self.forward_fc(feat_buf_uni)
 
         if num_tasks == 0: return {'logits': logits_uni}
 
-        # BƯỚC 2: ROUTING QUA N LẦN FORWARD 
+        # BƯỚC 2: ROUTING QUA N LẦN FORWARD & DEBUG DISTANCE
         task_scores = []
-        all_feat_specs = [] # Lưu lại đặc trưng thô của từng Expert
+        all_feat_specs = [] 
 
         with torch.no_grad():
             for t_idx in range(num_tasks):
-                # A. Chuyển sang thấu kính của Expert t [cite: 113, 115]
                 self.set_noise_mode(t_idx)
-                
-                # B. Forward để lấy đặc trưng qua Noise Maker t
                 feat_t = self.backbone(x)
                 feat_buf_t = self.buffer(feat_t)
-                all_feat_specs.append(feat_buf_t) # Lưu đặc trưng thô
+                all_feat_specs.append(feat_buf_t)
                 
-                # C. Tính Mahalanobis (Dùng đặc trưng thô, không Normalize)
-                R_t = self.R_list[t_idx] 
-                Mu = self.task_prototypes[t_idx].to(self.device) 
+                # Tính Mahalanobis (Raw - Không Normalize theo yêu cầu của ông)
+                R_t = self.R_list[t_idx]
+                Mu = self.task_prototypes[t_idx].to(self.device)
                 
-                # dist^2 = xRx' + muRmu' - 2xRmu'
                 xRx = torch.sum((feat_buf_t @ R_t) * feat_buf_t, dim=-1)
                 muRmu = torch.sum((Mu @ R_t) * Mu, dim=-1)
                 xRmu = feat_buf_t @ R_t @ Mu.T
                 
                 dist_sq = xRx.unsqueeze(1) + muRmu.unsqueeze(0) - 2 * xRmu
-                
-                # Chọn khoảng cách nhỏ nhất trong số các class của task t
                 min_dist_task, _ = dist_sq.min(dim=1)
-                task_scores.append(-min_dist_task)
+                task_scores.append(-min_dist_task) # Score càng cao = Khoảng cách càng nhỏ
 
-            # D. Tính trọng số Routing dựa trên Top-K [cite: 35, 102, 219]
-            all_scores = torch.stack(task_scores, dim=1)
-            routing_weights = F.softmax(all_scores / tau, dim=1) 
-            top_weights, top_task_ids = torch.topk(routing_weights, k=min(top_k, num_tasks), dim=1)
-
-        # BƯỚC 3: SOFT ENSEMBLE LOGITS (Sử dụng đặc trưng thô đã lưu) [cite: 104, 254]
-        combined_expert_logits = torch.zeros_like(logits_uni)
-        
-        with torch.no_grad():
-            # Duyệt qua các vị trí trong Top-K
-            for k in range(top_weights.shape[1]):
-                t_indices = top_task_ids[:, k] # Task ID được chọn ở rank k
-                weights_k = top_weights[:, k].unsqueeze(1) # Trọng số tương ứng
+            # TÍNH TOÁN TOP-K
+            all_scores = torch.stack(task_scores, dim=1) # [Batch, Num_Tasks]
+            top_weights, top_task_ids = torch.topk(F.softmax(all_scores / tau, dim=1), k=min(top_k, num_tasks), dim=1)
+            
+            # --- [DEBUG] IN KHOẢNG CÁCH TOP 5 CỦA MẪU ĐẦU TIÊN TRONG BATCH ---
+            if self.training is False: # Chỉ in khi Inference để tránh spam log lúc train
+                print(f"\n>>> [DEBUG ROUTING] Sample 0 Analysis:")
+                # Lấy khoảng cách thực (dương) thay vì score (âm)
+                actual_dists = -all_scores[0] 
+                sorted_dists, sorted_indices = torch.sort(actual_dists)
                 
+                for i in range(min(5, num_tasks)):
+                    t_id = sorted_indices[i].item()
+                    d_val = sorted_dists[i].item()
+                    weight = F.softmax(all_scores[0] / tau, dim=0)[t_id].item()
+                    print(f"  Rank {i+1}: Task {t_id} | Distance: {d_val:.4f} | Weight: {weight:.4f}")
+                
+                if targets is not None:
+                    # Tìm task ID thực tế của mẫu này
+                    true_task = -1
+                    for t_idx, indices in enumerate(self.task_class_indices):
+                        if targets[0] >= indices[0] and targets[0] <= indices[-1]:
+                            true_task = t_idx; break
+                    print(f"  Target Task: {true_task} | Correct Expert Selected: {sorted_indices[0].item() == true_task}")
+
+        # BƯỚC 3: SOFT ENSEMBLE LOGITS
+        combined_expert_logits = torch.zeros_like(logits_uni)
+        with torch.no_grad():
+            for k in range(top_weights.shape[1]):
+                t_indices = top_task_ids[:, k]
+                weights_k = top_weights[:, k].unsqueeze(1)
                 for t_idx in range(num_tasks):
                     mask = (t_indices == t_idx)
                     if not mask.any(): continue
-                    
-                    # Lấy đặc trưng thô đã tính từ thấu kính t tương ứng
                     feat_ready = all_feat_specs[t_idx][mask]
-                    # Nhân trực tiếp với bộ trọng số Expert t [cite: 114]
                     raw_logits_task = feat_ready @ self.task_weights[t_idx]
-                    
-                    # Đưa vào đúng vị trí lớp trong classifier toàn cục
                     idx = self.task_class_indices[t_idx]
                     expert_contribution = torch.zeros_like(logits_uni[mask])
                     expert_contribution[:, idx] = raw_logits_task
-                    
-                    # Cộng dồn có trọng số vào kết quả Expert Ensemble
                     combined_expert_logits[mask] += weights_k[mask] * expert_contribution
 
-        # BƯỚC 4: KẾT HỢP CUỐI CÙNG (Universal + Experts) [cite: 31, 104, 254]
+        # BƯỚC 4: KẾT QUẢ CUỐI
         final_logits = logits_uni + combined_expert_logits
         
-        # --- TÍNH TỶ LỆ CHỌN ĐÚNG EXPERT ---
+        # Routing Accuracy (Top-1)
         routing_acc = -1.0
         if targets is not None:
             best_task_ids = top_task_ids[:, 0]
