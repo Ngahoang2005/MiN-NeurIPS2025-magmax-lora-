@@ -758,7 +758,7 @@ class MinNet(object):
         model.to(self.device)
         
         # [FIX] Lấy prototype thông qua con mắt của Expert
-        model.set_noise_mode(-3) 
+        model.set_noise_mode(self.cur_task)
         
         all_features = []
         all_targets = []

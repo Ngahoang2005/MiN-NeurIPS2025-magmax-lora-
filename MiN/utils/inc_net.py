@@ -626,7 +626,7 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    def forward_tuna_combined(self, x, targets=None, top_k=10, tau=0.1):
+    def forward_tuna_combined(self, x, targets=None, top_k=3, tau=0.1):
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
