@@ -220,63 +220,70 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    # [FIXED] Dùng mode -2 cho Uni khi Infer và kết hợp với Expert
+    # [FIXED] Dùng mode -2 cho Uni khi Infer và kết hợp với Expert, dùng expert để tính prototype
     def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # 1. Universal (Mode -2) - Dùng cho Inference
+        # 1. Universal (Mode -2) - Vẫn giữ để làm nền tảng
         self.set_noise_mode(-2)
         with torch.no_grad():
             feat_backbone = self.backbone(x)
             feat_buffer = self.buffer(feat_backbone)
             logits_uni = self.forward_fc(feat_buffer)
 
-        # 2. Class-based Cosine Routing
-        best_logits_spec = torch.zeros_like(logits_uni)
-        max_sim_values = torch.zeros((batch_size, 1), device=x.device)
-        selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
+        # Nếu chưa có task nào (Task 0 chưa train xong?), trả về Universal
+        if num_tasks == 0:
+            if was_training: self.train()
+            return {'logits': logits_uni}
 
-        if num_tasks > 0:
-            with torch.no_grad():
-                feat_norm = F.normalize(feat_backbone, p=2, dim=1)
-                task_scores = []
-                for t_idx, protos in enumerate(self.task_prototypes):
-                    p_gpu = protos.to(x.device)
-                    p_norm = F.normalize(p_gpu, p=2, dim=1)
-                    sim_c = torch.mm(feat_norm, p_norm.t())
-                    sim_t, _ = sim_c.max(dim=1)
-                    task_scores.append(sim_t)
+        # 2. SINGLE PASS: Vừa tính Sim, Vừa tính Logit
+        task_scores = []
+        task_logits = []
+
+        with torch.no_grad():
+            for t_idx, protos in enumerate(self.task_prototypes):
+                # A. Bật Expert & Forward
+                self.set_noise_mode(t_idx)
+                feat_expert = self.backbone(x) 
                 
-                if len(task_scores) > 0:
-                    all_task_scores = torch.stack(task_scores, dim=1)
-                    max_sim, selected_task_ids = all_task_scores.max(dim=1)
-                    
-                    # Thresholding & Sharpening
-                    sim_val = F.relu(max_sim)
-                    mask = (sim_val > 0.1).float() # Giảm threshold xuống 0.1 để đỡ bị ngắt đột ngột
-                    sim_val = torch.pow(sim_val, 3) * mask
-                    max_sim_values = sim_val.unsqueeze(1)
+                # B. Tính luôn Logit cho Expert này (LƯU LẠI NGAY)
+                # Feature -> Buffer -> FC
+                l_t = self.forward_fc(self.buffer(feat_expert))
+                task_logits.append(l_t)
 
-        # 3. Specific Forward
-        if num_tasks > 0:
-            with torch.no_grad():
-                unique_tasks = selected_task_ids.unique()
-                for t in unique_tasks:
-                    mask = (selected_task_ids == t)
-                    self.set_noise_mode(t.item()) # Bật Expert t
-                    feat_t = self.backbone(x[mask])
-                    l_t = self.forward_fc(self.buffer(feat_t))
-                    best_logits_spec[mask] = l_t
+                # C. Tính Similarity (như cũ)
+                feat_norm = F.normalize(feat_expert, p=2, dim=1)
+                p_gpu = protos.to(x.device)
+                p_norm = F.normalize(p_gpu, p=2, dim=1)
+                
+                sim_c = torch.mm(feat_norm, p_norm.t())
+                sim_t, _ = sim_c.max(dim=1) # [Batch]
+                task_scores.append(sim_t)
+            
+            # 3. SELECT & GATHER (Không cần Forward lại)
+            # Stack Scores: [Batch, Num_Tasks]
+            all_task_scores = torch.stack(task_scores, dim=1)
+            # Chọn Task tốt nhất: [Batch]
+            _, selected_task_ids = all_task_scores.max(dim=1)
+            
+            # Stack Logits: [Batch, Num_Tasks, Num_Classes]
+            all_logits_stack = torch.stack(task_logits, dim=1)
+            
+            # Dùng Advanced Indexing để lấy Logit đúng Task cho từng mẫu
+            # Tạo index hàng: [0, 1, 2, ..., Batch-1]
+            row_indices = torch.arange(batch_size, device=x.device)
+            
+            # Chọn: Hàng i, Task selected_task_ids[i]
+            best_logits_spec = all_logits_stack[row_indices, selected_task_ids]
 
-        # 4. Ensemble: Universal + (Weight * Expert)
-        # BẠN ĐÃ YÊU CẦU: "Chỉ dùng mode -2 khi infer". 
-        # Đoạn này chính là infer, nên ta giữ Universal (mode -2) làm gốc.
-        alpha = 2.0 
-        final_logits = best_logits_spec  
-
+        # 4. Final Output
+        # Code của bạn đang chỉ lấy best_logits_spec
+        final_logits = best_logits_spec 
+        
+        # Reset & Return
         self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
