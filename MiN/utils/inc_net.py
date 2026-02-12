@@ -282,8 +282,5 @@ class MiNbaseNet(nn.Module):
         # 4. Final Output
         # Code của bạn đang chỉ lấy best_logits_spec
         final_logits = best_logits_spec 
-        
-        # Reset & Return
-        self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
