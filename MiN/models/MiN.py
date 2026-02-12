@@ -103,6 +103,8 @@ class MinNet(object):
    
         self._clear_gpu()
         # 2. Train Noise (MODE = CUR_TASK)
+        prototype = self.get_task_prototype(self._network, train_loader)
+        self._network.extend_task_prototype(prototype)
         self.run(train_loader)
         
         # Update Proto (MODE = CUR_TASK)
@@ -150,7 +152,9 @@ class MinNet(object):
         # Train Expert (MODE = CUR_TASK)
         train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self._clear_gpu()
-       
+        # prototype
+        prototype = self.get_task_prototype(self._network, train_loader)
+        self._network.extend_task_prototype(prototype)
         self.run(train_loader_run)
         
         self._clear_gpu()
