@@ -269,7 +269,7 @@ class MinNet(object):
                                 cos_sim = torch.mm(curr_norm, prev_norm.t())
                                 loss_orth += torch.sum(torch.abs(cos_sim))
 
-                    lambda_orth = 50.0 
+                    lambda_orth = 5.0
                     loss = loss_ce + lambda_orth * loss_orth
 
                 self.scaler.scale(loss).backward()
