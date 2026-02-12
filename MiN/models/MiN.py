@@ -296,7 +296,25 @@ class MinNet(object):
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                
+                # =========================================================
+                # [SAFETY BLOCK: XỬ LÝ TARGETS TUYỆT ĐỐI]
+                # =========================================================
+                # 1. Xử lý trường hợp One-Hot (nếu có): [Batch, Classes] -> [Batch]
+                if targets.dim() == 2 and targets.shape[1] > 1:
+                    targets = torch.argmax(targets, dim=1)
+                
+                # 2. Xử lý trường hợp thừa chiều: [Batch, 1] -> [Batch]
+                if targets.dim() > 1:
+                    targets = targets.view(-1)
+                
+                # 3. BẮT BUỘC: Ép kiểu về Long (int64). 
+                # Nếu để Float/Half, CrossEntropy sẽ crash với lỗi size mismatch.
+                targets = targets.to(dtype=torch.long)
+                # =========================================================
+
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
@@ -309,12 +327,8 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
                     
-                    # --- [FIX LỖI TARGET SIZE] ---
-                    if targets.dim() > 1: 
-                        targets = targets.squeeze().view(-1)
-                    targets = targets.long()
-                    
                     # --- Tính Loss ---
+                    # targets bây giờ chắc chắn là LongTensor [128]
                     ce_loss = F.cross_entropy(logits_final, targets)
                     loss = ce_loss + beta_current * batch_kl
 
@@ -338,8 +352,7 @@ class MinNet(object):
                 
                 del inputs, targets, loss, logits_final, batch_kl
 
-                # [DEBUG NOISE] In thông tin mỗi 50 batch để kiểm tra
-                # Chỉ in khi đang ở Task > 0 (Task có học Noise) hoặc cuối epoch task 0
+                # [DEBUG NOISE] 
                 if i % 50 == 0:
                      if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
                         self.print_noise_status()
@@ -356,7 +369,6 @@ class MinNet(object):
             
             if epoch % 5 == 0:
                 self._clear_gpu()
-
     # Thêm hàm helper này vào trong class MinNet luôn để tiện gọi self
     def print_noise_status(self):
         print("\n" + "="*85)
