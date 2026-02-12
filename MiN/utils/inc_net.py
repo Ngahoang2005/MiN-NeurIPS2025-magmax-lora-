@@ -240,7 +240,7 @@ class MiNbaseNet(nn.Module):
         for i, block in enumerate(self.backbone.blocks):
             x = block(x) 
             if hasattr(self.backbone, 'noise_maker'):
-                x, kl = self.backbone.noise_maker[i](x)
+                x, kl = self.backbone.noise_maker[i](x, return_kl=True)
                 kl_losses.append(kl)
         
         # 3. Norm

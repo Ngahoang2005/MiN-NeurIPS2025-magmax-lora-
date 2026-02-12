@@ -153,9 +153,11 @@ class PiNoise(nn.Module):
         self.mu.load_state_dict(get_merged_state(self.history_mu))
         self.sigma.load_state_dict(get_merged_state(self.history_sigma))
 
-    def forward(self, hyper_features):
+    def forward(self, hyper_features, return_kl=False):
+        # 1. Down Projection
         x_down = hyper_features @ self.w_down
         
+        # 2. Variational Encoding
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
         
@@ -164,37 +166,18 @@ class PiNoise(nn.Module):
             z = mu + sigma * epsilon
         else:
             z = mu 
-            
-        kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
         
-        # Calculate Noise Effect
-        raw_noise = z @ self.w_up
-        effective_noise = self.noise_scale * raw_noise # Noise thực tế cộng vào
+        # 3. Noise Injection
+        noise_projected = z @ self.w_up
+        out = hyper_features + (self.noise_scale * noise_projected)
         
-        out = hyper_features + effective_noise
-        
-        # [NEW] THU THẬP SỐ LIỆU DEBUG (Chỉ làm khi training để nhẹ máy)
-        if self.training:
-            with torch.no_grad():
-                # 1. Độ lớn tín hiệu gốc (L2 Norm trung bình)
-                signal_norm = hyper_features.norm(p=2, dim=-1).mean()
-                
-                # 2. Độ lớn nhiễu thực tế
-                noise_norm = effective_noise.norm(p=2, dim=-1).mean()
-                
-                # 3. Sigma trung bình (để xem variational có bị co về 0 không)
-                sigma_mean = sigma.mean()
-                
-                # 4. Lưu lại
-                self.last_debug_info = {
-                    "signal": signal_norm.item(),
-                    "noise": noise_norm.item(),
-                    "sigma": sigma_mean.item(),
-                    "snr": (signal_norm / (noise_norm + 1e-9)).item(), # Signal-to-Noise Ratio
-                    "scale": self.noise_scale.item()
-                }
-
-        return out, kl_div.mean()
+        # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
+        if return_kl:
+            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
+            return out, kl_div.mean()
+        else:
+            # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
+            return out
     
     def apply_gradient_projection(self, scale=1.0):
         """
