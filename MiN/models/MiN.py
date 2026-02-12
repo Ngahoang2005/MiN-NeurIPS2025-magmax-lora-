@@ -7,20 +7,13 @@ from torch import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 import copy
-import gc  # [ADDED] Để dọn rác bộ nhớ
+import gc 
 import os
 
 from utils.inc_net import MiNbaseNet
-from torch.utils.data import WeightedRandomSampler
-from utils.toolkit import tensor2numpy, count_parameters
-from data_process.data_manger import DataManger
+from utils.toolkit import tensor2numpy, calculate_class_metrics, calculate_task_metrics
 from utils.training_tool import get_optimizer, get_scheduler
-from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
-# [ADDED] Import Mixed Precision
 from torch.amp import autocast, GradScaler
-
-EPSILON = 1e-8
 
 class MinNet(object):
     def __init__(self, args, loger):
@@ -52,14 +45,9 @@ class MinNet(object):
         self.known_class = 0
         self.cur_task = -1
         self.total_acc = []
-        self.class_acc = []
-        self.task_acc = []
-        
-        # [ADDED] Scaler cho Mixed Precision
         self.scaler = GradScaler('cuda')
 
     def _clear_gpu(self):
-        # [ADDED] Hàm dọn dẹp GPU
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -73,40 +61,19 @@ class MinNet(object):
         _, test_list, _ = data_manger.get_task_list(self.cur_task)
         test_set = data_manger.get_task_data(source="test", class_list=test_list)
         test_set.labels = self.cat2order(test_set.labels, data_manger)
-        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False,
-                                 num_workers=self.num_workers)
+        test_loader = DataLoader(test_set, batch_size=self.init_batch_size, shuffle=False, num_workers=self.num_workers)
+        
         eval_res = self.eval_task(test_loader)
         self.total_acc.append(round(float(eval_res['all_class_accy']*100.), 2))
         self.logger.info('total acc: {}'.format(self.total_acc))
-        self.logger.info('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
-        self.logger.info('task_confusion_metrix:\n{}'.format(eval_res['task_confusion']))
         print('total acc: {}'.format(self.total_acc))
-        print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
+        
         if self.cur_task >= 0:
-            # Gọi hàm vẽ debug mới
             self.analyze_cosine_accuracy(test_loader)
         del test_set
 
     def save_check_point(self, path_name):
         torch.save(self._network.state_dict(), path_name)
-
-    def compute_test_acc(self, test_loader):
-        model = self._network.eval()
-        correct, total = 0, 0
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(test_loader):
-                inputs = inputs.to(self.device)
-                if self.cur_task > 0:
-                    outputs = model.forward_tuna_combined(inputs)
-                else:
-                    model.set_noise_mode(-2)
-                    outputs = model(inputs)
-                
-                logits = outputs["logits"]
-                predicts = torch.max(logits, dim=1)[1]
-                correct += (predicts.cpu() == targets).sum()
-                total += len(targets)
-        return np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
     @staticmethod
     def cat2order(targets, datamanger):
@@ -117,7 +84,7 @@ class MinNet(object):
     def init_train(self, data_manger):
         self.cur_task += 1
         train_list, test_list, _ = data_manger.get_task_list(0)
-        self.logger.info(f"Task 0: {train_list}")
+        self.logger.info(f"Task 0 Order: {train_list}")
 
         train_set = data_manger.get_task_data(source="train", class_list=train_list)
         train_set.labels = self.cat2order(train_set.labels, data_manger)
@@ -133,26 +100,24 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # 1. Calculate Prototype (Use Current Expert Mode!)
+        # 1. Calculate Proto (MODE = CUR_TASK)
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
         
-        # 2. Train Noise Experts (SGD)
-        # Trong lúc train noise, ta dùng cur_task để expert học được feature
+        # 2. Train Noise (MODE = CUR_TASK)
         self.run(train_loader)
         
-        # Update Prototype again after training
+        # Update Proto (MODE = CUR_TASK)
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
         
-        # 3. Fit Classifier (RLS)
-        # [FIX] Dùng mode cur_task để Fit, KHÔNG DÙNG -2
+        # 3. Fit Classifier (MODE = CUR_TASK)
         train_loader_buf = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
-        self.fit_fc(train_loader_buf, test_loader) # fit_fc sẽ tự set mode
+        self.fit_fc(train_loader_buf, test_loader) 
 
-        # 4. Re-Fit (Optional clean pass)
+        # 4. Re-Fit (MODE = CUR_TASK)
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
@@ -161,7 +126,6 @@ class MinNet(object):
             for param in self._network.backbone.parameters(): param.requires_grad = False
         
         self.re_fit(train_loader_clean, test_loader)
-        
         del train_set, test_set, train_set_clean; self._clear_gpu()
 
     def increment_train(self, data_manger):
@@ -180,18 +144,14 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
         
-        # Fit đầu tiên để lấy đà (Fit trên expert cũ hoặc universal cũng được, nhưng tốt nhất là -2 ở bước warm-up này)
-        # Tuy nhiên để nhất quán, ta update FC trước
         self._network.update_fc(self.increment)
         self._network.update_noise()
 
-        # Fit Warm-up: Có thể dùng Mode -2 để RLS học được feature chung trước
-        self._network.set_noise_mode(-2)
+        # Fit Warm-up (MODE = CUR_TASK)
         self.fit_fc(train_loader, test_loader)
         
-        # Train Expert (Quan trọng: Ortho Loss sẽ hoạt động ở đây)
+        # Train Expert (MODE = CUR_TASK)
         train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
-        
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader_run)
         self._network.extend_task_prototype(prototype)
@@ -204,7 +164,7 @@ class MinNet(object):
 
         del train_set
 
-        # Re-Fit chính thức: Dùng MODE CUR_TASK để RLS học khớp với Expert
+        # Re-Fit (MODE = CUR_TASK)
         train_set_clean = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
         train_set_clean.labels = self.cat2order(train_set_clean.labels, data_manger)
         train_loader_clean = DataLoader(train_set_clean, batch_size=self.buffer_batch, shuffle=True, num_workers=self.num_workers)
@@ -212,7 +172,7 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters(): param.requires_grad = False
             
-        self.re_fit(train_loader_clean, test_loader) # re_fit sẽ set mode cur_task
+        self.re_fit(train_loader_clean, test_loader) 
 
         del train_set_clean, test_set; self._clear_gpu()
 
@@ -220,64 +180,47 @@ class MinNet(object):
         self._network.eval()
         self._network.to(self.device)
         
-        # [MODIFIED] Mặc định dùng cur_task nếu không được set bên ngoài
-        # Hoặc bạn có thể force set ở đây nếu muốn chắc chắn
-        # self._network.set_noise_mode(self.cur_task) 
+        # [FIX] Luôn set mode Expert khi fit để học feature đã biến đổi
+        self._network.set_noise_mode(self.cur_task) 
         
-        if self.cur_task > 0:
-            decay = 0.9 
-            self._network.H *= decay
-            self._network.Hy *= decay
-        else:
-            self._network.H.zero_()
-            self._network.Hy.zero_()
-
-        prog_bar = tqdm(train_loader, desc=f"Fast RLS Task {self.cur_task}")
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-            self._network.fit_batch(inputs, targets)
+        prog_bar = tqdm(range(self.fit_epoch))
+        for _, epoch in enumerate(prog_bar):
+            self._network.to(self.device)
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
+                self._network.fit(inputs, targets)
             
-        self._network.update_analytical_weights()
-        self._clear_gpu()
+            info = f"Task {self.cur_task} --> Fast RLS Update"
+            self.logger.info(info); prog_bar.set_description(info)
+            self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
         self._network.eval()
         self._network.to(self.device)
         
-        # [FIX] QUAN TRỌNG: Refit trên feature của Expert hiện tại
+        # [FIX] Luôn set mode Expert khi refit
         self._network.set_noise_mode(self.cur_task)
-        
-        self._network.H.zero_()
-        self._network.Hy.zero_()
 
-        prog_bar = tqdm(train_loader, desc="Refit RLS (Expert Mode)")
+        prog_bar = tqdm(train_loader, desc="Refit RLS")
         for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-            self._network.fit_batch(inputs, targets)
+            self._network.fit(inputs, targets)
 
-        self._network.update_analytical_weights()
+        self.logger.info(f"Task {self.cur_task} --> Classifier Refined!")
         self._clear_gpu()
-    def run(self, train_loader):
-        if self.cur_task == 0:
-            epochs = self.init_epochs
-            lr = self.init_lr
-            weight_decay = self.init_weight_decay
-        else:
-            epochs = self.epochs
-            lr = self.lr
-            weight_decay = self.weight_decay
 
-        for param in self._network.parameters():
-            param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
-            param.requires_grad = True
+    def run(self, train_loader):
+        epochs = self.init_epochs if self.cur_task == 0 else self.epochs
+        lr = self.init_lr if self.cur_task == 0 else self.lr
+        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
             
-        if self.cur_task == 0:
-            self._network.init_unfreeze()
-        else:
-            self._network.unfreeze_noise()
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
             
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
@@ -287,6 +230,7 @@ class MinNet(object):
         self._network.train()
         self._network.to(self.device)
         self._network.set_noise_mode(self.cur_task) 
+        
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             correct = 0; total = 0
@@ -310,7 +254,7 @@ class MinNet(object):
                         loss_ce = F.cross_entropy(logits, targets.long())
                         logits_final = logits
 
-                    # [ADDED] ORTHOGONAL LOSS
+                    # ORTHO LOSS
                     loss_orth = torch.tensor(0.0, device=self.device)
                     if self.cur_task > 0:
                         for m in self._network.backbone.noise_maker:
@@ -318,21 +262,14 @@ class MinNet(object):
                             prev_mus = []
                             for t in range(self.cur_task):
                                 prev_mus.append(m.mu[t].weight.flatten())
-                            
                             if len(prev_mus) > 0:
-                                prev_stack = torch.stack(prev_mus)
-                                
-                                # [FIX] Detach expert cũ để không tính gradient ngược về quá khứ
-                                prev_stack = prev_stack.detach() 
-                                
+                                prev_stack = torch.stack(prev_mus).detach() 
                                 curr_norm = F.normalize(curr_mu.unsqueeze(0), p=2, dim=1)
                                 prev_norm = F.normalize(prev_stack, p=2, dim=1)
-
                                 cos_sim = torch.mm(curr_norm, prev_norm.t())
-                                # Minimize absolute similarity
                                 loss_orth += torch.sum(torch.abs(cos_sim))
 
-                    lambda_orth = 50.0
+                    lambda_orth = 50.0 
                     loss = loss_ce + lambda_orth * loss_orth
 
                 self.scaler.scale(loss).backward()
@@ -343,13 +280,14 @@ class MinNet(object):
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                del inputs, targets, loss, logits_final
+                del inputs, targets
 
             scheduler.step()
             train_acc = 100. * correct / total
-            info = f"Task {self.cur_task}: Epoch {epoch+1}/{epochs} => Loss {losses/len(train_loader):.3f} (Orth {loss_orth.item():.3f}), Acc {train_acc:.2f}%"
+            info = f"Task {self.cur_task} Ep {epoch+1}: Loss {losses/len(train_loader):.3f} (Orth {loss_orth.item():.4f}) Acc {train_acc:.2f}%"
             self.logger.info(info); prog_bar.set_description(info)
             if epoch % 5 == 0: self._clear_gpu()
+
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -357,7 +295,7 @@ class MinNet(object):
             for i, (_, inputs, targets) in enumerate(test_loader):
                 inputs = inputs.to(self.device)
                 
-                # [MODIFIED] Logic Selection
+                # Inference dùng Combined (Universal + Expert)
                 if self.cur_task > 0:
                     outputs = model.forward_tuna_combined(inputs)
                 else:
@@ -379,11 +317,7 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-    # =========================================================================
-    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
-    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
-    # =========================================================================
-    # [FIXED] Tính Prototype thông qua Expert (để phản ánh Ortho Loss)
+
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
@@ -405,7 +339,6 @@ class MinNet(object):
         all_features = torch.cat(all_features, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
-        # Tính Mean theo Class
         unique_classes = torch.unique(all_targets).sort()[0]
         class_prototypes = []
         for c in unique_classes:
@@ -415,29 +348,29 @@ class MinNet(object):
             
         prototypes = torch.stack(class_prototypes).to(self.device)
         self._clear_gpu()
-        return prototypes  
+        return prototypes
+
     def analyze_cosine_accuracy(self, test_loader):
-        """Thu thập dữ liệu Cosine Similarity và Accuracy tương ứng"""
         self._network.eval()
         all_sims = []
         all_corrects = []
         
-        # Lấy prototype của task hiện tại để làm mốc so sánh
-        curr_proto = self._network.task_prototypes[self.cur_task].to(self.device)
-        curr_proto_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
+        curr_protos = self._network.task_prototypes[self.cur_task].to(self.device)
+        curr_protos_norm = F.normalize(curr_protos, p=2, dim=1)
 
-        print(f">>> [DEBUG] Analyzing Cosine vs Acc for Task {self.cur_task}...")
+        print(f">>> [DEBUG] Analyzing Class-based Cosine vs Acc for Task {self.cur_task}...")
         with torch.no_grad():
             for _, inputs, targets in tqdm(test_loader, desc="Testing Bins"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # 1. Tính Similarity thực tế (trước buffer)
-                self._network.set_noise_mode(-2)
+                # So sánh: Feature qua Expert vs Prototype (cũng từ Expert)
+                self._network.set_noise_mode(self.cur_task) 
                 feat = self._network.extract_feature(inputs)
                 feat_norm = F.normalize(feat, p=2, dim=1)
-                sim = torch.mm(feat_norm, curr_proto_norm.t()).squeeze(1)
                 
-                # 2. Lấy dự đoán từ Routing
+                sim_matrix = torch.mm(feat_norm, curr_protos_norm.t())
+                sim, _ = sim_matrix.max(dim=1)
+                
                 outputs = self._network.forward_tuna_combined(inputs)
                 preds = outputs['logits'].argmax(dim=1)
                 correct = (preds == targets).float()
@@ -450,29 +383,21 @@ class MinNet(object):
     def _plot_cosine_acc_chart(self, sims, corrects, num_bins=10):
         import matplotlib.pyplot as plt
         sims, corrects = np.array(sims), np.array(corrects)
-        
-        # Chia bins từ 0.0 đến 1.0
         bin_edges = np.linspace(0, 1, num_bins + 1)
         acc_per_bin = []
         bin_centers = []
-
         for i in range(num_bins):
             mask = (sims >= bin_edges[i]) & (sims < bin_edges[i+1])
             if mask.any():
                 acc_per_bin.append(corrects[mask].mean() * 100)
                 bin_centers.append((bin_edges[i] + bin_edges[i+1]) / 2)
-
         plt.figure(figsize=(8, 6))
         plt.bar(bin_centers, acc_per_bin, width=0.08, color='skyblue', edgecolor='black', alpha=0.7)
         plt.plot(bin_centers, acc_per_bin, marker='o', color='blue', linewidth=2)
-        
-        plt.xlabel('Cosine Similarity to Correct Task Prototype', fontsize=12)
+        plt.xlabel('Cosine Similarity (Expert Space)', fontsize=12)
         plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title(f'Reliability: Similarity vs Acc (Task {self.cur_task})', fontsize=14)
+        plt.title(f'Task {self.cur_task}: Expert-based Sim vs Acc', fontsize=14)
         plt.grid(axis='y', linestyle='--', alpha=0.6)
         plt.ylim(0, 105)
-        
-        path = f'cosine_acc_task_{self.cur_task}.png'
-        plt.savefig(path)
+        plt.savefig(f'cosine_acc_task_{self.cur_task}.png')
         plt.close()
-        print(f">>> [DEBUG] Saved Cosine-Acc chart to: {path}")
