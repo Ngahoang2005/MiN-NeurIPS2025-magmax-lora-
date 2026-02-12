@@ -177,55 +177,63 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
-
         self.test_loader = test_loader
 
+        # [FIX 1: QUAN TRỌNG] Phải update FC (mở rộng class) TRƯỚC KHI fit
+        # Để fit_fc biết được đúng số lượng class mới
+        self._network.update_fc(self.increment)
+        
+        # Update Noise Generator cho task mới
+        self._network.update_noise()
+
+        # [STEP 1] Analytic Learning (RLS)
+        # Fit trên dữ liệu task mới (đồng thời tích lũy vào bộ nhớ A_global, B_global)
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-
+        
         self.fit_fc(train_loader, test_loader)
 
-        self._network.update_fc(self.increment)
-
-        train_loader = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
-                                    num_workers=self.num_workers)
-        self._network.update_noise()
+        # [STEP 2] Training Noise (SGD)
+        # Tạo lại loader với batch_size nhỏ hơn cho việc train noise
+        train_loader_sgd = DataLoader(train_set, batch_size=self.batch_size, shuffle=True,
+                                        num_workers=self.num_workers)
         
         self._clear_gpu()
-
-        self.run(train_loader)
+        self.run(train_loader_sgd)
+        
+        # Thu thập GPM Projection sau khi train xong noise
         self._network.collect_projections(mode='threshold', val=0.95)
-      
-        
         self._clear_gpu()
-
 
         del train_set
 
-        train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
-        train_set.labels = self.cat2order(train_set.labels, data_manger)
-
-        train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
-                                    num_workers=self.num_workers)
-        test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
-                                    num_workers=self.num_workers)
+        # [STEP 3] Re-Fit Analytic Classifier (Final Polish)
+        # Dùng tập train không augmentation để chốt hạ classifier
+        train_set_no_aug = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
+        train_set_no_aug.labels = self.cat2order(train_set_no_aug.labels, data_manger)
+        
+        train_loader_no_aug = DataLoader(train_set_no_aug, batch_size=self.buffer_batch, shuffle=True,
+                                         num_workers=self.num_workers)
 
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
 
-        self.re_fit(train_loader, test_loader)
-        #self.check_rls_quality()
-        del train_set, test_set
+        self.re_fit(train_loader_no_aug, test_loader)
+        
+        del train_set_no_aug, test_set
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
-        # [SỬA LỖI CHIẾN THUẬT]: Global Analytic Learning (Học 1 lần cho cả epoch)
+        # [FIX 2: MEMORY ACCUMULATION]
+        # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
+        # Nếu tính lại từ đầu, model sẽ quên sạch quá khứ.
+        
         self._network.eval()
         self._network.to(self.device)
         
-        # 1. Khởi tạo ma trận thống kê
+        # 1. Xác định kích thước feature
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
             dummy_feat = self._network.extract_feature(dummy_input)
@@ -233,52 +241,64 @@ class MinNet(object):
                 dummy_feat = self._network.buffer(dummy_feat.float())
             feat_dim = dummy_feat.shape[1]
         
-        # [FIX QUAN TRỌNG]: Lấy num_classes từ _network (đã update) thay vì self (chưa update)
+        # Lấy tổng số class ĐÃ ĐƯỢC MỞ RỘNG
         num_classes = self._network.known_class
         
-        # Ma trận A (Tự tương quan) và B (Tương quan chéo)
-        A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-        B = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+        # 2. Khởi tạo Global Memory nếu chưa có (lưu trong self của MinNet để persist qua các task)
+        if not hasattr(self, 'A_global'):
+            print("--> Initializing Global RLS Memory...")
+            self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+            self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
+
+        # Mở rộng B_global nếu số class tăng lên
+        current_B_cols = self.B_global.shape[1]
+        if num_classes > current_B_cols:
+            diff = num_classes - current_B_cols
+            expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
+            self.B_global = torch.cat([self.B_global, expansion], dim=1)
+            
+        print(f"--> Accumulating Statistics for Task {self.cur_task} (Total Classes: {num_classes})...")
         
-        print(f"--> Collecting Statistics for Task {self.cur_task} (Classes: {num_classes})...")
+        # 3. Tích lũy thống kê (Chỉ cộng thêm phần của Task mới)
+        # Lưu ý: A_new và B_new là thống kê của RIÊNG dữ liệu hiện tại
+        A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+        B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
         
-        # 2. Vòng lặp cộng dồn (Accumulation Phase)
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Accumulating")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # Xử lý targets để đảm bảo one_hot đúng
                 if targets.dim() > 1: targets = targets.view(-1)
                 
                 # Forward
                 features = self._network.extract_feature(inputs).float()
                 features = self._network.buffer(features)
                 
-                # One-hot chuẩn xác với num_classes cố định
+                # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
                 targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                 
-                # Cộng dồn
-                A += features.T @ features
-                B += features.T @ targets_oh
+                A_new += features.T @ features
+                B_new += features.T @ targets_oh
         
-        # 3. Giải phương trình (Solving Phase)
+        # 4. Cộng vào bộ nhớ toàn cục
+        self.A_global += A_new
+        self.B_global += B_new
+        
+        # 5. Giải hệ phương trình trên bộ nhớ toàn cục
+        # W = (A_global + gamma * I)^-1 @ B_global
+        print("--> Solving Global Linear System...")
         gamma = self.args['gamma']
         I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-        
-        print("--> Solving Linear System...")
-        A_reg = A + gamma * I
+        A_reg = self.A_global + gamma * I
         
         try:
-            W = torch.linalg.solve(A_reg, B)
+            W = torch.linalg.solve(A_reg, self.B_global)
         except RuntimeError:
-            W = torch.linalg.pinv(A_reg) @ B
+            W = torch.linalg.pinv(A_reg) @ self.B_global
             
-        # 4. Gán trọng số
+        # 6. Gán trọng số
         if self._network.weight.shape != W.shape:
             self._network.weight = torch.zeros_like(W)
-            self._network.weight.data = W
-        else:
-            self._network.weight.data = W
+        self._network.weight.data = W
             
         print("--> Analytic Learning Finished.")
         self._clear_gpu()
