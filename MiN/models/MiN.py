@@ -318,7 +318,7 @@ class MinNet(object):
         model.to(self.device)
         
         # [FIX] Lấy prototype thông qua con mắt của Expert
-        model.set_noise_mode(-2) 
+        model.set_noise_mode(-3) 
         
         all_features = []
         all_targets = []

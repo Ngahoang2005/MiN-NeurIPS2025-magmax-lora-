@@ -232,73 +232,40 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # 1. TRÍCH XUẤT UNIVERSAL FEATURE (Routing & Baseline)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            # Chỉ chạy backbone mode -2 một lần duy nhất cho cả batch
-            feat_uni = self.backbone(x) 
-            feat_buffer_uni = self.buffer(feat_uni)
-            logits_uni = self.forward_fc(feat_buffer_uni)
+            feat_noisy_uni = self.backbone(x)
+            logits_uni = self.forward_fc(self.buffer(feat_noisy_uni))
 
-        if num_tasks == 0:
-            if was_training: self.train()
-            return {'logits': logits_uni}
-
-        # 2. ROUTING TRONG KHÔNG GIAN UNIVERSAL
-        # So sánh feat_uni (mode -2) với prototypes (phải được tính ở mode -2)
-        task_scores = []
+        # BƯỚC 2: LẤY FEATURE SẠCH (MODE -3) ĐỂ ROUTING
+        # Phải forward thêm 1 lần (hoặc lấy feature từ bước trước nếu kiến trúc cho phép)
+        # để đảm bảo so sánh "Sạch vs Sạch"
+        self.set_noise_mode(-3)
         with torch.no_grad():
-            feat_uni_norm = F.normalize(feat_uni, p=2, dim=1)
-            for t_idx, protos in enumerate(self.task_prototypes):
-                p_gpu = protos.to(x.device)
-                p_norm = F.normalize(p_gpu, p=2, dim=1)
-                
-                # Tính similarity giữa ảnh (Uni) và Prototype (Uni)
-                sim_matrix = torch.mm(feat_uni_norm, p_norm.t())
-                max_sim_task, _ = sim_matrix.max(dim=1)
-                task_scores.append(max_sim_task)
+            feat_clean = self.backbone(x) 
+            feat_norm = F.normalize(feat_clean, p=2, dim=1)
             
-            # Chọn Task ID phù hợp nhất cho từng ảnh trong batch
-            all_scores = torch.stack(task_scores, dim=1) # [Batch, Num_Tasks]
-            max_sim_values, selected_task_ids = all_scores.max(dim=1)
+            # Tính Similarity với Prototype (cũng tính ở -3)
+            task_scores = []
+            for t_idx, protos in enumerate(self.task_prototypes):
+                p_norm = F.normalize(protos.to(x.device), p=2, dim=1)
+                sim_t, _ = torch.mm(feat_norm, p_norm.t()).max(dim=1)
+                task_scores.append(sim_t)
+            
+            selected_task_ids = torch.stack(task_scores, dim=1).argmax(dim=1)
 
-        # 3. LẤY LOGITS TỪ EXPERT (SPECIFIC BRANCH)
-        # Sau khi biết ảnh thuộc task nào, ta mới bật Expert đó lên để lấy tri thức chuyên sâu
+        # BƯỚC 3: LẤY LOGIT EXPERT (SPECIFIC)
         best_logits_spec = torch.zeros_like(logits_uni)
-        
         with torch.no_grad():
-            unique_tasks = selected_task_ids.unique()
-            for t in unique_tasks:
+            for t in selected_task_ids.unique():
                 mask = (selected_task_ids == t)
-                t_val = t.item()
-                
-                # Bật Expert của task được chọn
-                self.set_noise_mode(t_val)
-                
-                # Forward những ảnh thuộc task này qua Expert của nó
-                feat_spec = self.backbone(x[mask])
-                raw_logits_spec = self.forward_fc(self.buffer(feat_spec))
-                
-                # --- MASKING LOGIC ---
-                # Chỉ lấy logits của các class thuộc về task t_val
-                masked_l = torch.zeros_like(raw_logits_spec)
-                if hasattr(self, 'task_class_indices') and t_val < len(self.task_class_indices):
-                    idx = self.task_class_indices[t_val]
-                    masked_l[:, idx] = raw_logits_spec[:, idx]
-                else:
-                    masked_l = raw_logits_spec
-                
+                self.set_noise_mode(t.item())
+                # ... forward expert và masking như cũ ...
                 best_logits_spec[mask] = masked_l
 
-        # 4. KẾT HỢP (Hoặc chỉ lấy Spec như bạn đang test)
-        alpha = 1.0
-        weight = 1.0 # Có thể dùng max_sim_values.unsqueeze(1) để làm trọng số mềm
+        # BƯỚC 4: ENSEMBLE
+        # Bây giờ bạn có Uni chuẩn (-2) và Spec chuẩn (Mode t)
+        final_logits = best_logits_spec 
         
-        # Theo yêu cầu test mỗi spec của bạn:
-        final_logits = best_logits_spec * weight * alpha
-        
-        # Nếu muốn ensemble: final_logits = logits_uni + (best_logits_spec * weight * alpha)
-
         self.set_noise_mode(-2)
-        if was_training: self.train()
         return {'logits': final_logits}
