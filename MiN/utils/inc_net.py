@@ -626,7 +626,7 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    def forward_tuna_combined(self, x, targets=None, top_k=2, tau=0.1):
+    def forward_tuna_combined(self, x, targets=None, top_k=10, tau=0.1):
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
@@ -703,7 +703,7 @@ class MiNbaseNet(nn.Module):
                 combined_expert_logits[batch_mask] += w_t[batch_mask] * expert_contribution
 
         # BƯỚC 4: KẾT HỢP DỰ ĐOÁN (Theo logic TUNA Eq. 12)
-        final_logits = logits_uni + combined_expert_logits
+        final_logits = combined_expert_logits
         
         # --- TÍNH TỶ LỆ CHỌN ĐÚNG EXPERT (TOP-1) ---
         routing_acc = -1.0
