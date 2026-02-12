@@ -102,6 +102,7 @@ class PiNoise(nn.Module):
         # [AN TOÀN 2] Learnable Scaling Factor
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
+        self.last_debug_info = {}
 
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
@@ -152,32 +153,49 @@ class PiNoise(nn.Module):
         self.mu.load_state_dict(get_merged_state(self.history_mu))
         self.sigma.load_state_dict(get_merged_state(self.history_sigma))
 
-    def forward(self, hyper_features, new_forward=False):
-        # 1. Down Projection
-        x_down = hyper_features @ self.w_down 
+    def forward(self, hyper_features):
+        x_down = hyper_features @ self.w_down
         
         mu = self.fc_mu(x_down)
-        # Softplus đảm bảo dương, cộng epsilon nhỏ để tránh lỗi chia cho 0
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
         
         if self.training:
             epsilon = torch.randn_like(sigma)
             z = mu + sigma * epsilon
         else:
-            z = mu # Test time: Deterministic
+            z = mu 
             
-        # Tính KL Loss (Analytical)
-        # Chúng ta muốn ép z về N(0, I)
         kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
         
-        # [AN TOÀN 2] Scale nhiễu trước khi chiếu lên
-        noise_projected = z @ self.w_up
+        # Calculate Noise Effect
+        raw_noise = z @ self.w_up
+        effective_noise = self.noise_scale * raw_noise # Noise thực tế cộng vào
         
-        # Cộng vào features: Feature + (0.1 * Noise)
-        # Điều này đảm bảo Signal luôn trội hơn Noise
-        out = hyper_features + (self.noise_scale * noise_projected)
+        out = hyper_features + effective_noise
         
+        # [NEW] THU THẬP SỐ LIỆU DEBUG (Chỉ làm khi training để nhẹ máy)
+        if self.training:
+            with torch.no_grad():
+                # 1. Độ lớn tín hiệu gốc (L2 Norm trung bình)
+                signal_norm = hyper_features.norm(p=2, dim=-1).mean()
+                
+                # 2. Độ lớn nhiễu thực tế
+                noise_norm = effective_noise.norm(p=2, dim=-1).mean()
+                
+                # 3. Sigma trung bình (để xem variational có bị co về 0 không)
+                sigma_mean = sigma.mean()
+                
+                # 4. Lưu lại
+                self.last_debug_info = {
+                    "signal": signal_norm.item(),
+                    "noise": noise_norm.item(),
+                    "sigma": sigma_mean.item(),
+                    "snr": (signal_norm / (noise_norm + 1e-9)).item(), # Signal-to-Noise Ratio
+                    "scale": self.noise_scale.item()
+                }
+
         return out, kl_div.mean()
+    
     def apply_gradient_projection(self, scale=1.0):
         """
         GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T

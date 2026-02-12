@@ -260,13 +260,11 @@ class MinNet(object):
         
        
     def run(self, train_loader):
-        # [TỐI ƯU 1]: Sử dụng scaler đã khởi tạo
-        
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # Tính Adaptive Scale cho GPM (giữ nguyên logic của bạn)
+        # Adaptive Scale GPM
         current_scale = 0.85 
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
@@ -287,19 +285,14 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        
-        # [NEW] Cấu hình cho Information Bottleneck
-        # Beta là trọng số của KL Loss. 
-        # Ta dùng Annealing: Tăng dần từ 0 -> max_beta để tránh shock model lúc đầu
-        max_beta = 1e-3  # Giá trị an toàn. Nếu thấy model ít nhiễu quá thì tăng lên 1e-2
+        max_beta = 1e-3
         
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            kl_losses = 0.0 # Để log xem KL loss bao nhiêu
+            kl_losses = 0.0
             correct, total = 0, 0
 
-            # [NEW] Tính beta hiện tại (Linear Annealing)
-            # Tăng dần beta trong nửa đầu quá trình train
+            # Annealing Beta
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
@@ -307,43 +300,37 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True) 
 
                 with autocast('cuda'):
-                    # --- Logic Forward thay đổi để lấy KL Loss ---
-                    
+                    # --- Forward ---
                     if self.cur_task > 0:
-                        # 1. Lấy Logits từ Task cũ (đóng băng, không có noise variation lớn)
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
-                        
-                        # 2. Lấy Logits Task mới + KL Loss (Có variational noise)
-                        # Hàm này phải được định nghĩa trong inc_net.py như đã bàn ở trên
                         logits2, batch_kl = self._network.forward_with_ib(inputs)
-                        
                         logits_final = logits2 + logits1
                     else:
-                        # Task 0 cũng cần IB để nén thông tin ngay từ đầu
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
                     
-                    # --- Tính Tổng Loss ---
-                    ce_loss = F.cross_entropy(logits_final, targets.long())
+                    # --- [FIX LỖI TARGET SIZE] ---
+                    if targets.dim() > 1: 
+                        targets = targets.squeeze().view(-1)
+                    targets = targets.long()
                     
-                    # Loss = CrossEntropy + Beta * KL_Divergence
+                    # --- Tính Loss ---
+                    ce_loss = F.cross_entropy(logits_final, targets)
                     loss = ce_loss + beta_current * batch_kl
 
-                # --- Backward & Optimizer (Giữ nguyên tối ưu GPM) ---
+                # --- Backward ---
                 self.scaler.scale(loss).backward()
                 
-                if self.cur_task > 0:
-                    if epoch >= WARMUP_EPOCHS:
-                        self.scaler.unscale_(optimizer)
-                        self._network.apply_gpm_to_grads(scale=0.85)
-                    else:
-                        pass
+                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+                    self.scaler.unscale_(optimizer)
+                    self._network.apply_gpm_to_grads(scale=current_scale)
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
+                # --- Metrics ---
                 losses += loss.item()
-                kl_losses += batch_kl.item() # Log để theo dõi
+                kl_losses += batch_kl.item()
                 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
@@ -351,11 +338,16 @@ class MinNet(object):
                 
                 del inputs, targets, loss, logits_final, batch_kl
 
+                # [DEBUG NOISE] In thông tin mỗi 50 batch để kiểm tra
+                # Chỉ in khi đang ở Task > 0 (Task có học Noise) hoặc cuối epoch task 0
+                if i % 50 == 0:
+                     if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
+                        self.print_noise_status()
+
             scheduler.step()
             train_acc = 100. * correct / total
 
-            # [LOGGING] Thêm thông tin KL và Beta
-            info = "T {} | Ep {} | L {:.3f} (KL {:.4f}) | Acc {:.2f} | B {:.1e}".format(
+            info = "T {} | Ep {} | L {:.3f} (KL {:.4f}) | Acc {:.2f} | Beta {:.1e}".format(
                 self.cur_task, epoch + 1, losses / len(train_loader), 
                 kl_losses / len(train_loader), train_acc, beta_current
             )
@@ -364,6 +356,36 @@ class MinNet(object):
             
             if epoch % 5 == 0:
                 self._clear_gpu()
+
+    # Thêm hàm helper này vào trong class MinNet luôn để tiện gọi self
+    def print_noise_status(self):
+        print("\n" + "="*85)
+        print(f"{'Layer':<10} | {'Signal':<10} | {'Noise':<10} | {'SNR':<10} | {'Sigma':<10} | {'Scale':<10} | {'Status'}")
+        print("-" * 85)
+        
+        # Lấy danh sách các lớp Noise từ backbone
+        # Lưu ý: Cấu trúc backbone của bạn có thể khác, hãy đảm bảo path đúng
+        # Ví dụ: self._network.backbone.noise_maker
+        noise_layers = []
+        if hasattr(self._network.backbone, 'noise_maker'):
+             noise_layers = self._network.backbone.noise_maker
+        
+        for i, layer in enumerate(noise_layers):
+            # Kiểm tra xem lớp đó có biến last_debug_info không (đã thêm ở bước trước)
+            if not hasattr(layer, 'last_debug_info') or not layer.last_debug_info: 
+                continue
+            
+            info = layer.last_debug_info
+            
+            # Đánh giá trạng thái
+            snr = info['snr']
+            if snr < 1.0: status = "TOXIC ☠️"       # Nhiễu to hơn tín hiệu
+            elif snr < 10.0: status = "HEAVY ⚠️"    # Nhiễu nặng
+            elif snr > 1000.0: status = "USELESS 💤" # Nhiễu quá bé
+            else: status = "GOOD ✅"                # 10 < SNR < 1000
+            
+            print(f"L{i:<9} | {info['signal']:.4f}     | {info['noise']:.4f}     | {snr:.1f}       | {info['sigma']:.4f}     | {info['scale']:.4f}     | {status}")
+        print("="*85 + "\n")
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -401,3 +423,4 @@ class MinNet(object):
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
+    
