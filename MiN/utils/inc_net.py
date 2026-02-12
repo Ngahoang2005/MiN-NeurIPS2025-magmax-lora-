@@ -223,48 +223,90 @@ class MiNbaseNet(nn.Module):
             self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
     def forward_with_ib(self, x):
         """
-        [NEW] Forward đặc biệt để thu thập KL Divergence (Information Bottleneck).
-        Hàm này giả định backbone là ViT và có module `noise_maker`.
+        [FIXED] Forward với IB, thêm logic lấy [CLS] token cho ViT.
         """
         kl_losses = []
         
-        # 1. Patch Embedding & Positional Embedding
-        # Logic này mô phỏng lại forward của timm ViT
+        # 1. Embeddings
         x = self.backbone.patch_embed(x)
         if hasattr(self.backbone, '_pos_embed'):
             x = self.backbone._pos_embed(x)
         else:
-            # Fallback cho các version timm cũ hoặc custom
             if self.backbone.pos_embed is not None:
                 x = x + self.backbone.pos_embed
             x = self.backbone.pos_drop(x)
 
-        # 2. Forward qua Blocks + Inject Noise IB
+        # 2. Blocks + Noise
         for i, block in enumerate(self.backbone.blocks):
-            x = block(x) # Layer gốc
-            
-            # Gọi lớp PiNoiseIB tương ứng
+            x = block(x) 
             if hasattr(self.backbone, 'noise_maker'):
                 x, kl = self.backbone.noise_maker[i](x)
                 kl_losses.append(kl)
         
-        # 3. Norm cuối cùng
+        # 3. Norm
         if hasattr(self.backbone, 'norm'):
             x = self.backbone.norm(x)
-            
+
+        # [CRITICAL FIX]: Lấy [CLS] Token (Index 0)
+        # Nếu output là [Batch, 197, Dim] thì chỉ lấy [Batch, Dim]
+        if x.dim() == 3:
+            x = x[:, 0]
+
         # 4. Classifier
-        # Đưa vào Random Buffer
         x = self.buffer(x.to(self.buffer.weight.dtype))
-        
-        # Đưa vào Normal FC (để train bằng SGD)
         x = x.to(self.normal_fc.weight.dtype)
         logits = self.normal_fc(x)['logits']
         
-        # Tổng hợp KL Loss
         total_kl = torch.sum(torch.stack(kl_losses)) if kl_losses else torch.tensor(0.0, device=self.device)
         
         return logits, total_kl
 
+    @torch.no_grad()
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
+        with autocast(enabled=False):
+            X = X.float().to(self.device)
+            Y = Y.float().to(self.device)
+            num_targets = Y.shape[1]
+            
+            if self.weight.shape[1] == 0:
+                # [FIXED] Tính dummy feature cũng phải chuẩn [CLS] token
+                dummy_feat = self.backbone(X[0:2]).float()
+                dummy_feat = self.buffer(dummy_feat)
+                feat_dim = dummy_feat.shape[1]
+                self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            elif num_targets > self.weight.shape[1]:
+                increment = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+
+            N = X.shape[0]
+            feat_dim = self.weight.shape[0]
+            A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+            B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                x_batch = X[start:end] 
+                y_batch = Y[start:end] 
+                
+                features = self.backbone(x_batch).float()
+                features = self.buffer(features)
+                
+                A += features.T @ features
+                B += features.T @ y_batch
+                del features, x_batch, y_batch 
+
+            I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+            A += self.gamma * I 
+
+            try:
+                W_solution = torch.linalg.solve(A, B)
+            except RuntimeError:
+                W_solution = torch.linalg.pinv(A) @ B
+            
+            self.weight = W_solution
+            del A, B, I, X, Y
+            torch.cuda.empty_cache()
     # =========================================================================
     # [ANALYTIC LEARNING (OPTIMIZED FIT)]
     # =========================================================================
