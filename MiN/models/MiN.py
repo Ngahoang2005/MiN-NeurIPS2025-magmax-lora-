@@ -304,9 +304,7 @@ class MinNet(object):
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
         current_scale = 0.85 
-        if self.cur_task > 0:
-            current_scale = self.compute_adaptive_scale(train_loader)
-
+        
         # Freeze/Unfreeze
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
