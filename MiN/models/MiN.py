@@ -83,9 +83,7 @@ class MinNet(object):
         print('total acc: {}'.format(self.total_acc))
         print('avg_acc: {:.2f}'.format(np.mean(self.total_acc)))
         if self.cur_task >= 0:
-            self.analyze_entropy_accuracy(test_loader)
-            self.analyze_universal_correlation(test_loader)
-            self.visualize_expert_orthogonality()
+            self.analyze_cosine_accuracy(test_loader)  # [ADDED] Phân tích mối quan hệ giữa Cosine Similarity và Accuracy sau mỗi task
         del test_set
 
     def save_check_point(self, path_name):
@@ -235,38 +233,20 @@ class MinNet(object):
         self._network.to(self.device)
         
         if self.cur_task > 0:
-            decay = 0.9  # Giữ lại 90% kiến thức cũ
+            decay = 0.9 
             self._network.H *= decay
             self._network.Hy *= decay
         else:
             self._network.H.zero_()
             self._network.Hy.zero_()
-        print(">>> [Fast RLS] Accumulating Statistics form Train Loader...")
-        
-        # Nếu Dataloader có Data Augmentation, bạn có thể chạy nhiều epoch để lấy trung bình thống kê tốt hơn.
-        # Nếu không Augmentation, chỉ cần chạy 1 epoch là đủ (Toán học chứng minh là tương đương).
-        # Ở đây tôi giữ vòng lặp epoch nhưng thường 1 epoch là đủ cho RLS dạng này.
-        
-        prog_bar = tqdm(train_loader)
-        for i, (_, inputs, targets) in enumerate(prog_bar):
-            inputs, targets = inputs.to(self.device), targets.to(self.device)
-            
-            # Chuyển target sang one-hot global
-            targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
-            
-            # [BƯỚC 1] Chỉ tích lũy (Accumulate), cực nhanh
-            self._network.fit_batch(inputs, targets)
-            
-        # [BƯỚC 2] Giải hệ phương trình 1 lần duy nhất sau khi đã xem hết dữ liệu
-        print(f">>> [RLS Update] Task {self.cur_task} - Accumulating...")
+
+        print(f">>> [Fast RLS] Accumulating Stats for Task {self.cur_task}...")
         prog_bar = tqdm(train_loader)
         for i, (_, inputs, targets) in enumerate(prog_bar):
             inputs, targets = inputs.to(self.device), targets.to(self.device)
             targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
             self._network.fit_batch(inputs, targets)
             
-        # Giải hệ phương trình với Lambda nhỏ hơn để tăng biên độ Logit
-        # (Sửa lambda_reg xuống 1.0 trong inc_net.py)
         self._network.update_analytical_weights()
         self._clear_gpu()
 
@@ -447,163 +427,68 @@ class MinNet(object):
     # DEBUG TOOLS: ENTROPY, ACCURACY & ORTHOGONALITY VISUALIZATION
     # =========================================================================
 
-    def analyze_entropy_accuracy(self, test_loader):
-        """Vẽ biểu đồ tương quan giữa Độ tự tin (Entropy) và Độ chính xác (Accuracy)"""
+    def analyze_cosine_accuracy(self, test_loader):
+        """Vẽ biểu đồ: Mối quan hệ giữa Cosine Similarity và Accuracy"""
         self._network.eval()
-        all_entropies = []
+        all_similarities = []
         all_correct_flags = []
     
-        print(f">>> [DEBUG] Analyzing Entropy vs Accuracy for Task {self.cur_task}...")
-        max_samples = 2000 # Lấy mẫu vừa đủ để vẽ nhanh
-        current_samples = 0
-    
-        with torch.no_grad():
-            for _, inputs, targets in tqdm(test_loader, desc="Collecting Entropy Data"):
-                if current_samples >= max_samples: break
-                
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # 1. Kích hoạt Expert hiện tại để kiểm tra
-                self._network.set_noise_mode(self.cur_task)
-                
-                # 2. Forward thủ công qua Shared W
-                feat = self._network.extract_feature(inputs)
-                feat = self._network.buffer(feat)
-                logits = self._network.forward_fc(feat)
-                
-                # 3. Tính Entropy
-                prob = torch.softmax(logits, dim=1)
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                
-                # 4. Check đúng/sai
-                predicts = torch.max(logits, dim=1)[1]
-                correct = (predicts == targets).float()
-    
-                all_entropies.extend(entropy.cpu().numpy())
-                all_correct_flags.extend(correct.cpu().numpy())
-                current_samples += inputs.shape[0]
-    
-        self._plot_bin_graph(all_entropies, all_correct_flags, mode="Specific")
+        print(f">>> [DEBUG] Analyzing Cosine Similarity vs Accuracy for Task {self.cur_task}...")
+        
+        # Lấy prototype của task hiện tại để so sánh
+        current_proto = self._network.task_prototypes[self.cur_task].to(self.device)
+        current_proto = F.normalize(current_proto.unsqueeze(0), p=2, dim=1)
 
-    def analyze_universal_correlation(self, test_loader):
-        """Kiểm tra nhánh Universal hoạt động thế nào"""
-        self._network.eval()
-        all_entropies = []
-        all_correct_flags = []
-        print(f">>> [DEBUG] Analyzing Universal Branch...")
-        
-        max_samples = 2000
-        current_samples = 0
-        
         with torch.no_grad():
-            for _, inputs, targets in tqdm(test_loader, desc="Collecting Universal Data"):
-                if current_samples >= max_samples: break
+            for _, inputs, targets in tqdm(test_loader, desc="Collecting Cosine Data"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # Set Universal Mode
+                # Lấy feature ở mode Universal
                 self._network.set_noise_mode(-2)
-                
                 feat = self._network.extract_feature(inputs)
-                feat = self._network.buffer(feat)
-                logits = self._network.forward_fc(feat)
+                feat_norm = F.normalize(feat, p=2, dim=1)
                 
-                prob = torch.softmax(logits, dim=1)
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                predicts = torch.max(logits, dim=1)[1]
+                # Tính Sim với Prototype của task đúng
+                sim = torch.mm(feat_norm, current_proto.t()).squeeze(1)
+                
+                # Lấy dự đoán cuối cùng (dùng hàm combined chuẩn)
+                outputs = self._network.forward_tuna_combined(inputs)
+                predicts = torch.max(outputs['logits'], dim=1)[1]
                 correct = (predicts == targets).float()
-    
-                all_entropies.extend(entropy.cpu().numpy())
+
+                all_similarities.extend(sim.cpu().numpy())
                 all_correct_flags.extend(correct.cpu().numpy())
-                current_samples += inputs.shape[0]
-    
-        self._plot_bin_graph(all_entropies, all_correct_flags, mode="Universal")
 
-    def _plot_bin_graph(self, entropies, correct_flags, mode="Specific", num_bins=10):
+        self._plot_cosine_graph(all_similarities, all_correct_flags)
+
+    def _plot_cosine_graph(self, sims, corrects, num_bins=10):
         try:
-            entropies = np.array(entropies)
-            correct_flags = np.array(correct_flags)
-            if len(entropies) == 0: return
+            sims = np.array(sims)
+            corrects = np.array(corrects)
+            
+            # Chia bins theo độ tương đồng (0.0 đến 1.0)
+            bin_edges = np.linspace(0, 1, num_bins + 1)
+            bin_accs = []
+            bin_centers = []
 
-            # Chia bins từ min entropy đến max entropy
-            min_e, max_e = entropies.min(), entropies.max()
-            if min_e == max_e: max_e += 1e-5
-            
-            bin_edges = np.linspace(min_e, max_e, num_bins + 1)
-            accuracies = []
-            avg_entropies = []
-        
             for i in range(num_bins):
-                mask = (entropies >= bin_edges[i]) & (entropies < bin_edges[i+1])
+                mask = (sims >= bin_edges[i]) & (sims < bin_edges[i+1])
                 if mask.any():
-                    accuracies.append(correct_flags[mask].mean() * 100) # % Accuracy
-                    avg_entropies.append((bin_edges[i] + bin_edges[i+1]) / 2)
-        
-            # Vẽ biểu đồ
+                    bin_accs.append(corrects[mask].mean() * 100)
+                    bin_centers.append((bin_edges[i] + bin_edges[i+1]) / 2)
+
             plt.figure(figsize=(8, 6))
-            color = 'red' if mode == "Specific" else 'blue'
-            plt.plot(accuracies, avg_entropies, marker='o', color=color, linewidth=2, label=f'{mode} Branch')
+            plt.bar(bin_centers, bin_accs, width=0.08, color='green', alpha=0.7, edgecolor='black')
+            plt.plot(bin_centers, bin_accs, marker='o', color='darkgreen', linewidth=2)
             
-            plt.xlabel('Accuracy (%)', fontsize=12)
-            plt.ylabel('Entropy (Uncertainty)', fontsize=12)
-            plt.title(f'Debug: {mode} Confidence (Task {self.cur_task})', fontsize=14)
-            plt.grid(True, linestyle='--', alpha=0.6)
-            plt.gca().invert_yaxis() # Đảo trục Y: Entropy thấp (Tốt) ở trên cao
-            plt.legend()
+            plt.xlabel('Cosine Similarity to Task Prototype', fontsize=12)
+            plt.ylabel('Accuracy (%)', fontsize=12)
+            plt.title(f'Reliability Diagram: Similarity vs Acc (Task {self.cur_task})', fontsize=14)
+            plt.grid(axis='y', linestyle='--', alpha=0.6)
+            plt.ylim(0, 105)
             
-            filename = f'debug_{mode.lower()}_task_{self.cur_task}.png'
-            plt.savefig(filename)
+            plt.savefig(f'debug_cosine_acc_task_{self.cur_task}.png')
             plt.close()
-            print(f">>> [PLOT] Saved chart to: {filename}")
+            print(f">>> [PLOT] Saved Cosine Debug Chart: debug_cosine_acc_task_{self.cur_task}.png")
         except Exception as e:
             print(f">>> [PLOT ERROR] {e}")
-
-    def visualize_expert_orthogonality(self):
-        """Vẽ Heatmap thể hiện độ tương quan giữa các Expert"""
-        if self.cur_task == 0: return # Chưa có gì để so sánh
-        
-        print(f">>> [DEBUG] Visualizing Expert Orthogonality...")
-        try:
-            # Thu thập trọng số Mu từ tất cả Expert
-            mus = []
-            with torch.no_grad():
-                for i in range(self.cur_task + 1):
-                    # Lấy trung bình trọng số của các layer noise để đại diện cho task đó
-                    # Hoặc lấy layer cuối cùng (thường chứa thông tin ngữ nghĩa cao nhất)
-                    layer_idx = self._network.backbone.layer_num - 1
-                    expert_mu = self._network.backbone.noise_maker[layer_idx].mu[i].weight.data.flatten()
-                    mus.append(expert_mu)
-            
-            if not mus: return
-
-            # Stack lại: [Num_Tasks, Dim]
-            mus_tensor = torch.stack(mus)
-            
-            # Normalize vector về đơn vị
-            mus_norm = F.normalize(mus_tensor, p=2, dim=1)
-            
-            # Tính Ma trận Cosine Similarity: [Num_Tasks, Num_Tasks]
-            # Heatmap[i, j] = Cosine(Expert_i, Expert_j)
-            similarity_matrix = torch.mm(mus_norm, mus_norm.t()).cpu().numpy()
-            
-            # Vẽ Heatmap
-            plt.figure(figsize=(8, 6))
-            plt.imshow(similarity_matrix, cmap='viridis', interpolation='nearest')
-            plt.colorbar(label='Cosine Similarity')
-            plt.title(f'Expert Orthogonality Matrix (Task 0-{self.cur_task})')
-            plt.xlabel('Expert ID')
-            plt.ylabel('Expert ID')
-            
-            # Hiển thị số trên ô
-            for i in range(len(similarity_matrix)):
-                for j in range(len(similarity_matrix)):
-                    text = f"{similarity_matrix[i, j]:.2f}"
-                    color = "white" if similarity_matrix[i, j] < 0.5 else "black"
-                    plt.text(j, i, text, ha="center", va="center", color=color)
-            
-            filename = f'debug_orthogonality_task_{self.cur_task}.png'
-            plt.savefig(filename)
-            plt.close()
-            print(f">>> [PLOT] Saved orthogonality map to: {filename}")
-            
-        except Exception as e:
-            print(f">>> [PLOT ERROR] Could not visualize orthogonality: {e}")

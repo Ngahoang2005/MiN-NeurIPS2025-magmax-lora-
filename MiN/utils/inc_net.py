@@ -303,45 +303,52 @@ class MiNbaseNet(nn.Module):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
-        num_tasks = len(self.backbone.noise_maker[0].mu)
+        num_tasks = len(self.task_prototypes)
         
-        # 1. Nhánh Universal (Base) - Mode -2
+        # 1. Trích xuất Base Feature (Mode -2: Universal)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_uni = self.buffer(self.backbone(x))
-            logits_uni = self.forward_fc(feat_uni)
+            feat_backbone = self.backbone(x) # [Batch, 768]
+            feat_buffer = self.buffer(feat_backbone)
+            logits_uni = self.forward_fc(feat_buffer) # Logits nền
 
-        # 2. Tìm Best Specific Branch bằng Entropy
+        # 2. COSINE SIMILARITY ROUTING (Dùng Base Feature để match Task)
+        selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
+        if num_tasks > 0:
+            with torch.no_grad():
+                # Chuẩn hóa feature
+                feat_norm = F.normalize(feat_backbone, p=2, dim=1) # [B, D]
+                # Concat các prototype thành ma trận để tính nhanh
+                all_protos = torch.stack(self.task_prototypes).to(x.device) # [N_task, D]
+                all_protos_norm = F.normalize(all_protos, p=2, dim=1)
+                
+                # Sim matrix: [B, D] @ [D, N_task] -> [B, N_task]
+                sim_matrix = torch.mm(feat_norm, all_protos_norm.t())
+                # Chọn Task có Similarity cao nhất
+                selected_task_ids = sim_matrix.argmax(dim=1)
+
+        # 3. SPECIFIC INFERENCE (Chỉ forward Expert được chọn - Tối ưu 90% tốc độ)
         best_logits_spec = torch.zeros_like(logits_uni)
-        min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
-
+        
         with torch.no_grad():
-            for t in range(num_tasks):
-                self.set_noise_mode(t)
-                l_t = self.forward_fc(self.buffer(self.backbone(x)))
-                
-                # [FIX] Dùng Temperature Scaling (T=0.1) để làm rõ Entropy
-                # Giúp tách biệt rõ mẫu tự tin và mẫu đoán mò
-                prob = torch.softmax(l_t / 0.1, dim=1) 
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                
-                mask = entropy < min_entropy
-                min_entropy[mask] = entropy[mask]
-                best_logits_spec[mask] = l_t[mask]
+            # Duyệt qua các Task IDs xuất hiện trong batch
+            unique_tasks = selected_task_ids.unique()
+            for t in unique_tasks:
+                mask = (selected_task_ids == t)
+                # Bật đúng Expert cho task đó
+                self.set_noise_mode(t.item())
+                # Chỉ re-forward những mẫu thuộc task t
+                feat_t = self.backbone(x[mask])
+                l_t = self.forward_fc(self.buffer(feat_t))
+                best_logits_spec[mask] = l_t
 
-        # 3. [FIX] Dynamic Balancing (Cân bằng biên độ)
-        mag_uni = logits_uni.abs().mean()
-        mag_spec = best_logits_spec.abs().mean()
-        alpha = mag_uni / (mag_spec + 1e-8)
-        alpha = torch.clamp(alpha, min=0.1, max=1.0)
-
-        # 4. Cộng gộp: Uni dẫn đường, Spec bổ trợ
-        final_logits = logits_uni + alpha * best_logits_spec
+        # 4. Cộng gộp (TUNA Ensemble)
+        final_logits = logits_uni + best_logits_spec
 
         self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
-
+    
     def merge_noise_experts(self):
         print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
         # Duyệt qua backbone để gọi hàm merge của từng lớp PiNoise
