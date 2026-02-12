@@ -250,38 +250,44 @@ class MiNbaseNet(nn.Module):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
-        num_tasks = len(self.backbone.noise_maker[0].mu)
+        num_tasks = len(self.task_prototypes)
         
-        # 1. Lấy Universal Logits (Mode -2)
+        # 1. Trích xuất Đặc trưng nền (Mode -2: Universal)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            features_uni = self.backbone(x)
-            logits_uni = self.forward_fc(self.buffer(features_uni))
+            feat_backbone = self.backbone(x) # [Batch, 768]
+            feat_buffer = self.buffer(feat_backbone)
+            logits_uni = self.forward_fc(feat_buffer)
 
-        # 2. Tìm Best Specific Logits dựa trên ENTROPY
+        # 2. COSINE SIMILARITY ROUTING (Chọn Expert dựa trên không gian vector)
+        selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
+        if num_tasks > 0:
+            with torch.no_grad():
+                # Chuẩn hóa để tính Cosine nhanh
+                feat_norm = F.normalize(feat_backbone, p=2, dim=1) # [B, D]
+                all_protos = torch.stack(self.task_prototypes).to(x.device) # [N_task, D]
+                all_protos_norm = F.normalize(all_protos, p=2, dim=1)
+                
+                # Sim matrix: [B, N_task]
+                sim_matrix = torch.mm(feat_norm, all_protos_norm.t())
+                # Lấy index của Task giống nhất
+                selected_task_ids = sim_matrix.argmax(dim=1)
+
+        # 3. SPECIFIC FORWARD (Chỉ chạy Expert cho mẫu tương ứng)
         best_logits_spec = torch.zeros_like(logits_uni)
-        min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
-
         with torch.no_grad():
-            for t in range(num_tasks):
-                self.set_noise_mode(t) # Mode Specific
-                
-                # Forward
-                l_t = self.forward_fc(self.buffer(self.backbone(x)))
-                
-                # Tính Entropy: -sum(p * log(p))
-                prob = torch.softmax(l_t, dim=1)
-                entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
-                
-                # Nếu entropy thấp hơn (tự tin hơn) -> Chọn task này
-                mask = entropy < min_entropy
-                min_entropy[mask] = entropy[mask]
-                best_logits_spec[mask] = l_t[mask]
+            unique_tasks = selected_task_ids.unique()
+            for t in unique_tasks:
+                mask = (selected_task_ids == t)
+                self.set_noise_mode(t.item()) # Bật Expert t
+                # Re-forward Backbone chỉ cho những mẫu thuộc task t
+                feat_t = self.backbone(x[mask])
+                l_t = self.forward_fc(self.buffer(feat_t))
+                best_logits_spec[mask] = l_t
 
-        # 3. Cộng gộp kết quả: Universal + Best Specific
+        # 4. Cộng gộp kết quả (Ensemble)
         final_logits = logits_uni + best_logits_spec
 
-        self.set_noise_mode(-2) # Reset về mặc định
+        self.set_noise_mode(-2)
         if was_training: self.train()
-        
         return {'logits': final_logits}
