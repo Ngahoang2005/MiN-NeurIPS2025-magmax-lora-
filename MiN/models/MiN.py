@@ -334,9 +334,13 @@ class MinNet(object):
                             
                             if len(prev_mus) > 0:
                                 prev_stack = torch.stack(prev_mus)
-                                # Normalize
+                                
+                                # [FIX] Detach expert cũ để không tính gradient ngược về quá khứ
+                                prev_stack = prev_stack.detach() 
+                                
                                 curr_norm = F.normalize(curr_mu.unsqueeze(0), p=2, dim=1)
                                 prev_norm = F.normalize(prev_stack, p=2, dim=1)
+
                                 cos_sim = torch.mm(curr_norm, prev_norm.t())
                                 # Minimize absolute similarity
                                 loss_orth += torch.sum(torch.abs(cos_sim))

@@ -93,15 +93,17 @@ class PiNoise(torch.nn.Linear):
         self.active_task_idx = -2
 
     def update_noise(self):
-        # [MODIFIED] Luôn khởi tạo Expert mới về 0 (Zero Init)
+        # Tạo layer mới
         self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         
-        torch.nn.init.constant_(self.mu[-1].weight, 0.)
+        # [FIX] KHỞI TẠO NHIỄU (Random) THAY VÌ SỐ 0
+        # std=0.01 hoặc 0.001 để vector nhỏ nhưng không phải là 0
+        torch.nn.init.normal_(self.mu[-1].weight, mean=0.0, std=0.02)
         torch.nn.init.constant_(self.mu[-1].bias, 0.)
+        
         torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
         torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
-    
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
