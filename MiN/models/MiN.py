@@ -769,6 +769,8 @@ class MinNet(object):
                 feat = model.backbone(inputs)
                 # PHẢI qua buffer để cùng space với Routing
                 feat_high_dim = model.buffer(feat) 
+                feat_high_dim = F.normalize(feat_high_dim, p=2, dim=1) 
+                
                 all_features.append(feat_high_dim.detach().cpu())
                 all_targets.append(targets.cpu())
         all_features = torch.cat(all_features, dim=0)

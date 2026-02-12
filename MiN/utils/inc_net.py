@@ -507,57 +507,55 @@ class MiNbaseNet(nn.Module):
         self.normal_fc = SimpleLinear(self.buffer_size, self.known_class, bias=(self.cur_task==0))
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # RLS cực kỳ nhạy cảm với độ chính xác, tắt autocast để tính toán trên float32
-        with torch.amp.autocast('cuda', enabled=False):
-            # 1. Trích xuất đặc trưng (Backbone đang ở mode Trainer set)
-            X = self.backbone(X).float() 
-            X = self.buffer(X) # [Batch, Buffer_Size]
-            X, Y = X.to(self.device), Y.to(self.device).float()
-            
-            batch_size = X.shape[0]
-            num_classes_total = Y.shape[1]
-            I = torch.eye(batch_size, device=self.device)
+    # RLS cực kỳ nhạy cảm với độ chính xác, dùng float32 để tránh sai số tích lũy
+    with torch.amp.autocast('cuda', enabled=False):
+        # 1. Trích xuất đặc trưng và chiếu lên không gian cao chiều
+        X = self.backbone(X).float() 
+        X = self.buffer(X) # [Batch, Buffer_Size]
+        
+        # [ĐIỂM CHỐT 1] L2 Normalize sau Buffer để mọi mẫu nằm trên Unit Sphere
+        X = F.normalize(X, p=2, dim=1)
+        
+        X, Y = X.to(self.device), Y.to(self.device).float()
+        batch_size = X.shape[0]
+        num_classes_total = Y.shape[1]
+        I = torch.eye(batch_size, device=self.device)
 
-            # --- PHẦN 1: CẬP NHẬT GLOBAL WEIGHTS (Cho nhánh Universal) ---
-            # Tự động mở rộng Global W nếu số class tăng lên
-            if num_classes_total > self.weight.shape[1]:
-                diff = num_classes_total - self.weight.shape[1]
-                tail = torch.zeros((self.buffer_size, diff), device=self.device)
-                self.weight = torch.cat((self.weight, tail), dim=1)
+        # --- PHẦN 1: CẬP NHẬT UNIVERSAL WEIGHTS (Kiến thức tổng quát) ---
+        if num_classes_total > self.weight.shape[1]:
+            diff = num_classes_total - self.weight.shape[1]
+            tail = torch.zeros((self.buffer_size, diff), device=self.device)
+            self.weight = torch.cat((self.weight, tail), dim=1)
 
-            # RLS cho Global
-            # term = I + X @ R @ X.T
-            term_glob = I + X @ self.R_global @ X.T
-            term_glob.diagonal().add_(1e-6) # Ridge-like regularization
-            K_inv_glob = torch.inverse(term_glob)
-            Gain_glob = self.R_global @ X.T @ K_inv_glob
-            
-            # Cập nhật R_global và W_global
+        # Giải RLS cho nhánh Universal
+        term_glob = I + X @ self.R_global @ X.T
+        term_glob.diagonal().add_(1e-6) # Ridge Regularization
+        K_inv_glob = torch.inverse(term_glob)
+        Gain_glob = self.R_global @ X.T @ K_inv_glob
+        
+        with torch.no_grad():
             self.R_global -= Gain_glob @ (self.R_global @ X.T).T
             self.weight += Gain_glob @ (Y - X @ self.weight)
 
-            # --- PHẦN 2: CẬP NHẬT EXPERT RIÊNG BIỆT (R riêng + W riêng) ---
-            # Lấy đúng R và W của Expert hiện tại
-            R_curr = self.R_list[self.cur_task]
-            W_curr = self.task_weights[self.cur_task]
-            
-            # Chỉ lấy nhãn (Y) thuộc về các class của task hiện tại
-            curr_class_indices = self.task_class_indices[self.cur_task]
-            Y_task = Y[:, curr_class_indices] # [Batch, Num_Task_Classes]
+        # --- PHẦN 2: CẬP NHẬT EXPERT WEIGHTS (Kiến thức chuyên sâu) ---
+        R_curr = self.R_list[self.cur_task]
+        W_curr = self.task_weights[self.cur_task]
+        
+        # Chỉ lấy nhãn thuộc về các lớp của task hiện tại [cite: 66]
+        curr_class_indices = self.task_class_indices[self.cur_task]
+        Y_task = Y[:, curr_class_indices]
 
-            # RLS cho Expert (Dùng R riêng của task đó)
-            term_spec = I + X @ R_curr @ X.T
-            term_spec.diagonal().add_(1e-6)
-            K_inv_spec = torch.inverse(term_spec)
-            Gain_spec = R_curr @ X.T @ K_inv_spec
-            
-            # Cập nhật dữ liệu vào Parameter (Dùng .data để bypass autograd)
-            R_curr.data -= Gain_spec @ (R_curr @ X.T).T
-            W_curr.data += Gain_spec @ (Y_task - X @ W_curr)
+        # Giải RLS cho Expert chuyên biệt của task [cite: 115]
+        term_spec = I + X @ R_curr @ X.T
+        term_spec.diagonal().add_(1e-6)
+        K_inv_spec = torch.inverse(term_spec)
+        Gain_spec = R_curr @ X.T @ K_inv_spec
+        
+        with torch.no_grad():
+            R_curr.sub_(Gain_spec @ (R_curr @ X.T).T)
+            W_curr.add_(Gain_spec @ (Y_task - X @ W_curr))
 
-        # Giải phóng bộ nhớ tạm
-        del X, Y, I, Gain_glob, Gain_spec, K_inv_glob, K_inv_spec
-    
+    del X, Y, I, Gain_glob, Gain_spec, K_inv_glob, K_inv_spec
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
@@ -626,69 +624,56 @@ class MiNbaseNet(nn.Module):
             for m in self.backbone.noise_maker:
                 m.active_task_idx = mode
 
-    def forward_tuna_combined(self, x, targets=None, top_k=5, tau=0.1):
+    def forward_tuna_combined(self, x, targets=None, top_k=3, tau=0.2):
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # BƯỚC 1: LẤY LOGIT UNIVERSAL (Mode -2)
+        # BƯỚC 1: LẤY LOGIT UNIVERSAL (Mode -2: Hỗn hợp nhiễu) [cite: 11]
         self.set_noise_mode(-2)
         with torch.no_grad():
             feat_uni = self.backbone(x)
             feat_buf_uni = self.buffer(feat_uni)
-            logits_uni = self.forward_fc(feat_buf_uni)
+            # Đồng bộ hóa chuẩn hóa với hàm fit
+            feat_buf_uni_norm = F.normalize(feat_buf_uni, p=2, dim=1)
+            logits_uni = self.forward_fc(feat_buf_uni_norm)
 
         if num_tasks == 0: return {'logits': logits_uni}
 
-        # BƯỚC 2: ROUTING QUA N LẦN FORWARD & DEBUG DISTANCE
+        # BƯỚC 2: ROUTING MAHALANOBIS (N lần Forward qua từng Expert) [cite: 212]
         task_scores = []
         all_feat_specs = [] 
 
         with torch.no_grad():
             for t_idx in range(num_tasks):
+                # A. Đổi thấu kính sang Expert t
                 self.set_noise_mode(t_idx)
                 feat_t = self.backbone(x)
                 feat_buf_t = self.buffer(feat_t)
-                all_feat_specs.append(feat_buf_t)
                 
-                # Tính Mahalanobis (Raw - Không Normalize theo yêu cầu của ông)
+                # [ĐIỂM CHỐT 2] L2 Normalize trước khi đo khoảng cách
+                feat_buf_t_norm = F.normalize(feat_buf_t, p=2, dim=1)
+                all_feat_specs.append(feat_buf_t_norm)
+                
+                # B. Tính Mahalanobis trên không gian đã chuẩn hóa
                 R_t = self.R_list[t_idx]
-                Mu = self.task_prototypes[t_idx].to(self.device)
+                Mu = F.normalize(self.task_prototypes[t_idx].to(self.device), p=2, dim=-1)
                 
-                xRx = torch.sum((feat_buf_t @ R_t) * feat_buf_t, dim=-1)
+                # $d^2 = (x-\mu)^T R (x-\mu)$
+                xRx = torch.sum((feat_buf_t_norm @ R_t) * feat_buf_t_norm, dim=-1)
                 muRmu = torch.sum((Mu @ R_t) * Mu, dim=-1)
-                xRmu = feat_buf_t @ R_t @ Mu.T
+                xRmu = feat_buf_t_norm @ R_t @ Mu.T
                 
                 dist_sq = xRx.unsqueeze(1) + muRmu.unsqueeze(0) - 2 * xRmu
                 min_dist_task, _ = dist_sq.min(dim=1)
-                task_scores.append(-min_dist_task) # Score càng cao = Khoảng cách càng nhỏ
+                task_scores.append(-min_dist_task)
 
-            # TÍNH TOÁN TOP-K
-            all_scores = torch.stack(task_scores, dim=1) # [Batch, Num_Tasks]
-            top_weights, top_task_ids = torch.topk(F.softmax(all_scores / tau, dim=1), k=min(top_k, num_tasks), dim=1)
-            
-            # --- [DEBUG] IN KHOẢNG CÁCH TOP 5 CỦA MẪU ĐẦU TIÊN TRONG BATCH ---
-            if self.training is False: # Chỉ in khi Inference để tránh spam log lúc train
-                print(f"\n>>> [DEBUG ROUTING] Sample 0 Analysis:")
-                # Lấy khoảng cách thực (dương) thay vì score (âm)
-                actual_dists = -all_scores[0] 
-                sorted_dists, sorted_indices = torch.sort(actual_dists)
-                
-                for i in range(min(5, num_tasks)):
-                    t_id = sorted_indices[i].item()
-                    d_val = sorted_dists[i].item()
-                    weight = F.softmax(all_scores[0] / tau, dim=0)[t_id].item()
-                    print(f"  Rank {i+1}: Task {t_id} | Distance: {d_val:.4f} | Weight: {weight:.4f}")
-                
-                if targets is not None:
-                    # Tìm task ID thực tế của mẫu này
-                    true_task = -1
-                    for t_idx, indices in enumerate(self.task_class_indices):
-                        if targets[0] >= indices[0] and targets[0] <= indices[-1]:
-                            true_task = t_idx; break
-                    print(f"  Target Task: {true_task} | Correct Expert Selected: {sorted_indices[0].item() == true_task}")
+            # C. Tính trọng số Routing (Softmax Temperature) [cite: 35]
+            all_scores = torch.stack(task_scores, dim=1)
+            routing_weights = F.softmax(all_scores / tau, dim=1) 
+            top_weights, top_task_ids = torch.topk(routing_weights, k=min(top_k, num_tasks), dim=1)
 
-        # BƯỚC 3: SOFT ENSEMBLE LOGITS
+        # BƯỚC 3: ENSEMBLE LOGITS TỪ TOP-K EXPERTS [cite: 12, 254]
         combined_expert_logits = torch.zeros_like(logits_uni)
         with torch.no_grad():
             for k in range(top_weights.shape[1]):
@@ -697,17 +682,20 @@ class MiNbaseNet(nn.Module):
                 for t_idx in range(num_tasks):
                     mask = (t_indices == t_idx)
                     if not mask.any(): continue
+                    
+                    # Dùng đặc trưng đã chuẩn hóa ở thấu kính tương ứng
                     feat_ready = all_feat_specs[t_idx][mask]
                     raw_logits_task = feat_ready @ self.task_weights[t_idx]
+                    
                     idx = self.task_class_indices[t_idx]
                     expert_contribution = torch.zeros_like(logits_uni[mask])
                     expert_contribution[:, idx] = raw_logits_task
                     combined_expert_logits[mask] += weights_k[mask] * expert_contribution
 
-        # BƯỚC 4: KẾT QUẢ CUỐI
+        # BƯỚC 4: KẾT QUẢ CUỐI (TUNA Strategy: Uni + Expert) [cite: 254, 258]
         final_logits = logits_uni + combined_expert_logits
         
-        # Routing Accuracy (Top-1)
+        # Tính Accuracy của Routing (chọn Expert đúng) để theo dõi
         routing_acc = -1.0
         if targets is not None:
             best_task_ids = top_task_ids[:, 0]
