@@ -150,10 +150,12 @@ class PiNoise(torch.nn.Linear):
                     noise_sum += (self.mu[i](x_down) + self.sigmma[i](x_down))
                 noise_sum = noise_sum / n_experts # Tính trung bình cộng
             else:
-                noise_sum = 0
+                noise_sum = torch.zeros_like(x_down)
+
         if self.active_task_idx == -3:
             # không qua noise
-            noise_sum = 0
+            pass
+
 
         # Project ngược lên không gian gốc
         noise_out = noise_sum @ self.w_up
