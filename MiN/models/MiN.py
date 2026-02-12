@@ -318,7 +318,7 @@ class MinNet(object):
                 targets = targets.long() # Bắt buộc là LongTensor
 
                 # [DEBUG KHẨN CẤP] - Nếu vẫn lỗi, dòng này sẽ hiện nguyên nhân
-                # print(f"DEBUG: Logits {logits_final.shape} ({logits_final.dtype}) | Targets {targets.shape} ({targets.dtype})")
+                print(f"DEBUG: Logits {logits_final.shape} ({logits_final.dtype}) | Targets {targets.shape} ({targets.dtype})")
                 
                 # Tính Loss (bên ngoài autocast)
                 ce_loss = F.cross_entropy(logits_final, targets)
