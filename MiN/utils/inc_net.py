@@ -80,13 +80,13 @@ class MiNbaseNet(nn.Module):
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight)
+        self.register_buffer("R_global", torch.eye(self.buffer_size, **factory_kwargs) / self.gamma)
+        self.R_list = nn.ParameterList()
         self.task_weights = nn.ParameterList() 
         self.task_class_indices = [] # Để lưu vết class của từng task
         
 
-        self.R: torch.Tensor
-        R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
-        self.register_buffer("R", R)
+      
 
         self.Pinoise_list = nn.ModuleList()
         self.normal_fc = None
@@ -122,52 +122,72 @@ class MiNbaseNet(nn.Module):
         self.cur_task += 1
         start = self.known_class
         self.known_class += nb_classes
-        end = self.known_class
-        self.task_class_indices.append(list(range(start, end)))
+        self.task_class_indices.append(list(range(start, self.known_class)))
 
-        # 1. Update Global W (như cũ)
-        if self.cur_task > 0:
-            pass # Global W được cat thêm cột trong hàm fit
-        
-        # 2. [THÊM] Tạo W riêng biệt cho Expert hiện tại
+        # 1. Khởi tạo ma trận R riêng biệt cho Task hiện tại
+        # R_t = (X^T X + \gamma I)^{-1}
+        new_R = nn.Parameter(torch.eye(self.buffer_size, device=self.device) / self.gamma, requires_grad=False)
+        self.R_list.append(new_R)
+
+        # 2. Khởi tạo W riêng biệt cho Expert hiện tại
         new_w = nn.Parameter(torch.zeros((self.buffer_size, nb_classes), device=self.device))
         self.task_weights.append(new_w)
 
+        # 3. [FIX ERROR] Khởi tạo normal_fc ngay tại đây để tránh lỗi NoneType
+        self.normal_fc = SimpleLinear(self.buffer_size, self.known_class, bias=(self.cur_task==0))
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        with autocast(enabled=False):
-            X = self.backbone(X).float()
-            X = self.buffer(X)
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
+        # RLS cực kỳ nhạy cảm với độ chính xác, tắt autocast để tính toán trên float32
+        with torch.amp.autocast('cuda', enabled=False):
+            # 1. Trích xuất đặc trưng (Backbone đang ở mode Trainer set)
+            X = self.backbone(X).float() 
+            X = self.buffer(X) # [Batch, Buffer_Size]
+            X, Y = X.to(self.device), Y.to(self.device).float()
+            
+            batch_size = X.shape[0]
+            num_classes_total = Y.shape[1]
+            I = torch.eye(batch_size, device=self.device)
 
-            num_targets = Y.shape[1]
-            # Cập nhật Global W (giữ nguyên logic cat cột cũ)
-            if num_targets > self.out_features:
-                increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
+            # --- PHẦN 1: CẬP NHẬT GLOBAL WEIGHTS (Cho nhánh Universal) ---
+            # Tự động mở rộng Global W nếu số class tăng lên
+            if num_classes_total > self.weight.shape[1]:
+                diff = num_classes_total - self.weight.shape[1]
+                tail = torch.zeros((self.buffer_size, diff), device=self.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
 
-            # RLS CORE LOGIC (Giữ nguyên)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            term.diagonal().add_(1.0 + 1e-6)
-            K_inv = torch.inverse(term)
-            Gain = self.R @ X.T @ K_inv 
+            # RLS cho Global
+            # term = I + X @ R @ X.T
+            term_glob = I + X @ self.R_global @ X.T
+            term_glob.diagonal().add_(1e-6) # Ridge-like regularization
+            K_inv_glob = torch.inverse(term_glob)
+            Gain_glob = self.R_global @ X.T @ K_inv_glob
             
-            # Cập nhật Ma trận Hiệp phương sai R
-            self.R -= Gain @ (self.R @ X.T).T
-            
-            # A. Update Global W (kiến thức chung)
-            self.weight += Gain @ (Y - X @ self.weight)
+            # Cập nhật R_global và W_global
+            self.R_global -= Gain_glob @ (self.R_global @ X.T).T
+            self.weight += Gain_glob @ (Y - X @ self.weight)
 
-            # B. [MỚI] Update Task-Specific W (kiến thức chuyên gia)
-            # Chỉ lấy các cột nhãn tương ứng với task hiện tại
-            curr_idx = self.task_class_indices[self.cur_task]
-            Y_task = Y[:, curr_idx]
-            W_task = self.task_weights[self.cur_task]
+            # --- PHẦN 2: CẬP NHẬT EXPERT RIÊNG BIỆT (R riêng + W riêng) ---
+            # Lấy đúng R và W của Expert hiện tại
+            R_curr = self.R_list[self.cur_task]
+            W_curr = self.task_weights[self.cur_task]
             
-            # W_task = W_task + Gain * (Y_task - X * W_task)
-            W_task.data += Gain @ (Y_task - X @ W_task)
+            # Chỉ lấy nhãn (Y) thuộc về các class của task hiện tại
+            curr_class_indices = self.task_class_indices[self.cur_task]
+            Y_task = Y[:, curr_class_indices] # [Batch, Num_Task_Classes]
+
+            # RLS cho Expert (Dùng R riêng của task đó)
+            term_spec = I + X @ R_curr @ X.T
+            term_spec.diagonal().add_(1e-6)
+            K_inv_spec = torch.inverse(term_spec)
+            Gain_spec = R_curr @ X.T @ K_inv_spec
+            
+            # Cập nhật dữ liệu vào Parameter (Dùng .data để bypass autograd)
+            R_curr.data -= Gain_spec @ (R_curr @ X.T).T
+            W_curr.data += Gain_spec @ (Y_task - X @ W_curr)
+
+        # Giải phóng bộ nhớ tạm
+        del X, Y, I, Gain_glob, Gain_spec, K_inv_glob, K_inv_spec
+    
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
