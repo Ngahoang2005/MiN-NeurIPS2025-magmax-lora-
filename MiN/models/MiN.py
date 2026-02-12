@@ -234,11 +234,13 @@ class MinNet(object):
         self._network.eval()
         self._network.to(self.device)
         
-        # [QUAN TRỌNG] Reset ma trận tích lũy để tính toán sạch cho lượt này
-        # Nếu bạn không reset, nó sẽ cộng dồn với thống kê của các lần fit trước (có thể gây lệch)
-        self._network.H.zero_()
-        self._network.Hy.zero_()
-
+        if self.cur_task > 0:
+            decay = 0.9  # Giữ lại 90% kiến thức cũ
+            self._network.H *= decay
+            self._network.Hy *= decay
+        else:
+            self._network.H.zero_()
+            self._network.Hy.zero_()
         print(">>> [Fast RLS] Accumulating Statistics form Train Loader...")
         
         # Nếu Dataloader có Data Augmentation, bạn có thể chạy nhiều epoch để lấy trung bình thống kê tốt hơn.
@@ -256,9 +258,16 @@ class MinNet(object):
             self._network.fit_batch(inputs, targets)
             
         # [BƯỚC 2] Giải hệ phương trình 1 lần duy nhất sau khi đã xem hết dữ liệu
+        print(f">>> [RLS Update] Task {self.cur_task} - Accumulating...")
+        prog_bar = tqdm(train_loader)
+        for i, (_, inputs, targets) in enumerate(prog_bar):
+            inputs, targets = inputs.to(self.device), targets.to(self.device)
+            targets = torch.nn.functional.one_hot(targets, num_classes=self._network.known_class)
+            self._network.fit_batch(inputs, targets)
+            
+        # Giải hệ phương trình với Lambda nhỏ hơn để tăng biên độ Logit
+        # (Sửa lambda_reg xuống 1.0 trong inc_net.py)
         self._network.update_analytical_weights()
-        
-        self.logger.info(f"Task {self.cur_task} --> Analytical Classifier Updated (Fast Solve)!")
         self._clear_gpu()
 
     # --------------------------------------------------------------------------

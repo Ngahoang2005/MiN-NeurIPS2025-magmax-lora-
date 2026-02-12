@@ -305,36 +305,43 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.backbone.noise_maker[0].mu)
         
-        # 1. Universal (Shared W, Mode -2)
+        # 1. Nhánh Universal (Base) - Mode -2
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_uni = self.backbone(x)
-            logits_uni = self.forward_fc(self.buffer(feat_uni))
+            feat_uni = self.buffer(self.backbone(x))
+            logits_uni = self.forward_fc(feat_uni)
 
-        # 2. Specific (Shared W, Mode 0..t)
+        # 2. Tìm Best Specific Branch bằng Entropy
         best_logits_spec = torch.zeros_like(logits_uni)
         min_entropy = torch.full((batch_size,), float('inf'), device=x.device)
 
         with torch.no_grad():
             for t in range(num_tasks):
                 self.set_noise_mode(t)
-                feat_t = self.backbone(x)
-                l_t = self.forward_fc(self.buffer(feat_t))
+                l_t = self.forward_fc(self.buffer(self.backbone(x)))
                 
-                prob = torch.softmax(l_t, dim=1)
+                # [FIX] Dùng Temperature Scaling (T=0.1) để làm rõ Entropy
+                # Giúp tách biệt rõ mẫu tự tin và mẫu đoán mò
+                prob = torch.softmax(l_t / 0.1, dim=1) 
                 entropy = -torch.sum(prob * torch.log(prob + 1e-8), dim=1)
                 
                 mask = entropy < min_entropy
                 min_entropy[mask] = entropy[mask]
                 best_logits_spec[mask] = l_t[mask]
 
-        # 3. Cộng gộp
-        final_logits = logits_uni + best_logits_spec
+        # 3. [FIX] Dynamic Balancing (Cân bằng biên độ)
+        mag_uni = logits_uni.abs().mean()
+        mag_spec = best_logits_spec.abs().mean()
+        alpha = mag_uni / (mag_spec + 1e-8)
+        alpha = torch.clamp(alpha, min=0.1, max=1.0)
 
-        self.set_noise_mode(-2) 
+        # 4. Cộng gộp: Uni dẫn đường, Spec bổ trợ
+        final_logits = logits_uni + alpha * best_logits_spec
+
+        self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}
-    # --- DÁN VÀO TRONG CLASS MinNet ---
+
     def merge_noise_experts(self):
         print(f"\n>>> Merging Noise Experts (TUNA EMR) for Task {self.cur_task}...")
         # Duyệt qua backbone để gọi hàm merge của từng lớp PiNoise
