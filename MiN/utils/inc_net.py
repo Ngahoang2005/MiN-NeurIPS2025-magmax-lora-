@@ -232,77 +232,73 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # 1. Universal (Nền tảng)
+        # 1. TRÍCH XUẤT UNIVERSAL FEATURE (Routing & Baseline)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_uni = self.backbone(x)
-            logits_uni = self.forward_fc(self.buffer(feat_uni))
+            # Chỉ chạy backbone mode -2 một lần duy nhất cho cả batch
+            feat_uni = self.backbone(x) 
+            feat_buffer_uni = self.buffer(feat_uni)
+            logits_uni = self.forward_fc(feat_buffer_uni)
 
         if num_tasks == 0:
             if was_training: self.train()
             return {'logits': logits_uni}
 
-        # 2. Expert Routing & Logit Calculation
+        # 2. ROUTING TRONG KHÔNG GIAN UNIVERSAL
+        # So sánh feat_uni (mode -2) với prototypes (phải được tính ở mode -2)
         task_scores = []
-        task_logits_masked = [] # Lưu logit đã được mask
-
         with torch.no_grad():
+            feat_uni_norm = F.normalize(feat_uni, p=2, dim=1)
             for t_idx, protos in enumerate(self.task_prototypes):
-                # A. Bật Expert t
-                self.set_noise_mode(-3)
-                
-                # B. Forward 1 lần duy nhất
-                feat_expert = self.backbone(x)
-                
-                # C. Tính Logit & MASKING NGAY LẬP TỨC
-                # Expert t chỉ được phép có ý kiến về class thuộc Task t
-                raw_logits = self.forward_fc(self.buffer(feat_expert))
-                
-                # --- MASKING LOGIC ---
-                # Tạo mask số 0. Những class nào thuộc task t thì giữ nguyên, còn lại = 0
-                # Lý do = 0: Vì đây là Residual (Cộng thêm). Cộng 0 nghĩa là "không có ý kiến".
-                masked_l = torch.zeros_like(raw_logits)
-                
-                # Giả sử bạn có biến self.task_class_indices là list các list class index
-                # Ví dụ: Task 0 là [0,1,2,3,4], Task 1 là [5,6,7,8,9]
-                if hasattr(self, 'task_class_indices') and t_idx < len(self.task_class_indices):
-                    idx = self.task_class_indices[t_idx] # List indices
-                    masked_l[:, idx] = raw_logits[:, idx] 
-                else:
-                    # Fallback nếu chưa setup indices (chạy full như cũ - nguy hiểm)
-                    masked_l = raw_logits 
-                
-                task_logits_masked.append(masked_l)
-
-                # D. Tính Similarity (Dùng cho Routing)
-                feat_norm = F.normalize(feat_expert, p=2, dim=1)
                 p_gpu = protos.to(x.device)
                 p_norm = F.normalize(p_gpu, p=2, dim=1)
-                sim_c = torch.mm(feat_norm, p_norm.t())
-                sim_t, _ = sim_c.max(dim=1)
-                task_scores.append(sim_t)
+                
+                # Tính similarity giữa ảnh (Uni) và Prototype (Uni)
+                sim_matrix = torch.mm(feat_uni_norm, p_norm.t())
+                max_sim_task, _ = sim_matrix.max(dim=1)
+                task_scores.append(max_sim_task)
             
-            # 3. Selection
-            # Chọn Task nào có Sim cao nhất
-            all_scores = torch.stack(task_scores, dim=1) # [B, N_Task]
-            max_sim, selected_task_ids = all_scores.max(dim=1)
-            
-            # Lấy Logit (đã mask) của Task thắng cuộc
-            all_logits_stack = torch.stack(task_logits_masked, dim=1) # [B, N_Task, N_Class]
-            row_idx = torch.arange(batch_size, device=x.device)
-            best_logits_spec = all_logits_stack[row_idx, selected_task_ids]
-            
-            # [TÙY CHỌN] Sharpening Weight (để tin tưởng Expert hơn nếu Sim cao)
-            # weight = F.relu(max_sim).unsqueeze(1) 
-            # Hoặc đơn giản là 1.0 nếu đã tin tưởng Routing
-            weight = 1.0
+            # Chọn Task ID phù hợp nhất cho từng ảnh trong batch
+            all_scores = torch.stack(task_scores, dim=1) # [Batch, Num_Tasks]
+            max_sim_values, selected_task_ids = all_scores.max(dim=1)
 
-        # 4. Ensemble: Universal + Expert (Đã Mask)
-        # Vì đã Mask = 0 ở các class lạ, nên Expert sẽ không làm nhiễu Universal ở các task khác
-        alpha = 1.0 
-        # final_logits = logits_uni + (best_logits_spec * weight * alpha)
-        # test mỗi spec
+        # 3. LẤY LOGITS TỪ EXPERT (SPECIFIC BRANCH)
+        # Sau khi biết ảnh thuộc task nào, ta mới bật Expert đó lên để lấy tri thức chuyên sâu
+        best_logits_spec = torch.zeros_like(logits_uni)
+        
+        with torch.no_grad():
+            unique_tasks = selected_task_ids.unique()
+            for t in unique_tasks:
+                mask = (selected_task_ids == t)
+                t_val = t.item()
+                
+                # Bật Expert của task được chọn
+                self.set_noise_mode(t_val)
+                
+                # Forward những ảnh thuộc task này qua Expert của nó
+                feat_spec = self.backbone(x[mask])
+                raw_logits_spec = self.forward_fc(self.buffer(feat_spec))
+                
+                # --- MASKING LOGIC ---
+                # Chỉ lấy logits của các class thuộc về task t_val
+                masked_l = torch.zeros_like(raw_logits_spec)
+                if hasattr(self, 'task_class_indices') and t_val < len(self.task_class_indices):
+                    idx = self.task_class_indices[t_val]
+                    masked_l[:, idx] = raw_logits_spec[:, idx]
+                else:
+                    masked_l = raw_logits_spec
+                
+                best_logits_spec[mask] = masked_l
+
+        # 4. KẾT HỢP (Hoặc chỉ lấy Spec như bạn đang test)
+        alpha = 1.0
+        weight = 1.0 # Có thể dùng max_sim_values.unsqueeze(1) để làm trọng số mềm
+        
+        # Theo yêu cầu test mỗi spec của bạn:
         final_logits = best_logits_spec * weight * alpha
+        
+        # Nếu muốn ensemble: final_logits = logits_uni + (best_logits_spec * weight * alpha)
+
         self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}

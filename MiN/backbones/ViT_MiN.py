@@ -134,7 +134,7 @@ class PiNoise(torch.nn.Linear):
         
         # Project xuống không gian thấp chiều
         x_down = hyper_features @ self.w_down
-        noise_sum = 0 
+        noise_sum = torch.zeros_like(x_down)
 
         if self.active_task_idx >= 0:
             # --- MODE SPECIFIC ---

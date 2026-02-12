@@ -100,11 +100,8 @@ class MinNet(object):
         self._network.update_fc(self.init_class)
         self._network.update_noise()
         
-        # 1. Calculate Proto (MODE = CUR_TASK)
+   
         self._clear_gpu()
-        prototype = self.get_task_prototype(self._network, train_loader)
-        self._network.extend_task_prototype(prototype)
-        
         # 2. Train Noise (MODE = CUR_TASK)
         self.run(train_loader)
         
@@ -153,9 +150,7 @@ class MinNet(object):
         # Train Expert (MODE = CUR_TASK)
         train_loader_run = DataLoader(train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         self._clear_gpu()
-        prototype = self.get_task_prototype(self._network, train_loader_run)
-        self._network.extend_task_prototype(prototype)
-        
+       
         self.run(train_loader_run)
         
         self._clear_gpu()
@@ -323,7 +318,7 @@ class MinNet(object):
         model.to(self.device)
         
         # [FIX] Lấy prototype thông qua con mắt của Expert
-        model.set_noise_mode(self.cur_task) 
+        model.set_noise_mode(-2) 
         
         all_features = []
         all_targets = []
