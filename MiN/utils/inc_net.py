@@ -232,40 +232,60 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
+        # BƯỚC 1: LẤY LOGIT UNIVERSAL (MODE -2)
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_noisy_uni = self.backbone(x)
-            logits_uni = self.forward_fc(self.buffer(feat_noisy_uni))
+            feat_uni = self.backbone(x)
+            logits_uni = self.forward_fc(self.buffer(feat_uni))
 
-        # BƯỚC 2: LẤY FEATURE SẠCH (MODE -3) ĐỂ ROUTING
-        # Phải forward thêm 1 lần (hoặc lấy feature từ bước trước nếu kiến trúc cho phép)
-        # để đảm bảo so sánh "Sạch vs Sạch"
+        if num_tasks == 0:
+            if was_training: self.train()
+            return {'logits': logits_uni}
+
+        # BƯỚC 2: ROUTING TRONG KHÔNG GIAN SẠCH (MODE -3)
         self.set_noise_mode(-3)
         with torch.no_grad():
             feat_clean = self.backbone(x) 
             feat_norm = F.normalize(feat_clean, p=2, dim=1)
             
-            # Tính Similarity với Prototype (cũng tính ở -3)
             task_scores = []
             for t_idx, protos in enumerate(self.task_prototypes):
                 p_norm = F.normalize(protos.to(x.device), p=2, dim=1)
+                # Tính sim của feature sạch với prototype sạch
                 sim_t, _ = torch.mm(feat_norm, p_norm.t()).max(dim=1)
                 task_scores.append(sim_t)
             
             selected_task_ids = torch.stack(task_scores, dim=1).argmax(dim=1)
 
-        # BƯỚC 3: LẤY LOGIT EXPERT (SPECIFIC)
+        # BƯỚC 3: LẤY LOGIT EXPERT (ĐÂY LÀ CHỖ BỊ LỖI NAMEERROR)
         best_logits_spec = torch.zeros_like(logits_uni)
         with torch.no_grad():
             for t in selected_task_ids.unique():
+                t_val = t.item()
                 mask = (selected_task_ids == t)
-                self.set_noise_mode(t.item())
-                # ... forward expert và masking như cũ ...
+                
+                # Bật Expert cụ thể cho task t
+                self.set_noise_mode(t_val)
+                
+                # Forward CHỈ NHỮNG ẢNH thuộc task này qua Expert của nó
+                feat_spec = self.backbone(x[mask])
+                raw_logits = self.forward_fc(self.buffer(feat_spec))
+                
+                # THỰC HIỆN MASKING (Expert chỉ được nói về class của mình)
+                masked_l = torch.zeros_like(raw_logits)
+                if hasattr(self, 'task_class_indices') and t_val < len(self.task_class_indices):
+                    idx = self.task_class_indices[t_val]
+                    masked_l[:, idx] = raw_logits[:, idx]
+                else:
+                    masked_l = raw_logits
+                
+                # Gán lại vào tensor kết quả tổng hợp
                 best_logits_spec[mask] = masked_l
 
-        # BƯỚC 4: ENSEMBLE
-        # Bây giờ bạn có Uni chuẩn (-2) và Spec chuẩn (Mode t)
-        final_logits = best_logits_spec 
+        # BƯỚC 4: ENSEMBLE (Cộng Uni và Spec để lấy class tốt nhất)
+        alpha = 1.0 
+        final_logits =  best_logits_spec 
         
         self.set_noise_mode(-2)
+        if was_training: self.train()
         return {'logits': final_logits}
