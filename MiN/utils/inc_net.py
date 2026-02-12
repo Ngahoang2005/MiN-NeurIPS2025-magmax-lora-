@@ -261,61 +261,75 @@ class MiNbaseNet(nn.Module):
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # BƯỚC 1: UNIVERSAL BASELINE (W CHUNG)
+        # BƯỚC 1: LẤY LOGIT UNIVERSAL (Nền tảng chung qua Mode -2)
         self.set_noise_mode(-2)
         with torch.no_grad():
             feat_uni = self.backbone(x)
-            logits_uni = self.forward_fc(self.buffer(feat_uni))
+            feat_buf_uni = self.buffer(feat_uni)
+            logits_uni = self.forward_fc(feat_buf_uni)
 
         if num_tasks == 0: return {'logits': logits_uni}
 
-        # BƯỚC 2: ROUTING (MODE -3)
+        # BƯỚC 2: ROUTING DÙNG KHOẢNG CÁCH MAHALANOBIS (MODE -3 + BUFFER)
         self.set_noise_mode(-3)
         with torch.no_grad():
             feat_clean = self.backbone(x)
-            feat_norm = F.normalize(feat_clean, p=2, dim=1)
+            X = self.buffer(feat_clean) # Đặc trưng cao chiều [Batch, Buffer_Dim]
             
             task_scores = []
-            for t_idx, protos in enumerate(self.task_prototypes):
-                p_norm = F.normalize(protos.to(self.device), p=2, dim=1)
-                sim_t, _ = torch.mm(feat_norm, p_norm.t()).max(dim=1)
-                task_scores.append(sim_t)
+            for t_idx in range(num_tasks):
+                # R_t là inverse covariance của Task t (đã có trong R_list)
+                R_t = self.R_list[t_idx] 
+                # Prototype của các class thuộc Task t [Num_Class, Buffer_Dim]
+                Mu = self.task_prototypes[t_idx].to(self.device) 
+                
+                # Tối ưu hóa Mahalanobis: dist^2 = xRx' + muRmu' - 2xRmu'
+                # 1. x @ R @ x.T (Tính cho từng ảnh trong batch)
+                xRx = torch.sum((X @ R_t) * X, dim=-1) # [Batch]
+                # 2. mu @ R @ mu.T (Tính cho từng prototype trong task)
+                muRmu = torch.sum((Mu @ R_t) * Mu, dim=-1) # [Num_Class]
+                # 3. x @ R @ mu.T (Ma trận tương quan chéo)
+                xRmu = X @ R_t @ Mu.T # [Batch, Num_Class]
+                
+                # Ma trận khoảng cách bình phương tới mọi class trong task
+                dist_sq = xRx.unsqueeze(1) + muRmu.unsqueeze(0) - 2 * xRmu
+                
+                # Lấy khoảng cách nhỏ nhất tới bất kỳ class nào của task này làm điểm đại diện
+                min_dist_task, _ = dist_sq.min(dim=1)
+                
+                # Score cao = Khoảng cách nhỏ (dùng số âm để chọn max)
+                task_scores.append(-min_dist_task)
             
-            selected_task_ids = torch.stack(task_scores, dim=1).argmax(dim=1)
+            all_scores = torch.stack(task_scores, dim=1)
+            selected_task_ids = all_scores.argmax(dim=1)
 
-        # --- [BỔ SUNG] TÍNH TỶ LỆ CHỌN ĐÚNG EXPERT ---
+        # --- [DEBUG] TÍNH TỶ LỆ CHỌN ĐÚNG ---
         routing_acc = -1.0
         if targets is not None:
-            # Xác định Task ID thực tế từ targets (dựa trên class ranges)
             true_task_ids = torch.zeros_like(selected_task_ids)
             for t_idx, indices in enumerate(self.task_class_indices):
-                # Nếu target nằm trong range class của task t_idx
                 mask_t = (targets >= indices[0]) & (targets <= indices[-1])
                 true_task_ids[mask_t] = t_idx
             routing_acc = (selected_task_ids == true_task_ids).float().mean().item() * 100
 
-        # BƯỚC 3: EXPERT INFERENCE (W RIÊNG TỪNG TASK)
+        # BƯỚC 3: EXPERT INFERENCE (Dùng W riêng của Expert được chọn)
         best_logits_spec = torch.zeros_like(logits_uni)
         with torch.no_grad():
             for t in selected_task_ids.unique():
                 t_idx = t.item()
                 mask = (selected_task_ids == t)
                 
-                self.set_noise_mode(t_idx)
+                self.set_noise_mode(t_idx) # Bật Expert cụ thể
                 feat_expert = self.backbone(x[mask])
-                feat_buf = self.buffer(feat_expert)
+                feat_buf_spec = self.buffer(feat_expert)
                 
-                # Dùng W riêng của task t
-                raw_logits_task = feat_buf @ self.task_weights[t_idx]
+                # Dự đoán bằng trọng số riêng W_t
+                raw_logits_task = feat_buf_spec @ self.task_weights[t_idx]
                 
-                # [FIX INDEXERROR] Gán giá trị bằng cách xác định đúng hàng và cột
+                # [FIX INDEXERROR] Gán chính xác vào vị trí các class của task t
                 idx = torch.tensor(self.task_class_indices[t_idx], device=self.device)
-                # rows = các hàng đang được chọn bởi mask; cols = các cột của task t
                 rows = torch.where(mask)[0].reshape(-1, 1)
                 best_logits_spec[rows, idx] = raw_logits_task
 
         # BƯỚC 4: ENSEMBLE
-        final_logits = logits_uni + best_logits_spec 
-        
-        self.set_noise_mode(-2)
-        return {'logits': final_logits, 'routing_acc': routing_acc}
+        return {'logits': logits_uni + best_logits_spec, 'routing_acc': routing_acc}

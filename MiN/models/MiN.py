@@ -332,11 +332,11 @@ class MinNet(object):
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
-                with autocast('cuda'):
-                    feature = model.extract_feature(inputs)
-                all_features.append(feature.detach().cpu())
+                feat = model.backbone(inputs)
+                # PHẢI qua buffer để cùng space với Routing
+                feat_high_dim = model.buffer(feat) 
+                all_features.append(feat_high_dim.detach().cpu())
                 all_targets.append(targets.cpu())
-        
         all_features = torch.cat(all_features, dim=0)
         all_targets = torch.cat(all_targets, dim=0)
         
