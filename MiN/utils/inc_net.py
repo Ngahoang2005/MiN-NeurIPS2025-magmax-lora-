@@ -142,33 +142,60 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
         with autocast(enabled=False):
-            X = self.backbone(X).float() # Ép về float32
-            X = self.buffer(X) # Buffer đã sửa thành float32 ở trên
-
+            # 1. Prepare Data (Giữ nguyên)
+            X = self.backbone(X).float()
+            X = self.buffer(X) 
+            
+            # Chuyển device và dtype một lần
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
+            # 2. Resize output nếu cần (Giữ nguyên logic)
             num_targets = Y.shape[1]
             if num_targets > self.out_features:
                 increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device, dtype=self.weight.dtype)
                 self.weight = torch.cat((self.weight, tail), dim=1)
             elif num_targets < self.out_features:
                 increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
+                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device, dtype=Y.dtype)
                 Y = torch.cat((Y, tail), dim=1)
 
-            # [MODIFIED] Thêm Jitter để tránh Singular Matrix (vì dùng float32 kém chính xác hơn double)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            # --- OPTIMIZATION STARTS HERE ---
             
-            K = torch.inverse(term + jitter)
-            
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+            # [Tối ưu 1] Tính trước R * X.T (Ma trận Gain chưa chuẩn hóa)
+            # Kích thước: (Feature_Dim, Batch_Size)
+            # Thay vì tính X @ R nhiều lần, ta tính 1 lần và tái sử dụng.
+            R_XT = self.R @ X.T
 
+            # [Tối ưu 2] Tính term = I + X @ R @ X.T
+            # X @ R @ X.T chính là X @ (R @ X.T) -> X @ R_XT
+            # Kích thước: (Batch_Size, Batch_Size)
+            term = X @ R_XT
+            
+            # [Tối ưu 3] Thêm Jitter và Identity bằng phép cộng tại chỗ (In-place)
+            # Nhanh hơn nhiều so với việc tạo ma trận I và ma trận Jitter mới rồi cộng vào
+            term.diagonal().add_(1.0 + 1e-6)
+
+            # Nghịch đảo (Giữ nguyên logic inverse)
+            K_inv = torch.inverse(term)
+
+            # [Tối ưu 4] Tính Kalman Gain (K_gain)
+            # K_gain = R_new @ X.T = (R_old @ X.T) @ inv(term)
+            # Việc này giúp ta update weight và R mà không cần nhân lại ma trận lớn
+            Gain = R_XT @ K_inv
+
+            # Update R (Covariance Matrix)
+            # Công thức gốc: R_new = R - R @ X.T @ K @ X @ R
+            # Tối ưu: R_new = R - Gain @ R_XT.T
+            # (Vì X @ R chính là transpose của R @ X.T)
+            self.R -= Gain @ R_XT.T
+
+            # Update Weight
+            # Công thức gốc: W_new = W + R_new @ X.T @ (Y - X @ W)
+            # Tối ưu: W_new = W + Gain @ (Y - X @ W)
+            # (Vì Gain chính là R_new @ X.T đã tính ở trên)
+            self.weight += Gain @ (Y - X @ self.weight)
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
