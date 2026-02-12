@@ -356,6 +356,7 @@ class MinNet(object):
         all_sims = []
         all_corrects = []
         
+        # Prototype hiện tại đã là 16384 chiều (Hậu Buffer)
         curr_protos = self._network.task_prototypes[self.cur_task].to(self.device)
         curr_protos_norm = F.normalize(curr_protos, p=2, dim=1)
 
@@ -364,15 +365,22 @@ class MinNet(object):
             for _, inputs, targets in tqdm(test_loader, desc="Testing Bins"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # So sánh: Feature qua Expert vs Prototype (cũng từ Expert)
-                self._network.set_noise_mode(self.cur_task) 
-                feat = self._network.extract_feature(inputs)
-                feat_norm = F.normalize(feat, p=2, dim=1)
+                # 1. Trích xuất đặc trưng sạch (Mode -3)
+                self._network.set_noise_mode(-3) 
+                feat_raw = self._network.extract_feature(inputs) # 768 chiều
                 
+                # 2. [QUAN TRỌNG] Phải đi qua Buffer để lên 16384 chiều
+                feat_high_dim = self._network.buffer(feat_raw) # 16384 chiều
+                
+                # 3. Normalize trong không gian cao chiều
+                feat_norm = F.normalize(feat_high_dim, p=2, dim=1)
+                
+                # 4. Bây giờ phép nhân mm sẽ chạy mượt mà (16384 vs 16384)
                 sim_matrix = torch.mm(feat_norm, curr_protos_norm.t())
                 sim, _ = sim_matrix.max(dim=1)
                 
-                outputs = self._network.forward_tuna_combined(inputs)
+                # Tính accuracy tổng hợp để vẽ chart
+                outputs = self._network.forward_tuna_combined(inputs, targets=targets)
                 preds = outputs['logits'].argmax(dim=1)
                 correct = (preds == targets).float()
 
@@ -380,7 +388,7 @@ class MinNet(object):
                 all_corrects.extend(correct.cpu().numpy())
 
         self._plot_cosine_acc_chart(all_sims, all_corrects)
-
+    
     def _plot_cosine_acc_chart(self, sims, corrects, num_bins=10):
         import matplotlib.pyplot as plt
         sims, corrects = np.array(sims), np.array(corrects)
