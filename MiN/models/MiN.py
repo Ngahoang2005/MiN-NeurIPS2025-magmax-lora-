@@ -264,12 +264,11 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        # Adaptive Scale GPM
         current_scale = 0.85 
         if self.cur_task > 0:
             current_scale = self.compute_adaptive_scale(train_loader)
 
-        # Freeze/Unfreeze Logic
+        # Freeze/Unfreeze
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -292,33 +291,16 @@ class MinNet(object):
             kl_losses = 0.0
             correct, total = 0, 0
 
-            # Annealing Beta
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 targets = targets.to(self.device)
                 
-                # =========================================================
-                # [SAFETY BLOCK: XỬ LÝ TARGETS TUYỆT ĐỐI]
-                # =========================================================
-                # 1. Xử lý trường hợp One-Hot (nếu có): [Batch, Classes] -> [Batch]
-                if targets.dim() == 2 and targets.shape[1] > 1:
-                    targets = torch.argmax(targets, dim=1)
-                
-                # 2. Xử lý trường hợp thừa chiều: [Batch, 1] -> [Batch]
-                if targets.dim() > 1:
-                    targets = targets.view(-1)
-                
-                # 3. BẮT BUỘC: Ép kiểu về Long (int64). 
-                # Nếu để Float/Half, CrossEntropy sẽ crash với lỗi size mismatch.
-                targets = targets.to(dtype=torch.long)
-                # =========================================================
-
                 optimizer.zero_grad(set_to_none=True) 
 
+                # 1. FORWARD TRONG AUTOCAST
                 with autocast('cuda'):
-                    # --- Forward ---
                     if self.cur_task > 0:
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
@@ -326,13 +308,23 @@ class MinNet(object):
                         logits_final = logits2 + logits1
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
-                    
-                    # --- Tính Loss ---
-                    # targets bây giờ chắc chắn là LongTensor [128]
-                    ce_loss = F.cross_entropy(logits_final, targets)
-                    loss = ce_loss + beta_current * batch_kl
 
-                # --- Backward ---
+                # 2. THOÁT KHỎI AUTOCAST ĐỂ TÍNH LOSS (CRITICAL FIX)
+                # Chuyển Logits về float32 để tính toán chính xác và tránh lỗi type
+                logits_final = logits_final.float() 
+                
+                # Xử lý Targets triệt để
+                if targets.dim() > 1: targets = targets.reshape(-1)
+                targets = targets.long() # Bắt buộc là LongTensor
+
+                # [DEBUG KHẨN CẤP] - Nếu vẫn lỗi, dòng này sẽ hiện nguyên nhân
+                # print(f"DEBUG: Logits {logits_final.shape} ({logits_final.dtype}) | Targets {targets.shape} ({targets.dtype})")
+                
+                # Tính Loss (bên ngoài autocast)
+                ce_loss = F.cross_entropy(logits_final, targets)
+                loss = ce_loss + beta_current * batch_kl
+
+                # 3. BACKWARD VỚI SCALER
                 self.scaler.scale(loss).backward()
                 
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
@@ -342,7 +334,7 @@ class MinNet(object):
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # --- Metrics ---
+                # Metrics
                 losses += loss.item()
                 kl_losses += batch_kl.item()
                 
@@ -350,9 +342,10 @@ class MinNet(object):
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
+                # Clean VRAM
                 del inputs, targets, loss, logits_final, batch_kl
 
-                # [DEBUG NOISE] 
+                # Debug Noise
                 if i % 50 == 0:
                      if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
                         self.print_noise_status()
@@ -360,16 +353,15 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "T {} | Ep {} | L {:.3f} (KL {:.4f}) | Acc {:.2f} | Beta {:.1e}".format(
-                self.cur_task, epoch + 1, losses / len(train_loader), 
-                kl_losses / len(train_loader), train_acc, beta_current
+            info = "T {} | Ep {} | L {:.3f} | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, losses / len(train_loader), train_acc
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
             if epoch % 5 == 0:
                 self._clear_gpu()
-    # Thêm hàm helper này vào trong class MinNet luôn để tiện gọi self
+    
     def print_noise_status(self):
         print("\n" + "="*85)
         print(f"{'Layer':<10} | {'Signal':<10} | {'Noise':<10} | {'SNR':<10} | {'Sigma':<10} | {'Scale':<10} | {'Status'}")
