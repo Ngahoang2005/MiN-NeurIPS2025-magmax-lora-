@@ -267,9 +267,7 @@ class MinNet(object):
                                 prev_norm = F.normalize(prev_stack, p=2, dim=1)
                                 cos_sim = torch.mm(curr_norm, prev_norm.t())
                                 loss_orth += torch.sum(torch.abs(cos_sim))
-
-                    lambda_orth = 0.1 
-                    loss = loss_ce + lambda_orth * loss_orth
+                    loss = loss_ce 
 
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)

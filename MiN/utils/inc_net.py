@@ -80,6 +80,9 @@ class MiNbaseNet(nn.Module):
 
         weight = torch.zeros((self.buffer_size, 0), **factory_kwargs)
         self.register_buffer("weight", weight)
+        self.task_weights = nn.ParameterList() 
+        self.task_class_indices = [] # Để lưu vết class của từng task
+        
 
         self.R: torch.Tensor
         R = torch.eye(self.weight.shape[0], **factory_kwargs) / self.gamma
@@ -117,45 +120,54 @@ class MiNbaseNet(nn.Module):
 
     def update_fc(self, nb_classes):
         self.cur_task += 1
+        start = self.known_class
         self.known_class += nb_classes
+        end = self.known_class
+        self.task_class_indices.append(list(range(start, end)))
+
+        # 1. Update Global W (như cũ)
         if self.cur_task > 0:
-            fc = SimpleLinear(self.buffer_size, self.known_class, bias=False)
-        else:
-            fc = SimpleLinear(self.buffer_size, nb_classes, bias=True)
-        if self.normal_fc is None:
-            self.normal_fc = fc
-        else:
-            nn.init.constant_(fc.weight, 0.)
-            del self.normal_fc
-            self.normal_fc = fc
+            pass # Global W được cat thêm cột trong hàm fit
+        
+        # 2. [THÊM] Tạo W riêng biệt cho Expert hiện tại
+        new_w = nn.Parameter(torch.zeros((self.buffer_size, nb_classes), device=self.device))
+        self.task_weights.append(new_w)
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
         with autocast(enabled=False):
-            # Backbone sẽ dùng mode hiện tại (đã được set ở Trainer) để trích xuất đặc trưng
             X = self.backbone(X).float()
             X = self.buffer(X)
             X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
             num_targets = Y.shape[1]
+            # Cập nhật Global W (giữ nguyên logic cat cột cũ)
             if num_targets > self.out_features:
                 increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device, dtype=self.weight.dtype)
+                tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device)
                 self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.out_features:
-                increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size), device=Y.device, dtype=Y.dtype)
-                Y = torch.cat((Y, tail), dim=1)
 
+            # RLS CORE LOGIC (Giữ nguyên)
             I = torch.eye(X.shape[0]).to(X)
             term = I + X @ self.R @ X.T
             term.diagonal().add_(1.0 + 1e-6)
             K_inv = torch.inverse(term)
-            Gain = R_XT = self.R @ X.T @ K_inv # Combine steps for clarity
+            Gain = self.R @ X.T @ K_inv 
             
+            # Cập nhật Ma trận Hiệp phương sai R
             self.R -= Gain @ (self.R @ X.T).T
+            
+            # A. Update Global W (kiến thức chung)
             self.weight += Gain @ (Y - X @ self.weight)
 
+            # B. [MỚI] Update Task-Specific W (kiến thức chuyên gia)
+            # Chỉ lấy các cột nhãn tương ứng với task hiện tại
+            curr_idx = self.task_class_indices[self.cur_task]
+            Y_task = Y[:, curr_idx]
+            W_task = self.task_weights[self.cur_task]
+            
+            # W_task = W_task + Gain * (Y_task - X * W_task)
+            W_task.data += Gain @ (Y_task - X @ W_task)
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
@@ -260,32 +272,26 @@ class MiNbaseNet(nn.Module):
         # BƯỚC 3: LẤY LOGIT EXPERT (ĐÂY LÀ CHỖ BỊ LỖI NAMEERROR)
         best_logits_spec = torch.zeros_like(logits_uni)
         with torch.no_grad():
-            for t in selected_task_ids.unique():
+            unique_tasks = selected_task_ids.unique()
+            for t in unique_tasks:
                 t_val = t.item()
                 mask = (selected_task_ids == t)
-                
-                # Bật Expert cụ thể cho task t
                 self.set_noise_mode(t_val)
                 
-                # Forward CHỈ NHỮNG ẢNH thuộc task này qua Expert của nó
                 feat_spec = self.backbone(x[mask])
-                raw_logits = self.forward_fc(self.buffer(feat_spec))
+                feat_buf_spec = self.buffer(feat_spec)
                 
-                # THỰC HIỆN MASKING (Expert chỉ được nói về class của mình)
-                masked_l = torch.zeros_like(raw_logits)
-                if hasattr(self, 'task_class_indices') and t_val < len(self.task_class_indices):
-                    idx = self.task_class_indices[t_val]
-                    masked_l[:, idx] = raw_logits[:, idx]
-                else:
-                    masked_l = raw_logits
+                # [THAY ĐỔI] Dùng W chuyên biệt của task t
+                # Phép nhân này trả về logit chỉ cho các class của task đó
+                raw_logits_task = feat_buf_spec @ self.task_weights[t_val]
                 
-                # Gán lại vào tensor kết quả tổng hợp
-                best_logits_spec[mask] = masked_l
+                # Điền vào đúng vị trí class của task t trong tensor tổng
+                idx = self.task_class_indices[t_val]
+                best_logits_spec[mask.bool()[:, None].expand(-1, len(idx)), torch.tensor(idx, device=self.device)] = raw_logits_task
 
-        # BƯỚC 4: ENSEMBLE (Cộng Uni và Spec để lấy class tốt nhất)
-        alpha = 1.0 
-        final_logits =  best_logits_spec 
+        # BƯỚC 4: ENSEMBLE
+        # final_logits = best_logits_spec # Nếu ông chỉ muốn test expert
+        final_logits = logits_uni + best_logits_spec # Nếu muốn gộp
         
         self.set_noise_mode(-2)
-        if was_training: self.train()
         return {'logits': final_logits}
