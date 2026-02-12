@@ -20,6 +20,6 @@
   "weight_decay": 5e-4,
   "num_workers": 0,
   "buffer_size": 16384,
-  "gamma": 10,
+  "gamma": 100,
   "hidden_dim": 192
 }

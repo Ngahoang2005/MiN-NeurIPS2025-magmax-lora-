@@ -180,7 +180,7 @@ class MiNbaseNet(nn.Module):
         print(">>> [System] Solving Linear System for Weights (Fast RLS)...")
         with autocast(enabled=False):
             # Ridge Regression parameter (Tương đương với việc khởi tạo R = I/gamma cũ)
-            lambda_reg = 100.0 
+            lambda_reg = 10.0
             
             I = torch.eye(self.buffer_size, device=self.device)
             
