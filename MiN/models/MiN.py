@@ -299,20 +299,15 @@ class MinNet(object):
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
-        self._network.set_noise_mode(self.cur_task) # Train expert của task hiện tại
+        self._network.set_noise_mode(self.cur_task) 
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            correct, total = 0, 0
-
+            correct = 0; total = 0
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # [ADDED] set_to_none=True tiết kiệm RAM hơn
                 optimizer.zero_grad(set_to_none=True) 
 
-                # [ADDED] Autocast để giảm 50% VRAM khi train
                 with autocast('cuda'):
-                    # 1. Main Loss (Cross Entropy)
                     if self.cur_task > 0:
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
@@ -328,12 +323,11 @@ class MinNet(object):
                         loss_ce = F.cross_entropy(logits, targets.long())
                         logits_final = logits
 
-                    # 2. [ADDED] ORTHOGONAL LOSS
+                    # [ADDED] ORTHOGONAL LOSS
                     loss_orth = torch.tensor(0.0, device=self.device)
                     if self.cur_task > 0:
                         for m in self._network.backbone.noise_maker:
                             curr_mu = m.mu[self.cur_task].weight.flatten()
-                            # Gom các vector cũ
                             prev_mus = []
                             for t in range(self.cur_task):
                                 prev_mus.append(m.mu[t].weight.flatten())
@@ -343,46 +337,28 @@ class MinNet(object):
                                 # Normalize
                                 curr_norm = F.normalize(curr_mu.unsqueeze(0), p=2, dim=1)
                                 prev_norm = F.normalize(prev_stack, p=2, dim=1)
-                                # Cos Sim: [1, D] @ [D, N_prev] -> [1, N_prev]
                                 cos_sim = torch.mm(curr_norm, prev_norm.t())
-                                # Phạt độ tương đồng
+                                # Minimize absolute similarity
                                 loss_orth += torch.sum(torch.abs(cos_sim))
 
-                    lambda_orth = 1.0 # Hệ số phạt (tùy chỉnh)
+                    lambda_orth = 1.0 
                     loss = loss_ce + lambda_orth * loss_orth
 
-                # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
                 losses += loss.item()
-
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
-                
-                # [ADDED] Xóa biến tạm
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
-
-            info = "Task {} --> Epoch {}/{} => Loss {:.3f} (Orth {:.3f}), Acc {:.2f}%".format(
-                self.cur_task,
-                epoch + 1,
-                epochs,
-                losses / len(train_loader),
-                loss_orth.item(),
-                train_acc,
-            )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            
-            # [ADDED] Clear cache sau mỗi epoch
-            if epoch % 5 == 0:
-                self._clear_gpu()
-
+            info = f"Task {self.cur_task}: Epoch {epoch+1}/{epochs} => Loss {losses/len(train_loader):.3f} (Orth {loss_orth.item():.3f}), Acc {train_acc:.2f}%"
+            self.logger.info(info); prog_bar.set_description(info)
+            if epoch % 5 == 0: self._clear_gpu()
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
@@ -412,47 +388,60 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-    # [UPDATED] Quay về tính TASK PROTOTYPE (Mean chung của cả task)
+    # =========================================================================
+    # [FIX OOM] HÀM NÀY ĐÃ ĐƯỢC CHỈNH ĐỂ CHẠY TRÊN CPU
+    # Vẫn giữ nguyên logic là Simple Mean (Mean tất cả feature)
+    # =========================================================================
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
         features = []
         
+        # 1. Thu thập features (CHUYỂN VỀ CPU NGAY LẬP TỨC)
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
+                
+                # Dùng autocast khi extract feature để nhanh hơn
                 with autocast('cuda'):
                     feature = model.extract_feature(inputs)
+                
+                # .detach().cpu() là chìa khóa để tránh OOM
                 features.append(feature.detach().cpu())
         
+        # 2. Concat trên CPU (RAM thường lớn hơn VRAM)
         all_features = torch.cat(features, dim=0)
-        # Tính Mean của tất cả features trong task
+        
+        # 3. Tính Mean (Vẫn tính trên CPU hoặc đưa về GPU nếu cần)
+        # Vì chỉ tính mean của 1 tensor lớn, đưa về GPU tính sẽ nhanh, 
+        # nhưng nếu tensor quá lớn > VRAM thì tính trên CPU luôn.
+        # Ở đây tôi để tính trên GPU cho nhanh, nếu vẫn OOM thì xóa .to(self.device)
         prototype = torch.mean(all_features, dim=0).to(self.device)
         
         self._clear_gpu()
         return prototype
-
     def analyze_cosine_accuracy(self, test_loader):
+        """Thu thập dữ liệu Cosine Similarity và Accuracy tương ứng"""
         self._network.eval()
         all_sims = []
         all_corrects = []
         
-        # Lấy Task Prototype hiện tại (đã là 1 vector mean)
+        # Lấy prototype của task hiện tại để làm mốc so sánh
         curr_proto = self._network.task_prototypes[self.cur_task].to(self.device)
         curr_proto_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
 
-        print(f">>> [DEBUG] Analyzing Task-based Cosine vs Acc for Task {self.cur_task}...")
+        print(f">>> [DEBUG] Analyzing Cosine vs Acc for Task {self.cur_task}...")
         with torch.no_grad():
             for _, inputs, targets in tqdm(test_loader, desc="Testing Bins"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
+                # 1. Tính Similarity thực tế (trước buffer)
                 self._network.set_noise_mode(-2)
                 feat = self._network.extract_feature(inputs)
                 feat_norm = F.normalize(feat, p=2, dim=1)
-                
-                # Sim với Task Proto
                 sim = torch.mm(feat_norm, curr_proto_norm.t()).squeeze(1)
                 
+                # 2. Lấy dự đoán từ Routing
                 outputs = self._network.forward_tuna_combined(inputs)
                 preds = outputs['logits'].argmax(dim=1)
                 correct = (preds == targets).float()
@@ -466,6 +455,7 @@ class MinNet(object):
         import matplotlib.pyplot as plt
         sims, corrects = np.array(sims), np.array(corrects)
         
+        # Chia bins từ 0.0 đến 1.0
         bin_edges = np.linspace(0, 1, num_bins + 1)
         acc_per_bin = []
         bin_centers = []
@@ -480,9 +470,9 @@ class MinNet(object):
         plt.bar(bin_centers, acc_per_bin, width=0.08, color='skyblue', edgecolor='black', alpha=0.7)
         plt.plot(bin_centers, acc_per_bin, marker='o', color='blue', linewidth=2)
         
-        plt.xlabel('Cosine Similarity to Task Prototype', fontsize=12)
+        plt.xlabel('Cosine Similarity to Correct Task Prototype', fontsize=12)
         plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title(f'Reliability: Task-Sim vs Acc (Task {self.cur_task})', fontsize=14)
+        plt.title(f'Reliability: Similarity vs Acc (Task {self.cur_task})', fontsize=14)
         plt.grid(axis='y', linestyle='--', alpha=0.6)
         plt.ylim(0, 105)
         
