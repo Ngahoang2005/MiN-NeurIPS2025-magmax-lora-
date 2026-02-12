@@ -267,22 +267,20 @@ class MiNbaseNet(nn.Module):
                 m.active_task_idx = mode
 
     # [ADDED] Logic Routing dựa trên CLASS SIMILARITY
+    # [MODIFIED] TASK-BASED ROUTING + THRESHOLD
     def forward_tuna_combined(self, x):
         was_training = self.training
         self.eval()
         batch_size = x.shape[0]
         num_tasks = len(self.task_prototypes)
         
-        # 1. Trích xuất Đặc trưng nền (Mode -2: Universal)
+        # 1. Base Features
         self.set_noise_mode(-2)
         with torch.no_grad():
-            feat_backbone = self.backbone(x) # [Batch, 768]
+            feat_backbone = self.backbone(x)
             feat_buffer = self.buffer(feat_backbone)
             logits_uni = self.forward_fc(feat_buffer)
 
-        # 2. CLASS-BASED COSINE ROUTING
-        # Thay vì so sánh với 1 vector task, ta so sánh với tất cả vector class của task đó
-        # và lấy Max Sim.
         best_logits_spec = torch.zeros_like(logits_uni)
         max_sim_values = torch.zeros((batch_size, 1), device=x.device)
         selected_task_ids = torch.zeros((batch_size,), dtype=torch.long, device=x.device)
@@ -290,47 +288,41 @@ class MiNbaseNet(nn.Module):
         if num_tasks > 0:
             with torch.no_grad():
                 feat_norm = F.normalize(feat_backbone, p=2, dim=1) # [B, D]
+                # Task prototypes giờ là [N_task, D]
+                all_protos = torch.stack(self.task_prototypes).to(x.device)
+                all_protos_norm = F.normalize(all_protos, p=2, dim=1)
                 
-                task_scores = []
-                # Duyệt qua từng task vì số lượng class mỗi task có thể khác nhau
-                for t_idx, protos in enumerate(self.task_prototypes):
-                    # protos: [Num_Class_In_Task, D]
-                    p_gpu = protos.to(x.device)
-                    p_norm = F.normalize(p_gpu, p=2, dim=1)
-                    
-                    # Sim matrix: [B, D] @ [D, Nc] -> [B, Nc]
-                    sim_c = torch.mm(feat_norm, p_norm.t())
-                    
-                    # Lấy Max Sim trong các class của task này để làm điểm của Task
-                    # [B]
-                    sim_t, _ = sim_c.max(dim=1) 
-                    task_scores.append(sim_t)
+                # Sim matrix: [B, N_task]
+                sim_matrix = torch.mm(feat_norm, all_protos_norm.t())
+                max_sim, selected_task_ids = sim_matrix.max(dim=1)
                 
-                # Stack lại: [B, Num_Tasks]
-                if len(task_scores) > 0:
-                    all_task_scores = torch.stack(task_scores, dim=1)
-                    # Chọn Task có điểm cao nhất
-                    max_sim, selected_task_ids = all_task_scores.max(dim=1)
-                    
-                    # Sim dùng làm trọng số (Weighted Ensemble)
-                    max_sim_values = F.relu(max_sim).unsqueeze(1) 
+                # --- THRESHOLDING LOGIC ---
+                # 1. ReLU: Bỏ sim âm
+                sim_val = F.relu(max_sim)
+                
+                # 2. Hard Threshold + Sharpening
+                # Nếu sim < 0.4 (không giống task nào) -> Trọng số = 0 -> Dùng Universal
+                threshold = 0.4
+                mask = (sim_val > threshold).float()
+                
+                # Mũ 3 để làm dốc biểu đồ (sim cao càng mạnh, sim thấp càng yếu)
+                sim_val = torch.pow(sim_val, 3) * mask
+                
+                max_sim_values = sim_val.unsqueeze(1)
 
-        # 3. SPECIFIC FORWARD (Chỉ chạy Expert cho mẫu tương ứng)
+        # 3. Specific Forward
         if num_tasks > 0:
             with torch.no_grad():
                 unique_tasks = selected_task_ids.unique()
                 for t in unique_tasks:
                     mask = (selected_task_ids == t)
-                    self.set_noise_mode(t.item()) # Bật Expert t
-                    
-                    # Re-forward Backbone chỉ cho những mẫu thuộc task t
+                    self.set_noise_mode(t.item())
                     feat_t = self.backbone(x[mask])
                     l_t = self.forward_fc(self.buffer(feat_t))
                     best_logits_spec[mask] = l_t
 
-        # 4. Cộng gộp kết quả (Weighted Ensemble)
-        # Final = Universal + (MaxSim * Specific)
-        alpha = 1.0
+        # 4. Weighted Ensemble
+        alpha = 2.0 
         weighted_spec = best_logits_spec * max_sim_values * alpha
         final_logits = logits_uni + weighted_spec
 

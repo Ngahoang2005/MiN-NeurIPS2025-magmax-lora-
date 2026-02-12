@@ -412,76 +412,52 @@ class MinNet(object):
             "task_confusion": task_info['task_confusion_matrices'],
             "all_task_accy": task_info['task_accy'],
         }
-    # =========================================================================
-    # [MODIFIED] TÍNH CLASS PROTOTYPE THAY VÌ TASK PROTOTYPE
-    # =========================================================================
+    # [UPDATED] Quay về tính TASK PROTOTYPE (Mean chung của cả task)
     def get_task_prototype(self, model, train_loader):
         model = model.eval()
         model.to(self.device)
-        
-        all_features = []
-        all_targets = []
+        features = []
         
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
                 with autocast('cuda'):
                     feature = model.extract_feature(inputs)
-                
-                all_features.append(feature.detach().cpu())
-                all_targets.append(targets.cpu())
+                features.append(feature.detach().cpu())
         
-        # Concat toàn bộ
-        all_features = torch.cat(all_features, dim=0) # [N, D]
-        all_targets = torch.cat(all_targets, dim=0)   # [N]
-        
-        # Tính Mean cho từng class có trong tập train này
-        unique_classes = torch.unique(all_targets)
-        unique_classes = unique_classes.sort()[0] # Sắp xếp để đúng thứ tự
-        
-        class_prototypes = []
-        for c in unique_classes:
-            mask = (all_targets == c)
-            class_mean = all_features[mask].mean(dim=0) # [D]
-            class_prototypes.append(class_mean)
-            
-        # Stack lại: [Num_Class, D]
-        prototypes = torch.stack(class_prototypes).to(self.device)
+        all_features = torch.cat(features, dim=0)
+        # Tính Mean của tất cả features trong task
+        prototype = torch.mean(all_features, dim=0).to(self.device)
         
         self._clear_gpu()
-        return prototypes
+        return prototype
 
     def analyze_cosine_accuracy(self, test_loader):
-        """Thu thập dữ liệu Cosine Similarity và Accuracy tương ứng"""
         self._network.eval()
         all_sims = []
         all_corrects = []
         
-        # Lấy class prototypes của task hiện tại [Num_Class, D]
-        curr_protos = self._network.task_prototypes[self.cur_task].to(self.device)
-        curr_protos_norm = F.normalize(curr_protos, p=2, dim=1)
+        # Lấy Task Prototype hiện tại (đã là 1 vector mean)
+        curr_proto = self._network.task_prototypes[self.cur_task].to(self.device)
+        curr_proto_norm = F.normalize(curr_proto.unsqueeze(0), p=2, dim=1)
 
-        print(f">>> [DEBUG] Analyzing Class-based Cosine vs Acc for Task {self.cur_task}...")
+        print(f">>> [DEBUG] Analyzing Task-based Cosine vs Acc for Task {self.cur_task}...")
         with torch.no_grad():
             for _, inputs, targets in tqdm(test_loader, desc="Testing Bins"):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
                 self._network.set_noise_mode(-2)
                 feat = self._network.extract_feature(inputs)
-                feat_norm = F.normalize(feat, p=2, dim=1) # [B, D]
+                feat_norm = F.normalize(feat, p=2, dim=1)
                 
-                # Tính Sim với tất cả class của task hiện tại
-                # [B, D] @ [D, Nc] -> [B, Nc]
-                sim_matrix = torch.mm(feat_norm, curr_protos_norm.t())
-                
-                # Lấy Max Sim (giả sử mẫu thuộc về class giống nhất trong task này)
-                max_sim, _ = sim_matrix.max(dim=1)
+                # Sim với Task Proto
+                sim = torch.mm(feat_norm, curr_proto_norm.t()).squeeze(1)
                 
                 outputs = self._network.forward_tuna_combined(inputs)
                 preds = outputs['logits'].argmax(dim=1)
                 correct = (preds == targets).float()
 
-                all_sims.extend(max_sim.cpu().numpy())
+                all_sims.extend(sim.cpu().numpy())
                 all_corrects.extend(correct.cpu().numpy())
 
         self._plot_cosine_acc_chart(all_sims, all_corrects)
@@ -490,7 +466,6 @@ class MinNet(object):
         import matplotlib.pyplot as plt
         sims, corrects = np.array(sims), np.array(corrects)
         
-        # Chia bins từ 0.0 đến 1.0
         bin_edges = np.linspace(0, 1, num_bins + 1)
         acc_per_bin = []
         bin_centers = []
@@ -505,9 +480,9 @@ class MinNet(object):
         plt.bar(bin_centers, acc_per_bin, width=0.08, color='skyblue', edgecolor='black', alpha=0.7)
         plt.plot(bin_centers, acc_per_bin, marker='o', color='blue', linewidth=2)
         
-        plt.xlabel('Max Cosine Similarity to Class Prototypes', fontsize=12)
+        plt.xlabel('Cosine Similarity to Task Prototype', fontsize=12)
         plt.ylabel('Accuracy (%)', fontsize=12)
-        plt.title(f'Reliability: Class-Sim vs Acc (Task {self.cur_task})', fontsize=14)
+        plt.title(f'Reliability: Task-Sim vs Acc (Task {self.cur_task})', fontsize=14)
         plt.grid(axis='y', linestyle='--', alpha=0.6)
         plt.ylim(0, 105)
         
