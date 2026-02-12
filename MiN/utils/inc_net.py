@@ -249,7 +249,7 @@ class MiNbaseNet(nn.Module):
         with torch.no_grad():
             for t_idx, protos in enumerate(self.task_prototypes):
                 # A. Bật Expert t
-                self.set_noise_mode(t_idx)
+                self.set_noise_mode(-3)
                 
                 # B. Forward 1 lần duy nhất
                 feat_expert = self.backbone(x)
@@ -300,8 +300,9 @@ class MiNbaseNet(nn.Module):
         # 4. Ensemble: Universal + Expert (Đã Mask)
         # Vì đã Mask = 0 ở các class lạ, nên Expert sẽ không làm nhiễu Universal ở các task khác
         alpha = 1.0 
-        final_logits = logits_uni + (best_logits_spec * weight * alpha)
-        
+        # final_logits = logits_uni + (best_logits_spec * weight * alpha)
+        # test mỗi spec
+        final_logits = best_logits_spec * weight * alpha
         self.set_noise_mode(-2)
         if was_training: self.train()
         return {'logits': final_logits}

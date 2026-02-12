@@ -131,28 +131,35 @@ class PiNoise(torch.nn.Linear):
 
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
+        
+        # Project xuống không gian thấp chiều
         x_down = hyper_features @ self.w_down
-        noise = 0 # [MODIFIED] Khởi tạo noise bằng 0
+        noise_sum = 0 
 
-        # [MODIFIED] Logic rẽ nhánh Hybrid TUNA
         if self.active_task_idx >= 0:
-            # Chế độ Specific: Chỉ dùng đúng bộ Expert được chọn
+            # --- MODE SPECIFIC ---
+            # Chỉ dùng đúng Expert của task được chọn (Routing thắng)
             if self.active_task_idx < len(self.mu):
-                noise = self.mu[self.active_task_idx](x_down) + self.sigmma[self.active_task_idx](x_down)
-        else:
-            # Chế độ Universal (Gộp/Mixture): Trộn tất cả Expert bằng weight_noise
-            if self.weight_noise is not None:
-                # Đảm bảo weight_noise sum = 1
-                w = torch.softmax(self.weight_noise, dim=-1)
-                for i in range(len(self.mu)):
-                    noise += (self.mu[i](x_down) + self.sigmma[i](x_down)) * w[i]
+                noise_sum = self.mu[self.active_task_idx](x_down) + self.sigmma[self.active_task_idx](x_down)
+        if self.active_task_idx == -2:
+            # --- MODE UNIVERSAL (Gộp trung bình) ---
+            # Cộng tất cả các Expert lại rồi chia trung bình
+            n_experts = len(self.mu)
+            if n_experts > 0:
+                for i in range(n_experts):
+                    noise_sum += (self.mu[i](x_down) + self.sigmma[i](x_down))
+                noise_sum = noise_sum / n_experts # Tính trung bình cộng
             else:
-                # Fallback nếu chưa có weight_noise
-                noise = self.mu[-1](x_down) + self.sigmma[-1](x_down)
+                noise_sum = 0
+        if self.active_task_idx == -3:
+            # không qua noise
+            noise_sum = 0
 
-        noise = noise @ self.w_up
-        return x1 + noise + hyper_features
-
+        # Project ngược lên không gian gốc
+        noise_out = noise_sum @ self.w_up
+        
+        # Residual connection
+        return x1 + noise_out + hyper_features
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
 
