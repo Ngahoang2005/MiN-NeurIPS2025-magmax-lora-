@@ -221,70 +221,61 @@ class MinNet(object):
         self._clear_gpu()
 
     def fit_fc(self, train_loader, test_loader):
-        # [SỬA LỖI CHIẾN THUẬT]: Chuyển từ "Học từng batch" sang "Cộng dồn thống kê -> Giải 1 lần"
+        # [SỬA LỖI CHIẾN THUẬT]: Global Analytic Learning (Học 1 lần cho cả epoch)
         self._network.eval()
         self._network.to(self.device)
         
         # 1. Khởi tạo ma trận thống kê
-        # Cần xác định feature_dim. Lấy thử 1 mẫu để đo.
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
             dummy_feat = self._network.extract_feature(dummy_input)
-            # Qua Buffer
             if hasattr(self._network, 'buffer'):
                 dummy_feat = self._network.buffer(dummy_feat.float())
             feat_dim = dummy_feat.shape[1]
         
-        # Num classes hiện tại (quan trọng để one_hot đúng)
-        num_classes = self.known_class
+        # [FIX QUAN TRỌNG]: Lấy num_classes từ _network (đã update) thay vì self (chưa update)
+        num_classes = self._network.known_class
         
         # Ma trận A (Tự tương quan) và B (Tương quan chéo)
-        # Dùng float32 hoặc float64 cho chính xác
         A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
         B = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
         
-        print(f"--> Collecting Statistics for Task {self.cur_task}...")
+        print(f"--> Collecting Statistics for Task {self.cur_task} (Classes: {num_classes})...")
         
         # 2. Vòng lặp cộng dồn (Accumulation Phase)
         with torch.no_grad():
             for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Accumulating")):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
                 
-                # Forward Backbone
+                # Xử lý targets để đảm bảo one_hot đúng
+                if targets.dim() > 1: targets = targets.view(-1)
+                
+                # Forward
                 features = self._network.extract_feature(inputs).float()
-                # Forward Buffer (Random Projection)
                 features = self._network.buffer(features)
                 
-                # One-hot encoding chuẩn xác
+                # One-hot chuẩn xác với num_classes cố định
                 targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                 
-                # Cộng dồn A = X^T * X và B = X^T * Y
+                # Cộng dồn
                 A += features.T @ features
                 B += features.T @ targets_oh
         
         # 3. Giải phương trình (Solving Phase)
-        # W = (A + gamma * I)^-1 @ B
         gamma = self.args['gamma']
         I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
         
         print("--> Solving Linear System...")
-        # Ridge Regression Regularization
         A_reg = A + gamma * I
         
         try:
-            # Giải hệ phương trình tuyến tính
             W = torch.linalg.solve(A_reg, B)
         except RuntimeError:
-            # Fallback nếu ma trận không khả nghịch
             W = torch.linalg.pinv(A_reg) @ B
             
-        # 4. Gán trọng số vào mạng
-        # Lưu ý: Cần mở rộng self._network.weight nếu size chưa khớp (cho task mới)
+        # 4. Gán trọng số
         if self._network.weight.shape != W.shape:
-            # Tạo weight mới đúng kích thước
             self._network.weight = torch.zeros_like(W)
-            # Register lại buffer nếu cần, hoặc chỉ gán data nếu size khớp
-            # Ở đây ta gán trực tiếp data
             self._network.weight.data = W
         else:
             self._network.weight.data = W
@@ -293,10 +284,9 @@ class MinNet(object):
         self._clear_gpu()
 
     def re_fit(self, train_loader, test_loader):
-        # re_fit dùng chung logic với fit_fc (học lại trên tập train_no_aug)
+        # re_fit dùng chung logic với fit_fc
         print(f"--> Refitting Task {self.cur_task} (No Augmentation)...")
         self.fit_fc(train_loader, test_loader)
-        
        
     def run(self, train_loader):
         epochs = self.init_epochs if self.cur_task == 0 else self.epochs
