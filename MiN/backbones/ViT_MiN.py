@@ -169,8 +169,21 @@ class PiNoise(nn.Module):
         
         # 3. Noise Injection
         noise_projected = z @ self.w_up
-        out = hyper_features + (self.noise_scale * noise_projected)
-        
+        effective_noise = self.noise_scale * noise_projected
+        out = hyper_features + effective_noise
+        if self.training:
+            with torch.no_grad():
+                # Tính norm trung bình trên chiều cuối cùng (dim=-1)
+                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
+                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
+                
+                self.last_debug_info = {
+                    "signal": sig_norm,
+                    "noise": noise_norm,
+                    "snr": sig_norm / (noise_norm + 1e-9),
+                    "sigma": sigma.mean().item(),
+                    "scale": self.noise_scale.item()
+                }
         # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
         if return_kl:
             kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
@@ -241,7 +254,8 @@ class PiNoise(nn.Module):
             total_var = torch.sum(S)
             s_cumsum = torch.cumsum(S, dim=0)
             k = torch.searchsorted(s_cumsum, total_var * val).item()
-            print(f"--> GPM Selection (Energy {val}): Need {k} dims.")
+            if k == 0 and total_var > 0: k = 1
+            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
             
         else: # ratio
             k = max(1, int(self.hidden_dim * val))

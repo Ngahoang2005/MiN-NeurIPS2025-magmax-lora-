@@ -263,21 +263,23 @@ class MinNet(object):
         # Lưu ý: A_new và B_new là thống kê của RIÊNG dữ liệu hiện tại
         A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
         B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+        fit_epochs = self.fit_epoch 
         
-        with torch.no_grad():
-            for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Accumulating")):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
-                if targets.dim() > 1: targets = targets.view(-1)
-                
-                # Forward
-                features = self._network.extract_feature(inputs).float()
-                features = self._network.buffer(features)
-                
-                # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
-                targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
-                
-                A_new += features.T @ features
-                B_new += features.T @ targets_oh
+        for epoch in range(fit_epochs):
+            with torch.no_grad():
+                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}")):
+                    inputs, targets = inputs.to(self.device), targets.to(self.device)
+                    if targets.dim() > 1: targets = targets.view(-1)
+                    
+                    # Forward
+                    features = self._network.extract_feature(inputs).float()
+                    features = self._network.buffer(features)
+                    
+                    # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
+                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+                    
+                    A_new += features.T @ features
+                    B_new += features.T @ targets_oh
         
         # 4. Cộng vào bộ nhớ toàn cục
         self.A_global += A_new
@@ -315,7 +317,7 @@ class MinNet(object):
 
         current_scale = 0.85 
         
-        # Freeze/Unfreeze
+        # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
         for param in self._network.normal_fc.parameters(): param.requires_grad = True
         
@@ -331,11 +333,12 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 1e-4
+        max_beta = 1e-4 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
         
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
-            kl_losses = 0.0
+            ce_losses = 0.0 # Theo dõi riêng CE
+            kl_losses = 0.0 # Theo dõi riêng KL
             correct, total = 0, 0
 
             beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
@@ -346,7 +349,7 @@ class MinNet(object):
                 
                 optimizer.zero_grad(set_to_none=True) 
 
-                # 1. FORWARD TRONG AUTOCAST
+                # 1. FORWARD
                 with autocast('cuda'):
                     if self.cur_task > 0:
                         with torch.no_grad():
@@ -356,20 +359,15 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # 2. THOÁT KHỎI AUTOCAST ĐỂ TÍNH LOSS (CRITICAL FIX)
-                # Chuyển Logits về float32 để tính toán chính xác và tránh lỗi type
+                # 2. CALC LOSS
                 logits_final = logits_final.float() 
-                
-                # Xử lý Targets triệt để
                 if targets.dim() > 1: targets = targets.reshape(-1)
-                targets = targets.long() # Bắt buộc là LongTensor
+                targets = targets.long()
 
-                
-                # Tính Loss (bên ngoài autocast)
                 ce_loss = F.cross_entropy(logits_final, targets)
                 loss = ce_loss + beta_current * batch_kl
 
-                # 3. BACKWARD VỚI SCALER
+                # 3. BACKWARD
                 self.scaler.scale(loss).backward()
                 
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
@@ -379,18 +377,18 @@ class MinNet(object):
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
-                # Metrics
+                # 4. METRICS & LOGGING
                 losses += loss.item()
-                kl_losses += batch_kl.item()
+                ce_losses += ce_loss.item()      # Cộng dồn CE
+                kl_losses += batch_kl.item()     # Cộng dồn KL
                 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # Clean VRAM
                 del inputs, targets, loss, logits_final, batch_kl
 
-                # Debug Noise
+                # In bảng Noise mỗi 50 batch
                 if i % 50 == 0:
                      if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
                         self.print_noise_status()
@@ -398,14 +396,21 @@ class MinNet(object):
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "T {} | Ep {} | L {:.3f} | Acc {:.2f}".format(
-                self.cur_task, epoch + 1, losses / len(train_loader), train_acc
+            # [HIỂN THỊ CHI TIẾT LOSS]
+            # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
+            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, 
+                losses / len(train_loader), 
+                ce_losses / len(train_loader),
+                kl_losses / len(train_loader),
+                train_acc
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
             if epoch % 5 == 0:
                 self._clear_gpu()
+    
     
     def print_noise_status(self):
         print("\n" + "="*85)
