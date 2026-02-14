@@ -370,7 +370,7 @@ class MinNet(object):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
                     if targets.dim() > 1: targets = targets.view(-1)
 
-                    with autocast(enabled=False): # Tắt Float16
+                    with autocast('cuda', enabled=False): # Tắt Float16
                         # Forward
                         features = self._network.extract_feature(inputs).float()
                         if hasattr(self._network, 'buffer'):
