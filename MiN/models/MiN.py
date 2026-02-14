@@ -361,7 +361,7 @@ class MinNet(object):
                     if targets.dim() > 1: targets = targets.view(-1)
                     
                     # Forward (Vẫn giữ autocast/float16 của bạn)
-                    with autocast(enabled=True): 
+                    with autocast('cuda', enabled=True): 
                         features = self._network.extract_feature(inputs).float() # Buffer cần float32 đầu vào
                         features = self._network.buffer(features)
                         targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
