@@ -388,3 +388,68 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
+        # Thêm vào trong class MiNbaseNet (inc_net.py)
+
+    def _mmcc_kernel(self, error, sigma=1.0, omega=0.4):
+        """
+        Tính trọng số bền vững (Robustness Weight) dựa trên sai số.
+        Kết hợp Gaussian và Cauchy kernel như bạn yêu cầu.
+        
+        Args:
+            error: Tensor sai số (Batch_size, Num_classes)
+            sigma: Băng thông (Bandwidth)
+            omega: Trọng số trộn (Mixing proportion)
+        Returns:
+            eta: Trọng số vô hướng cho mỗi mẫu (Batch_size, 1)
+        """
+        # Tính bình phương lỗi (L2 norm squared per sample)
+        # Ta lấy trung bình lỗi trên các class để ra 1 trọng số duy nhất cho cả mẫu
+        e_sq = error.pow(2).mean(dim=1, keepdim=True) 
+        
+        # 1. Gaussian Kernel (Nhạy với lỗi nhỏ - Accuracy)
+        k_gauss = torch.exp(-e_sq / (2 * sigma**2))
+        
+        # 2. Cauchy Kernel (Đuôi nặng - Robustness với Outliers lớn)
+        k_cauchy = 1 / (1 + e_sq / sigma**2)
+        
+        # 3. Mixture
+        eta = omega * k_gauss + (1 - omega) * k_cauchy
+        
+        return eta
+
+    def fit_mmcc(self, X, Y, W_prev, sigma=1.0, omega=0.4):
+        """
+        Thực hiện 1 bước tính toán thống kê A và B có trọng số MMCC.
+        
+        Args:
+            X: Features đầu vào (Batch, Feat_dim)
+            Y: Nhãn One-hot (Batch, Num_classes)
+            W_prev: Trọng số Classifier hiện tại (để tính lỗi dự đoán)
+        Returns:
+            A_weighted: Ma trận tự tương quan đã lọc nhiễu
+            B_weighted: Ma trận tương quan chéo đã lọc nhiễu
+        """
+        # 1. Dự đoán với trọng số hiện tại (A priori estimate)
+        with torch.no_grad():
+            # X và W_prev cần cùng kiểu dữ liệu
+            logits = X @ W_prev
+            
+            # 2. Tính sai số dự đoán (Prediction Error) e_k
+            error = Y - logits
+            
+            # 3. Tính trọng số MMCC eta(e_k)
+            # Mẫu nào lỗi quá lớn -> eta tiệm cận 0 -> Loại bỏ khỏi phép cộng dồn
+            eta = self._mmcc_kernel(error, sigma, omega)
+        
+        # 4. Áp dụng trọng số vào dữ liệu (Re-weighting)
+        # sqrt(eta) vì A = (X*sq_eta)^T @ (X*sq_eta) = X^T * eta * X
+        sqrt_eta = torch.sqrt(eta)
+        
+        X_weighted = X * sqrt_eta
+        Y_weighted = Y * sqrt_eta # Y cũng cần nhân trọng số tương ứng
+        
+        # 5. Tính A và B cho batch này
+        A_weighted = X_weighted.T @ X_weighted
+        B_weighted = X_weighted.T @ Y_weighted
+        
+        return A_weighted, B_weighted
