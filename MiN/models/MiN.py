@@ -376,7 +376,7 @@ class MinNet(object):
                     
                     # [CORE MMCC]: Tính A và B có trọng số dựa trên W của vòng lặp trước
                     A_batch, B_batch = self._network.fit_mmcc(
-                        features, targets_oh, current_W, sigma=SIGMA, omega=OMEGA
+                        features, targets_oh, current_W, sigma=None, omega=OMEGA
                     )
                     
                     A_epoch += A_batch

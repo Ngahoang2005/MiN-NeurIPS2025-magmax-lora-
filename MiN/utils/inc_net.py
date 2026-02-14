@@ -417,39 +417,38 @@ class MiNbaseNet(nn.Module):
         
         return eta
 
-    def fit_mmcc(self, X, Y, W_prev, sigma=1.0, omega=0.4):
-        """
-        Thực hiện 1 bước tính toán thống kê A và B có trọng số MMCC.
+    def fit_mmcc(self, X, Y, W_prev, sigma=None, omega=0.5):
+        # 1. Dự đoán
+        logits = X @ W_prev
+        error = Y - logits
+        e_sq = error.pow(2).mean(dim=1, keepdim=True)
         
-        Args:
-            X: Features đầu vào (Batch, Feat_dim)
-            Y: Nhãn One-hot (Batch, Num_classes)
-            W_prev: Trọng số Classifier hiện tại (để tính lỗi dự đoán)
-        Returns:
-            A_weighted: Ma trận tự tương quan đã lọc nhiễu
-            B_weighted: Ma trận tương quan chéo đã lọc nhiễu
-        """
-        # 1. Dự đoán với trọng số hiện tại (A priori estimate)
-        with torch.no_grad():
-            # X và W_prev cần cùng kiểu dữ liệu
-            logits = X @ W_prev
-            
-            # 2. Tính sai số dự đoán (Prediction Error) e_k
-            error = Y - logits
-            
-            # 3. Tính trọng số MMCC eta(e_k)
-            # Mẫu nào lỗi quá lớn -> eta tiệm cận 0 -> Loại bỏ khỏi phép cộng dồn
-            eta = self._mmcc_kernel(error, sigma, omega)
+        # [AUTO-TUNE SIGMA]
+        # Nếu sigma không được set cứng, hãy lấy theo thống kê của batch
+        # Quy tắc Silverman: Sigma = Median của lỗi * hằng số
+        if sigma is None:
+            with torch.no_grad():
+                # Lấy median của lỗi trong batch để làm chuẩn
+                # Những mẫu có lỗi > 3 * median mới bị coi là outlier
+                median_err = torch.median(e_sq)
+                sigma = torch.sqrt(median_err) * 3.0 
+                # Chặn dưới để không bị chia cho 0
+                sigma = torch.max(sigma, torch.tensor(1.0, device=X.device))
         
-        # 4. Áp dụng trọng số vào dữ liệu (Re-weighting)
-        # sqrt(eta) vì A = (X*sq_eta)^T @ (X*sq_eta) = X^T * eta * X
+        # 2. Gaussian Kernel
+        k_gauss = torch.exp(-e_sq / (2 * sigma**2))
+        
+        # 3. Cauchy Kernel (Mềm hơn)
+        k_cauchy = 1 / (1 + e_sq / sigma**2)
+        
+        # 4. Mixture
+        eta = omega * k_gauss + (1 - omega) * k_cauchy
+        
+        # [AN TOÀN] Không cho phép eta quá nhỏ để tránh chết mẫu
+        eta = torch.clamp(eta, min=0.01) 
+        
         sqrt_eta = torch.sqrt(eta)
-        
         X_weighted = X * sqrt_eta
-        Y_weighted = Y * sqrt_eta # Y cũng cần nhân trọng số tương ứng
+        Y_weighted = Y * sqrt_eta
         
-        # 5. Tính A và B cho batch này
-        A_weighted = X_weighted.T @ X_weighted
-        B_weighted = X_weighted.T @ Y_weighted
-        
-        return A_weighted, B_weighted
+        return X_weighted.T @ X_weighted, X_weighted.T @ Y_weighted
