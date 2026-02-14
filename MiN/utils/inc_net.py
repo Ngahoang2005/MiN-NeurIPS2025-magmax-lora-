@@ -416,7 +416,7 @@ class MiNbaseNet(nn.Module):
         eta = omega * k_gauss + (1 - omega) * k_cauchy
         
         return eta
-
+    @torch.no_grad()
     def fit_mmcc(self, X, Y, W_prev, sigma=None, omega=0.5):
         # 1. Dự đoán
         logits = X @ W_prev
