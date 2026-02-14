@@ -333,7 +333,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 1e-5 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
+        max_beta = 1e-3# [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
         
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
@@ -341,7 +341,7 @@ class MinNet(object):
             kl_losses = 0.0 # Theo dõi riêng KL
             correct, total = 0, 0
 
-            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
+            beta_current = max_beta * min(1.0, epoch / (epochs / 3 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
