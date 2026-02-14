@@ -263,7 +263,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
-        with autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             X = X.float().to(self.device)
             Y = Y.float().to(self.device)
             num_targets = Y.shape[1]
@@ -388,6 +388,3 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
-        # Thêm vào trong class MiNbaseNet (inc_net.py)
-
-    
