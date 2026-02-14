@@ -317,114 +317,119 @@ class MinNet(object):
         self._network.eval()
         self._network.to(self.device)
 
-        # --- CẤU HÌNH ---
-        # DEBUG MODE: SIGMA=10000.0, OMEGA=1.0 (Giống RLS)
-        # REAL MODE: SIGMA=5.0, OMEGA=0.8
-        SIGMA = 10000.0 
+        # [CẤU HÌNH KIỂM TRA]
+        # SIGMA = 10000.0, OMEGA = 1.0 -> RLS Mode (Verification)
+        # SIGMA = 5.0, OMEGA = 0.8 -> Robust Mode
+        SIGMA = 10000.0
         OMEGA = 1.0
 
-        # 1. Xác định Feature Dimension
+        # 1. Xác định Feature
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
-            # Ép kiểu float ngay từ đầu
-            dummy_feat = self._network.extract_feature(dummy_input).float() 
+            dummy_feat = self._network.extract_feature(dummy_input).float()
             if hasattr(self._network, 'buffer'):
                 dummy_feat = self._network.buffer(dummy_feat)
             feat_dim = dummy_feat.shape[1]
 
         num_classes = self._network.known_class
-        
-        # 2. Init Global Memory (Nếu chưa có)
+
+        # 2. Khởi tạo Global Memory (Nếu chưa có)
         if not hasattr(self, 'A_global'):
-            print("--> [MMCC] Init Global Memory (Float32)...")
+            print("--> Init Global Memory...")
             self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
             self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
 
-        # Mở rộng B_global nếu cần
+        # Mở rộng B_global
         if num_classes > self.B_global.shape[1]:
             diff = num_classes - self.B_global.shape[1]
             expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
             self.B_global = torch.cat([self.B_global, expansion], dim=1)
 
-        # 3. Chuẩn bị current_W (FIX LỖI TẠI ĐÂY)
-        # Bắt buộc current_W phải có kích thước [feat_dim, num_classes] để tính logits
+        # 3. Chuẩn bị W để tính lỗi (QUAN TRỌNG: Resize W cho khớp Class)
         current_W = self._network.weight.data.clone().float()
-        
-        # Nếu current_W đang rỗng (Task 0) hoặc thiếu class (Task > 0) -> Phải Resize ngay
         if current_W.shape[1] != num_classes:
             new_W = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
-            # Copy phần cũ sang (nếu có)
             if current_W.shape[1] > 0:
-                valid_cols = min(current_W.shape[1], num_classes)
-                new_W[:, :valid_cols] = current_W[:, :valid_cols]
+                valid = min(current_W.shape[1], num_classes)
+                new_W[:, :valid] = current_W[:, :valid]
             current_W = new_W
 
-        # 4. Accumulation Loop
-        current_fit_epochs = self.fit_epoch if update_archive else 1
+        # 4. Tích lũy (Accumulation Loop)
+        # Tạo biến tạm A_new, B_new để cộng dồn qua các Epochs
+        A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+        B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
         
-        # Biến tích lũy cho đợt fit này
-        A_total_aug = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-        B_total_aug = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+        # Nếu update_archive=False (Re-fit), chạy ít epoch thôi (vd: 1)
+        fit_epochs = self.fit_epoch if update_archive else 1 
+        
+        print(f"--> Accumulating Stats ({fit_epochs} epochs)...")
 
-        print(f"--> [MMCC] Fitting {current_fit_epochs} epochs (Sigma={SIGMA})...")
-
-        for epoch in range(current_fit_epochs):
+        for epoch in range(fit_epochs):
             with torch.no_grad():
                 for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False)):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
                     if targets.dim() > 1: targets = targets.view(-1)
-                    
-                    # Forward (Ép kiểu float32)
-                    # Tắt autocast tạm thời ở đây để đảm bảo tính toán ma trận chính xác
-                    with autocast('cuda', enabled=False): 
+
+                    with autocast(enabled=False): # Tắt Float16
+                        # Forward
                         features = self._network.extract_feature(inputs).float()
-                        features = self._network.buffer(features)
-                        targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+                        if hasattr(self._network, 'buffer'):
+                            features = self._network.buffer(features)
                         
-                        # [MMCC]: Tính A, B cho batch này
-                        # Bây giờ current_W đã đúng kích thước, không còn lỗi mismatch
+                        targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+
+                        # [MMCC CALL]
+                        # Gọi hàm tính toán có trọng số
                         A_batch, B_batch = self._network.fit_mmcc(
                             features, targets_oh, current_W, sigma=SIGMA, omega=OMEGA
                         )
-                    
-                    # Cộng dồn
-                    A_total_aug += A_batch
-                    B_total_aug += B_batch
+                        
+                        # Cộng dồn
+                        A_new += A_batch
+                        B_new += B_batch
 
-            # Update sơ bộ current_W (Optional)
+            # (Tùy chọn) Cập nhật sơ bộ W sau mỗi epoch để epoch sau tính lỗi chính xác hơn (Iterative)
+            # Nếu muốn thuần RLS cộng dồn thì comment đoạn try-except này lại.
             try:
-                temp_A = self.A_global + A_total_aug + self.args['gamma'] * torch.eye(feat_dim, device=self.device)
-                temp_B = self.B_global + B_total_aug
+                temp_A = self.A_global + A_new + self.args['gamma'] * torch.eye(feat_dim, device=self.device)
+                temp_B = self.B_global + B_new
                 current_W = torch.linalg.solve(temp_A, temp_B)
             except: pass
 
-        # 5. Giải hệ phương trình cuối cùng
-        print("--> Solving Final System...")
-        gamma = self.args['gamma']
-        I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+        # 5. Cập nhật Global & Giải
+        print("--> Solving Global System...")
         
         if update_archive:
-            self.A_global += A_total_aug
-            self.B_global += B_total_aug
+            # Lưu vào bộ nhớ thật
+            self.A_global += A_new
+            self.B_global += B_new
             A_final = self.A_global
             B_final = self.B_global
         else:
-            A_final = self.A_global + A_total_aug
-            B_final = self.B_global + B_total_aug
+            # Re-fit: Chỉ dùng tạm A_new + A_global
+            A_final = self.A_global + A_new
+            B_final = self.B_global + B_new
 
-        # Regularization & Solve
+        gamma = self.args['gamma']
+        I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+        
         try:
             W = torch.linalg.solve(A_final + gamma * I, B_final)
         except RuntimeError:
-            print("   [Warning] Singular matrix, using pinv...")
             W = torch.linalg.pinv(A_final + gamma * I) @ B_final
-            
-        # Gán lại W vào network
+
+        # 6. Gán Weight
         if self._network.weight.shape != W.shape:
             self._network.weight = torch.zeros_like(W)
         self._network.weight.data = W
-            
+        
         self._clear_gpu()
+
+    def re_fit(self, train_loader, test_loader):
+        # Gọi lại fit_fc nhưng KHÔNG LƯU vào Global (update_archive=False)
+        print(f"--> Refitting Task {self.cur_task} (No Archive Update)...")
+        self.fit_fc(train_loader, test_loader, update_archive=False)
+    
     def re_fit(self, train_loader, test_loader):
         """
         Re-fit với MMCC trên dữ liệu sạch.
