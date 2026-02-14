@@ -319,7 +319,7 @@ class MinNet(object):
         
         # --- Cấu hình Hyperparams cho MMCC ---
         # Bạn có thể đưa cái này ra file config args
-        SIGMA =5.0  # Ban đầu = 1.0. Tăng lên nếu data quá nhiễu.
+        SIGMA =100000  # Ban đầu = 1.0. Tăng lên nếu data quá nhiễu.
         OMEGA = 0.8  # Tỷ lệ trộn (0.4 Gaussian, 0.6 Cauchy)
         
 
