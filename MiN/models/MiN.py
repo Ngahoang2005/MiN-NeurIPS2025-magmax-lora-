@@ -320,7 +320,7 @@ class MinNet(object):
         # --- Cấu hình Hyperparams cho MMCC ---
         # Bạn có thể đưa cái này ra file config args
         SIGMA = 1.0  # Ban đầu = 1.0. Tăng lên nếu data quá nhiễu.
-        OMEGA = 0.4  # Tỷ lệ trộn (0.4 Gaussian, 0.6 Cauchy)
+        OMEGA = 0.9  # Tỷ lệ trộn (0.4 Gaussian, 0.6 Cauchy)
         
         # 1. Lấy Feature Dim & Init Memory (Giữ nguyên như cũ)
         with torch.no_grad():
