@@ -316,14 +316,14 @@ class MinNet(object):
     def fit_fc(self, train_loader, test_loader, update_archive=True):
         self._network.eval()
         self._network.to(self.device)
-        
-        # --- Cấu hình Hyperparams cho MMCC ---
-        # Bạn có thể đưa cái này ra file config args
-        SIGMA =100000  # Ban đầu = 1.0. Tăng lên nếu data quá nhiễu.
-        OMEGA = 0.8  # Tỷ lệ trộn (0.4 Gaussian, 0.6 Cauchy)
-        
 
-        # 1. Lấy Feature Dim & Init Memory (Giữ nguyên như cũ)
+        # --- CẤU HÌNH ---
+        # Khi muốn debug về RLS thường: Set SIGMA = 10000.0, OMEGA = 1.0
+        # Khi chạy thật: Set SIGMA = 5.0, OMEGA = 0.8 (hoặc tùy chỉnh)
+        SIGMA = 5.0 
+        OMEGA = 0.8
+        
+        # 1. Init Memory
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
             dummy_feat = self._network.extract_feature(dummy_input)
@@ -334,7 +334,7 @@ class MinNet(object):
         num_classes = self._network.known_class
         
         if not hasattr(self, 'A_global'):
-            print("--> Initializing MMCC-RLS Global Memory...")
+            print("--> [MMCC] Init Global Memory...")
             self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
             self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
 
@@ -343,75 +343,86 @@ class MinNet(object):
             expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
             self.B_global = torch.cat([self.B_global, expansion], dim=1)
 
-        # 2. ITERATIVE LEARNING (IRLS)
-        # MMCC cần trọng số W ban đầu để tính lỗi. 
-        # Nếu là epoch 0, ta dùng W hiện tại (hoặc khởi tạo ngẫu nhiên nếu task 0)
+        current_fit_epochs = self.fit_epoch if update_archive else 1 # Re-fit thì chạy ít thôi
         current_W = self._network.weight.data.clone()
-        if current_W.shape[1] != num_classes: # Resize nếu class tăng
-             # (Logic resize W đơn giản, hoặc để 0 cũng được vì IRLS sẽ hội tụ nhanh)
+        
+        if current_W.shape[1] != num_classes:
              new_W = torch.zeros((feat_dim, num_classes), device=self.device)
-             new_W[:, :current_W.shape[1]] = current_W
+             if current_W.shape[1] > 0: new_W[:, :current_W.shape[1]] = current_W
              current_W = new_W
 
-        current_fit_epochs = self.fit_epoch if update_archive else 1 
+        print(f"--> [MMCC] Fitting (Accumulating {current_fit_epochs} epochs)...")
         
-        print(f"--> MMCC-RLS Fitting (Sigma={SIGMA}, Omega={OMEGA})...")
-        
-        # Vòng lặp tinh chỉnh trọng số (The Robust Loop)
+        # [FIX BUG QUAN TRỌNG]: Khởi tạo biến tích lũy BÊN NGOÀI vòng lặp Epoch
+        # Để tổng hợp dữ liệu của toàn bộ quá trình Augmentation
+        A_total_aug = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+        B_total_aug = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+
         for epoch in range(current_fit_epochs):
-            # Reset Accumulators cho Epoch này
-            A_epoch = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-            B_epoch = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+            # Với MMCC, ta có thể cập nhật W sau mỗi epoch để tính eta chuẩn hơn (IRLS)
+            # Hoặc giữ nguyên W (One-shot). 
+            # Để an toàn và giống RLS nhất, ta giữ nguyên W hoặc chỉ update nhẹ.
             
             with torch.no_grad():
-                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"MMCC Ep {epoch+1}", leave=False)):
+                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}", leave=False)):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
                     if targets.dim() > 1: targets = targets.view(-1)
                     
-                    # Forward lấy feature
                     features = self._network.extract_feature(inputs).float()
                     features = self._network.buffer(features)
-                    
-                    # One-hot Targets
                     targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
                     
-                    # [CORE MMCC]: Tính A và B có trọng số dựa trên W của vòng lặp trước
+                    # Tính MMCC Stats
                     A_batch, B_batch = self._network.fit_mmcc(
                         features, targets_oh, current_W, sigma=SIGMA, omega=OMEGA
                     )
                     
-                    A_epoch += A_batch
-                    B_epoch += B_batch
+                    # Cộng dồn vào biến tổng
+                    A_total_aug += A_batch
+                    B_total_aug += B_batch
             
-            # Giải hệ phương trình tạm thời để cập nhật W cho epoch sau (Refinement)
-            # W_new = (A_global + A_epoch + gamma*I)^-1 @ (B_global + B_epoch)
-            # Lưu ý: Ta cộng với A_global để tận dụng kiến thức cũ giúp định hình lỗi tốt hơn
-            
+            # (Tùy chọn) Cập nhật sơ bộ current_W để epoch sau lọc nhiễu tốt hơn
+            # Nhưng không reset A_total_aug!
             gamma = self.args['gamma']
             I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-            
-            # Nếu update_archive=False (Refit), ta dùng A_global nhưng không sửa nó
-            # Nếu update_archive=True, ta chưa sửa A_global ngay mà đợi hết loop mới sửa (hoặc sửa luôn tùy chiến thuật)
-            # Ở đây: Ta dùng W tạm để tính lỗi cho chính xác hơn ở epoch sau
+            # Solve tạm để update W cho vòng lặp sau
             try:
-                current_W = torch.linalg.solve(self.A_global + A_epoch + gamma * I, self.B_global + B_epoch)
-            except RuntimeError:
-                current_W = torch.linalg.pinv(self.A_global + A_epoch + gamma * I) @ (self.B_global + B_epoch)
+                # Lưu ý: Ta dùng A_total_aug (đã tích lũy) + A_global
+                # Việc này giúp W hội tụ dần
+                temp_A = self.A_global + A_total_aug + gamma * I
+                temp_B = self.B_global + B_total_aug
+                current_W = torch.linalg.solve(temp_A, temp_B)
+            except:
+                pass
 
-        # 3. Final Update to Memory & Network
-        print("--> Solving Final MMCC System...")
+        # 3. FINAL SOLVE & UPDATE MEMORY
+        print("--> Solving Final System...")
         
         if update_archive:
-            # Chỉ cộng dồn thống kê của Epoch CUỐI CÙNG (nơi trọng số eta chính xác nhất)
-            # Hoặc trung bình các epoch. Ở đây lấy epoch cuối là chuẩn nhất theo IRLS.
-            self.A_global += A_epoch
-            self.B_global += B_epoch
+            # Cộng toàn bộ dữ liệu Augmented vào Global
+            self.A_global += A_total_aug
+            self.B_global += B_total_aug
         
-        # Gán trọng số đã giải được vào mạng
-        if self._network.weight.shape != current_W.shape:
-            self._network.weight = torch.zeros_like(current_W)
-        self._network.weight.data = current_W
+        # Giải nghiệm cuối cùng (đã bao gồm A_global + Toàn bộ Augmentation)
+        # Lúc này Gamma sẽ tương tác với lượng dữ liệu lớn -> Tỷ lệ chuẩn như RLS thường
+        gamma = self.args['gamma']
+        I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
         
+        if update_archive:
+            A_final = self.A_global
+            B_final = self.B_global
+        else:
+            A_final = self.A_global + A_total_aug
+            B_final = self.B_global + B_total_aug
+
+        try:
+            W = torch.linalg.solve(A_final + gamma * I, B_final)
+        except RuntimeError:
+            W = torch.linalg.pinv(A_final + gamma * I) @ B_final
+            
+        if self._network.weight.shape != W.shape:
+            self._network.weight = torch.zeros_like(W)
+        self._network.weight.data = W
         self._clear_gpu()
     def re_fit(self, train_loader, test_loader):
         """
