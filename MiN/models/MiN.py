@@ -230,86 +230,160 @@ class MinNet(object):
         del train_set_no_aug, test_set
         self._clear_gpu()
 
-    def fit_fc(self, train_loader, test_loader):
-        # [FIX 2: MEMORY ACCUMULATION]
-        # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
-        # Nếu tính lại từ đầu, model sẽ quên sạch quá khứ.
+    # def fit_fc(self, train_loader, test_loader):
+    #     # [FIX 2: MEMORY ACCUMULATION]
+    #     # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
+    #     # Nếu tính lại từ đầu, model sẽ quên sạch quá khứ.
         
+    #     self._network.eval()
+    #     self._network.to(self.device)
+        
+    #     # 1. Xác định kích thước feature
+    #     with torch.no_grad():
+    #         dummy_input = next(iter(train_loader))[1].to(self.device)
+    #         dummy_feat = self._network.extract_feature(dummy_input)
+    #         if hasattr(self._network, 'buffer'):
+    #             dummy_feat = self._network.buffer(dummy_feat.float())
+    #         feat_dim = dummy_feat.shape[1]
+        
+    #     # Lấy tổng số class ĐÃ ĐƯỢC MỞ RỘNG
+    #     num_classes = self._network.known_class
+        
+    #     # 2. Khởi tạo Global Memory nếu chưa có (lưu trong self của MinNet để persist qua các task)
+    #     if not hasattr(self, 'A_global'):
+    #         print("--> Initializing Global RLS Memory...")
+    #         self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+    #         self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
+
+    #     # Mở rộng B_global nếu số class tăng lên
+    #     current_B_cols = self.B_global.shape[1]
+    #     if num_classes > current_B_cols:
+    #         diff = num_classes - current_B_cols
+    #         expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
+    #         self.B_global = torch.cat([self.B_global, expansion], dim=1)
+            
+    #     print(f"--> Accumulating Statistics for Task {self.cur_task} (Total Classes: {num_classes})...")
+        
+    #     # 3. Tích lũy thống kê (Chỉ cộng thêm phần của Task mới)
+    #     # Lưu ý: A_new và B_new là thống kê của RIÊNG dữ liệu hiện tại
+    #     A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+    #     B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
+    #     fit_epochs = self.fit_epoch 
+        
+    #     for epoch in range(fit_epochs):
+    #         with torch.no_grad():
+    #             for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}")):
+    #                 inputs, targets = inputs.to(self.device), targets.to(self.device)
+    #                 if targets.dim() > 1: targets = targets.view(-1)
+                    
+    #                 # Forward
+    #                 features = self._network.extract_feature(inputs).float()
+    #                 features = self._network.buffer(features)
+                    
+    #                 # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
+    #                 targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+                    
+    #                 A_new += features.T @ features
+    #                 B_new += features.T @ targets_oh
+        
+    #     # 4. Cộng vào bộ nhớ toàn cục
+    #     self.A_global += A_new
+    #     self.B_global += B_new
+        
+    #     # 5. Giải hệ phương trình trên bộ nhớ toàn cục
+    #     # W = (A_global + gamma * I)^-1 @ B_global
+    #     print("--> Solving Global Linear System...")
+    #     gamma = self.args['gamma']
+    #     I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+    #     A_reg = self.A_global + gamma * I
+        
+    #     try:
+    #         W = torch.linalg.solve(A_reg, self.B_global)
+    #     except RuntimeError:
+    #         W = torch.linalg.pinv(A_reg) @ self.B_global
+            
+    #     # 6. Gán trọng số
+    #     if self._network.weight.shape != W.shape:
+    #         self._network.weight = torch.zeros_like(W)
+    #     self._network.weight.data = W
+            
+    #     print("--> Analytic Learning Finished.")
+    #     self._clear_gpu()
+
+    #fit mmcm
+    def fit_fc(self, train_loader, test_loader, update_archive=True):
         self._network.eval()
         self._network.to(self.device)
+
+        # --- HYPERPARAMS (Theo yêu cầu của bạn) ---
+        SIGMA = 5.0   # Bắt đầu với 5.0, giảm dần nếu cần
+        OMEGA = 0.4   # Mixture ratio
+        LAMBDA = 100.0 # Hệ số khởi tạo P (Tương đương 1/lambda nhỏ trong Ridge)
         
-        # 1. Xác định kích thước feature
+        # 1. Init Feature Dim
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
-            dummy_feat = self._network.extract_feature(dummy_input)
+            dummy_feat = self._network.extract_feature(dummy_input).double()
             if hasattr(self._network, 'buffer'):
-                dummy_feat = self._network.buffer(dummy_feat.float())
+                dummy_feat = self._network.buffer(dummy_feat.float()).double()
             feat_dim = dummy_feat.shape[1]
-        
-        # Lấy tổng số class ĐÃ ĐƯỢC MỞ RỘNG
+
         num_classes = self._network.known_class
-        
-        # 2. Khởi tạo Global Memory nếu chưa có (lưu trong self của MinNet để persist qua các task)
-        if not hasattr(self, 'A_global'):
-            print("--> Initializing Global RLS Memory...")
-            self.A_global = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-            self.B_global = torch.zeros((feat_dim, 0), device=self.device, dtype=torch.float32)
 
-        # Mở rộng B_global nếu số class tăng lên
-        current_B_cols = self.B_global.shape[1]
-        if num_classes > current_B_cols:
-            diff = num_classes - current_B_cols
-            expansion = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float32)
-            self.B_global = torch.cat([self.B_global, expansion], dim=1)
+        # 2. Khởi tạo Global Covariance Matrix (P / Omega)
+        if not hasattr(self, 'P_global'):
+            print(f"--> [Recursive] Init P_global (Scale={LAMBDA})...")
+            # Khởi tạo P = Lambda * I (Lambda lớn -> Quên nhanh lúc đầu)
+            self.P_global = torch.eye(feat_dim, device=self.device, dtype=torch.float64) * LAMBDA
+        
+        # Reset Weight nếu cần (hoặc giữ nguyên để học tiếp)
+        if self._network.weight.shape[1] == 0:
+             self._network.weight = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float64)
+        
+        # Expand Weight
+        if num_classes > self._network.weight.shape[1]:
+            diff = num_classes - self._network.weight.shape[1]
+            tail = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float64)
+            self._network.weight = torch.cat([self._network.weight, tail], dim=1)
             
-        print(f"--> Accumulating Statistics for Task {self.cur_task} (Total Classes: {num_classes})...")
+        # Đảm bảo weight là double
+        if self._network.weight.dtype != torch.float64:
+            self._network.weight = self._network.weight.double()
+
+        # 3. Training Loop (Recursive)
+        # Recursive chỉ cần chạy 1 Epoch là hội tụ (One-pass learning)
+        # Nếu update_archive=False (Refit), cũng chạy 1 epoch.
         
-        # 3. Tích lũy thống kê (Chỉ cộng thêm phần của Task mới)
-        # Lưu ý: A_new và B_new là thống kê của RIÊNG dữ liệu hiện tại
-        A_new = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-        B_new = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float32)
-        fit_epochs = self.fit_epoch 
+        print(f"--> [Recursive MMCC] Processing Stream (Batch Size per step: {train_loader.batch_size})...")
         
-        for epoch in range(fit_epochs):
+        # [QUAN TRỌNG] Tắt Autocast để chạy Double Precision (float64)
+        with autocast(enabled=False):
             with torch.no_grad():
-                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc=f"Ep {epoch+1}")):
+                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Streaming")):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
-                    if targets.dim() > 1: targets = targets.view(-1)
                     
-                    # Forward
-                    features = self._network.extract_feature(inputs).float()
-                    features = self._network.buffer(features)
+                    # Extract Feature
+                    features = self._network.extract_feature(inputs).double()
+                    if hasattr(self._network, 'buffer'):
+                        features = self._network.buffer(features.float()).double()
                     
-                    # One-hot (đã an toàn vì num_classes được update từ bước update_fc)
-                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).float()
+                    targets_oh = F.one_hot(targets.long(), num_classes=num_classes).double()
                     
-                    A_new += features.T @ features
-                    B_new += features.T @ targets_oh
-        
-        # 4. Cộng vào bộ nhớ toàn cục
-        self.A_global += A_new
-        self.B_global += B_new
-        
-        # 5. Giải hệ phương trình trên bộ nhớ toàn cục
-        # W = (A_global + gamma * I)^-1 @ B_global
-        print("--> Solving Global Linear System...")
-        gamma = self.args['gamma']
-        I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-        A_reg = self.A_global + gamma * I
-        
-        try:
-            W = torch.linalg.solve(A_reg, self.B_global)
-        except RuntimeError:
-            W = torch.linalg.pinv(A_reg) @ self.B_global
-            
-        # 6. Gán trọng số
-        if self._network.weight.shape != W.shape:
-            self._network.weight = torch.zeros_like(W)
-        self._network.weight.data = W
-            
-        print("--> Analytic Learning Finished.")
-        self._clear_gpu()
+                    # Gọi hàm Recursive (Update P_global in-place và trả về)
+                    # Hàm này sẽ loop bên trong batch để đảm bảo đúng quy trình
+                    self.P_global = self._network.fit_recursive_mmcc_batch(
+                        features, targets_oh, self.P_global, sigma=SIGMA, omega=OMEGA
+                    )
 
+        # Cast về float32 sau khi xong để tương thích
+        self._network.weight = self._network.weight.float()
+        
+        # [LƯU Ý] Recursive RLS tự động cập nhật P_global liên tục
+        # Không cần bước "Giải hệ phương trình" cuối cùng như Batch RLS.
+        # W đã được cập nhật liên tục trong vòng lặp rồi.
+        
+        print("--> Recursive Update Finished.")
+        self._clear_gpu()
     def re_fit(self, train_loader, test_loader):
         # re_fit dùng chung logic với fit_fc
         print(f"--> Refitting Task {self.cur_task} (No Augmentation)...")
