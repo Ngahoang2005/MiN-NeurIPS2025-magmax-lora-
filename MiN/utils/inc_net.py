@@ -388,111 +388,93 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
-    def fit_amkmmc_batch(self, X, Y, P_global, theta=0.5, alpha=1.0, omega_cauchy=1.0, lambda_student=2.0, max_iter=3):
+    def fit_amkmmc_adaptive(self, X, Y, P_global, theta=0.5, lambda_student=3.0, max_iter=1, lambda_forget=0.98):
         """
-        Thực hiện AMKMMC-RLS dựa trên bài báo 2601.11971v1.
-        Sử dụng Fixed-point Iteration để giải trọng số tối ưu.
+        AMKMMC-RLS "Auto-Pilot": Tự động thích nghi Bandwidth.
+        Dựa trên bài báo: 2601.11971v1 (Adaptive Multi-Kernel Mixture Maximum Correntropy).
         
         Args:
             X: Batch Features [Batch, Dim]
             Y: Batch Targets [Batch, Num_Classes]
-            P_global: Covariance Matrix [Dim, Dim]
-            theta: Hệ số trộn (0 <= theta <= 1)
-            alpha: Bandwidth của Student's t
-            omega_cauchy: Bandwidth của Cauchy
-            lambda_student: Bậc tự do của Student's t (thường là v)
-            max_iter: Số vòng lặp Fixed-point (Algorithm 1, step 3)
+            P_global: Ma trận Hiệp phương sai [Dim, Dim]
+            theta: Hệ số trộn (0.5 = 50% Student + 50% Cauchy)
+            lambda_student: Bậc tự do của Student-t (thường chọn 3.0)
+            max_iter: Số vòng lặp Fixed-point (1 là đủ nhanh và tốt)
+            lambda_forget: Hệ số quên (0.98 - 0.99) để duy trì khả năng học Task mới
         """
-        # Ép kiểu Double để tính toán chính xác
+        # 1. Ép kiểu Double (Float64) để đảm bảo độ chính xác ma trận nghịch đảo
         X = X.double()
         Y = Y.double()
         P = P_global.double()
+        
+        # Đảm bảo Weight cũng là Double
         if self.weight.dtype != torch.float64:
              self.weight = self.weight.double()
         
         batch_size = X.shape[0]
-        
-        # Để đơn giản và nhanh, ta xử lý theo Batch nhưng update P kiểu Recursive
-        # Lưu ý: Bài báo dùng Iterative update cho State. Ở đây ta dùng cho Weight.
-        
-        # 1. Dự đoán ban đầu (Prediction Step)
-        # W_old = self.weight
-        
-        # Vòng lặp Fixed-point Iteration (Eq. 27 trong bài báo)
-        # Giúp trọng số hội tụ chính xác hơn trước khi sang batch mới
+
+        # 2. Vòng lặp Fixed-point Iteration (Theo Algorithm 1 bài báo)
         for t in range(max_iter):
-            
-            # Tính sai số dự đoán hiện tại: e = y - X * W
+            # Dự đoán và tính lỗi
             pred = X @ self.weight 
-            error = Y - pred # [Batch, Class]
+            error = Y - pred 
             
-            # Tính bình phương lỗi từng mẫu (để tính Kernel)
+            # Bình phương lỗi từng mẫu: e^2
             e_sq = error.pow(2).mean(dim=1) # [Batch]
             
-            # --- TÍNH TRỌNG SỐ KERNEL (MKMMC) ---
+            # --- [AUTO-PILOT: TỰ ĐỘNG CHỈNH BANDWIDTH] ---
+            # Tính độ lệch chuẩn (STD) của sai số trong batch này.
+            # - Nếu Task mới (sai số lớn) -> STD lớn -> Alpha/Omega lớn -> Học mạnh (như RLS).
+            # - Nếu Task cũ (sai số nhỏ) -> STD nhỏ -> Alpha/Omega nhỏ -> Lọc nhiễu kỹ (Robust).
+            batch_std = torch.sqrt(e_sq.mean()).item()
+            
+            # Tránh chia cho 0
+            if batch_std < 1e-6: batch_std = 1e-6
+
+            # Thiết lập Alpha (Student) và Omega (Cauchy) dựa trên thống kê
+            # Alpha bao phủ 3-sigma (99.7% dữ liệu)
+            curr_alpha = 3.0 * batch_std 
+            # Omega scale theo phương sai
+            curr_omega = 2.0 * (batch_std**2) 
+            # -----------------------------------------------
+
+            # 3. Tính trọng số Kernel (MKMMC)
             # Eq (4): Student's t Kernel
-            # S(e) = (1 + e^2 / (lambda * alpha^2)) ^ (-(lambda+2)/2)
-            term_student = 1.0 + e_sq / (lambda_student * (alpha**2))
+            term_student = 1.0 + e_sq / (lambda_student * (curr_alpha**2))
             k_student = torch.pow(term_student, -(lambda_student + 2.0) / 2.0)
             
             # Eq (5): Cauchy Kernel
-            # C(e) = 1 / (1 + e^2 / omega)
-            k_cauchy = 1.0 / (1.0 + e_sq / omega_cauchy)
+            k_cauchy = 1.0 / (1.0 + e_sq / curr_omega)
             
-            # Eq (26): Tổng hợp trọng số Theta_ki
-            # Weight vector cho từng mẫu trong batch
-            # eta shape: [Batch]
+            # Eq (26): Tổng hợp trọng số Eta
             eta = theta * k_student + (1.0 - theta) * k_cauchy
             
-            # Chặn dưới để tránh lỗi chia 0
-            eta = torch.clamp(eta, min=1e-6)
+            # Chặn dưới an toàn
+            eta = torch.clamp(eta, min=1e-8)
             
-            # --- CẬP NHẬT TRỌNG SỐ (RLS Update) ---
-            # Trong bài báo dùng Kalman Gain K. Với RLS, ta dùng công thức tương đương.
-            # W_new = W_old + P * X.T * Eta * Error ...
-            
-            # Để tối ưu tốc độ trên GPU, ta không update từng mẫu (loop for k in batch)
-            # mà update cả batch một lúc bằng ma trận trọng số Eta.
-            
-            # Tính ma trận Gain hiệu dụng cho cả batch
-            # X_weighted = eta * X
-            # Gain = P @ X.T @ inv(I + X @ P @ X.T * eta) ... (Sherman-Morrison mở rộng)
-            
-            # Tuy nhiên, để đúng chuẩn Recursive RLS (update P liên tục), 
-            # ta nên loop qua từng mẫu hoặc mini-batch nhỏ.
-            # Ở đây tôi chọn loop từng mẫu bên trong hàm này (như bài GVMKC trước)
-            # nhưng áp dụng công thức MKMMC.
-            
-            # [LƯU Ý]: Nếu loop iter t > 1, ta chỉ update Weight, KHÔNG update P nhiều lần
-            # P chỉ được update 1 lần duy nhất cho mỗi mẫu dữ liệu mới.
-            
+            # 4. Cập nhật RLS (Chỉ update P ở vòng lặp đầu tiên của batch)
             if t == 0:
-                # Chỉ update P ở vòng lặp đầu tiên của Fixed-point
+                # Loop qua từng mẫu để update P chính xác theo công thức đệ quy
+                # (Có thể vector hóa nhưng loop đảm bảo toán học chuẩn nhất cho P)
                 for k in range(batch_size):
-                    x_k = X[k:k+1].T # [Dim, 1]
-                    y_k = Y[k:k+1].T # [Class, 1]
-                    err_k = error[k:k+1].T # [Class, 1]
-                    eta_k = eta[k]   # Scalar
+                    x_k = X[k:k+1].T    # [Dim, 1]
+                    y_k = Y[k:k+1].T    # [Class, 1]
+                    err_k = error[k:k+1].T # [Class, 1] (Lấy error mới nhất)
+                    eta_k = eta[k]      # Scalar
                     
-                    # Tính Gain Vector L_k
-                    # L = (P * x) / (1/eta + x.T * P * x)
+                    # Tính toán Gain (Sherman-Morrison)
                     Px = P @ x_k
                     xPx = x_k.T @ Px
-                    den = (1.0 / eta_k) + xPx
+                    
+                    # Mẫu số có thêm Forgetting Factor (lambda)
+                    den = (lambda_forget / eta_k) + xPx
                     L = Px / den
                     
                     # Update Weight: W = W + L * e
                     self.weight += L @ err_k.T
                     
-                    # Update P: P = P - L * x.T * P
-                    # P = P - (1 / den) * Px @ Px.T
-                    P -= (1.0/den) * (Px @ Px.T)
-            else:
-                # Ở các vòng lặp sau (Refinement), ta dùng P đã update 
-                # để tinh chỉnh W dựa trên eta mới (đã chính xác hơn).
-                # Đây là bước "Iterated" trong Iterated EKF/RLS.
-                # Công thức xấp xỉ: W = W + learning_rate * X.T * eta * error
-                # Nhưng với RLS chuẩn, thường ta chỉ chạy t=1 là đủ tốt.
-                pass 
-
+                    # Update P: P = (1/lambda) * (P - L * x.T * P)
+                    update_term = (1.0 / den) * (Px @ Px.T)
+                    P = (1.0 / lambda_forget) * (P - update_term)
+                    
         return P

@@ -312,19 +312,21 @@ class MinNet(object):
 
     #fit mmcm
     def fit_fc(self, train_loader, test_loader, update_archive=True):
+        """
+        Hàm huấn luyện chính sử dụng AMKMMC-RLS Adaptive.
+        """
         self._network.eval()
         self._network.to(self.device)
 
-        # --- CẤU HÌNH AMKMMC (Student + Cauchy) ---
-        # Các tham số này bạn có thể tune, hoặc để mặc định như bài báo gợi ý
-        THETA = 0.5         # Trộn đều 50-50
-        ALPHA = 2.2         # Bandwidth Student (theo Table II trong PDF)
-        OMEGA = 1.5         # Bandwidth Cauchy (theo Table II trong PDF)
-        LAMBDA = 3.0        # Bậc tự do Student (thường chọn > 2)
+        # --- CẤU HÌNH ---
+        # Forgetting Factor: 0.98 để cân bằng giữa nhớ cũ và học mới.
+        # Nếu Task mới vẫn thấp, giảm xuống 0.95.
+        LAMBDA_FORGET = 0.98 
         
-        P_INIT_VAL = 10000.0 # Khởi tạo P lớn
+        # Giá trị khởi tạo P (càng lớn càng tốt cho lúc đầu)
+        P_INIT_VAL = 10000.0 
 
-        # 1. Init Feature Dim (Giữ nguyên)
+        # 1. Init Feature Dimension
         with torch.no_grad():
             dummy_input = next(iter(train_loader))[1].to(self.device)
             dummy_feat = self._network.extract_feature(dummy_input).double()
@@ -334,46 +336,62 @@ class MinNet(object):
         
         num_classes = self._network.known_class
 
-        # 2. Init P_global & Weight (Giữ nguyên)
+        # 2. Quản lý Ma trận P (Omega)
         if not hasattr(self, 'P_global'):
-            print(f"--> [AMKMMC] Init Omega matrix...")
+            print(f"--> [AMKMMC] Init Omega matrix (Scale={P_INIT_VAL})...")
             self.P_global = torch.eye(feat_dim, device=self.device, dtype=torch.float64) * P_INIT_VAL
-            if self._network.weight.shape[1] == 0:
-                 self._network.weight = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float64)
+        else:
+            # [QUAN TRỌNG] Boosting P cho Task mới
+            # Nếu không làm bước này, P sẽ quá nhỏ -> Không học được Task mới
+            if self._network.known_class > 0: # Chỉ boost khi sang Task > 0
+                print(f"--> [AMKMMC] Boosting Omega matrix for New Task...")
+                # Cộng thêm năng lượng vào đường chéo
+                self.P_global += torch.eye(feat_dim, device=self.device, dtype=torch.float64) * 100.0
 
-        if num_classes > self._network.weight.shape[1]:
+        # 3. Quản lý Weight
+        # Khởi tạo
+        if self._network.weight.shape[1] == 0:
+             self._network.weight = torch.zeros((feat_dim, num_classes), device=self.device, dtype=torch.float64)
+        # Mở rộng (Expand) cho class mới
+        elif num_classes > self._network.weight.shape[1]:
             diff = num_classes - self._network.weight.shape[1]
             tail = torch.zeros((feat_dim, diff), device=self.device, dtype=torch.float64)
             self._network.weight = torch.cat([self._network.weight, tail], dim=1)
         
+        # Đảm bảo Precision
         if self._network.weight.dtype != torch.float64:
             self._network.weight = self._network.weight.double()
 
-        # 3. Training Loop
-        print(f"--> [AMKMMC] Robust Learning (Student-Cauchy Mix)...")
+        # 4. Training Loop
+        print(f"--> [AMKMMC] Adaptive Auto-Pilot (Lambda={LAMBDA_FORGET})...")
         
-        with autocast('cuda', enabled=False):
+        # Tắt Autocast để chạy Double Precision
+        with autocast(enabled=False):
             with torch.no_grad():
-                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="AMKMMC Step")):
+                for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Adaptive Step")):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
                     
+                    # Extract Features
                     features = self._network.extract_feature(inputs).double()
                     if hasattr(self._network, 'buffer'):
                         features = self._network.buffer(features.float()).double()
                     
+                    # One-hot Targets
                     targets_oh = F.one_hot(targets.long(), num_classes=num_classes).double()
                     
-                    # Gọi hàm update mới
-                    # max_iter=1 để chạy nhanh (tương đương GVMKC về tốc độ)
-                    # max_iter=3 nếu muốn chính xác hơn (chậm hơn 3 lần)
-                    self.P_global = self._network.fit_amkmmc_batch(
+                    # Gọi hàm Adaptive
+                    # Không cần truyền alpha/omega vì nó tự tính
+                    self.P_global = self._network.fit_amkmmc_adaptive(
                         features, targets_oh, self.P_global,
-                        theta=THETA, alpha=ALPHA, omega_cauchy=OMEGA, 
-                        lambda_student=LAMBDA, max_iter=1 
+                        theta=0.5,           # Trộn 50-50 Student/Cauchy
+                        lambda_student=3.0,  # Degree of freedom
+                        max_iter=1,          # 1 Iter là đủ
+                        lambda_forget=LAMBDA_FORGET
                     )
 
+        # 5. Kết thúc: Cast về Float32 để tương thích hệ thống
         self._network.weight = self._network.weight.float()
-        print("--> Done.")
+        print("--> AMKMMC Update Finished.")
         self._clear_gpu()
     def re_fit(self, train_loader, test_loader):
         # re_fit dùng chung logic với fit_fc
