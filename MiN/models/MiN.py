@@ -357,7 +357,7 @@ class MinNet(object):
         print(f"--> [Recursive MMCC] Processing Stream (Batch Size per step: {train_loader.batch_size})...")
         
         # [QUAN TRỌNG] Tắt Autocast để chạy Double Precision (float64)
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             with torch.no_grad():
                 for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="Streaming")):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)

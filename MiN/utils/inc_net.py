@@ -263,7 +263,7 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             X = X.float().to(self.device)
             Y = Y.float().to(self.device)
             num_targets = Y.shape[1]
@@ -319,7 +319,7 @@ class MiNbaseNet(nn.Module):
         2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
         """
         # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             
             # 1. Chuẩn bị dữ liệu (Float32)
             X = X.float().to(self.device)
