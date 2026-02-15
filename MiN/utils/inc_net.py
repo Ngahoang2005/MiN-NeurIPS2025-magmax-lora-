@@ -388,105 +388,81 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
-    def fit_recursive_mmcc_batch(self, X, Y, P, sigma=5.0, omega=0.4):
+    def fit_gvmkc_recursive(self, X, Y, P_global, sigma=1.0, gamma=5.0, omega=0.4):
         """
-        Thực thi Recursive MMCC đúng công thức bạn đưa:
-        
-        1. Tính e_k (A priori error)
-        2. Tính eta(e_k) (Mixture Kernel)
-        3. Tính Gain L_k
-        4. Cập nhật Theta (Weight)
-        5. Cập nhật Omega (Covariance P)
+        Thực hiện GVMKC-RRLS (Algorithm 1, steps 8-10).
         
         Args:
-            X: Batch input [B, Dim]
-            Y: Batch target [B, Class]
-            P: Ma trận Hiệp phương sai [Dim, Dim]
+            X: Batch Features [Batch, Dim] (phi_k)
+            Y: Batch Targets [Batch, Num_Classes] (y_k)
+            P_global: Ma trận hiệp phương sai [Dim, Dim] (Omega_k)
+            sigma: Bandwidth Gaussian 
+            gamma: Tham số Versoria 
+            omega: Hệ số trộn (Mixing coefficient) 
         """
-        # Đảm bảo độ chính xác cao nhất (Double Precision) cho RLS
-        # GPU mạnh thì chạy Double vẫn mượt
+        # Ép kiểu Double (float64) để đảm bảo độ chính xác cho đệ quy
         X = X.double()
         Y = Y.double()
-        P = P.double()
+        P = P_global.double()
+        
         if self.weight.dtype != torch.float64:
              self.weight = self.weight.double()
         
-        # Lấy kích thước
         batch_size = X.shape[0]
         
-        # [QUAN TRỌNG] Vòng lặp đệ quy từng mẫu (k)
-        # Dù là vòng lặp Python, nhưng các phép tính bên trong (matmul) chạy trên GPU
+        # Vòng lặp đệ quy (Algorithm 1: for k = 1 : L) [cite: 367]
+        # Xử lý từng mẫu trong batch hiện tại
         for k in range(batch_size):
-            # ---------------------------------------------------------
-            # Bước 0: Chuẩn bị dữ liệu mẫu k
-            # ---------------------------------------------------------
+            # 1. Chuẩn bị phi_k và y_k
             phi_k = X[k].unsqueeze(1)  # [Dim, 1]
             y_k = Y[k].unsqueeze(0)    # [1, Class]
             
-            # ---------------------------------------------------------
-            # Bước 1: Tính sai số dự đoán (A priori error)
+            # 2. Tính sai số dự đoán (A priori error) - Eq (46) [cite: 324]
             # e_k = y_k - phi_k^T * theta_{k-1}
-            # ---------------------------------------------------------
-            # self.weight shape: [Dim, Class]
-            pred = phi_k.T @ self.weight # [1, Class]
-            e_k = y_k - pred             # [1, Class]
+            # theta chính là self.weight
+            pred = phi_k.T @ self.weight 
+            e_k = y_k - pred             
             
-            # ---------------------------------------------------------
-            # Bước 2: Tính trọng số MMCC (eta)
-            # eta = omega * G(e) + (1-omega) * C(e)
-            # ---------------------------------------------------------
-            # Lấy lỗi trung bình để tính eta scalar
-            val_sq = e_k.pow(2).mean() 
-            
-            # Gaussian
-            k_gauss = torch.exp(-val_sq / (2 * sigma**2))
-            # Cauchy
-            k_cauchy = 1 / (1 + val_sq / sigma**2)
-            
-            eta = omega * k_gauss + (1 - omega) * k_cauchy
-            
-            # Chặn dưới để tránh chia cho 0 (Singularity protection)
-            eta = torch.max(eta, torch.tensor(1e-8, device=X.device, dtype=torch.float64))
+            # Lấy giá trị lỗi (Scalar) để tính Kernel
+            # Nếu multi-class, ta lấy trung bình bình phương lỗi
+            val_sq = e_k.pow(2).mean()
+            val = torch.sqrt(val_sq) # e_k (scalar approximation)
 
-            # ---------------------------------------------------------
-            # Bước 3: Tính Gain Vector (L_k)
-            # L_k = (P * phi) / (1/eta + phi^T * P * phi)
-            # ---------------------------------------------------------
-            # Tử số: P * phi (Vector [Dim, 1])
-            # Đây là phép tính nặng nhất: [2048,2048] @ [2048,1] -> GPU gánh
-            P_phi = P @ phi_k 
+            # 3. Tính trọng số hỗn hợp eta(e_k) - Eq (47) 
+            # Gaussian Kernel: G_sigma(e) = exp(-e^2 / 2sigma^2) [cite: 185]
+            k_gauss = torch.exp(-val_sq / (2 * sigma**2))
             
-            # Mẫu số: Scalar
-            phi_T_P_phi = phi_k.T @ P_phi
-            denominator = (1.0 / eta) + phi_T_P_phi
+            # Versoria Kernel: V_gamma(e) = gamma / (1 + e^2/gamma^2) [cite: 188]
+            # Lưu ý: Bài báo dùng công thức rút gọn trong Eq (47)
+            k_versoria = gamma / (1 + val_sq / (gamma**2))
             
-            L_k = P_phi / denominator # [Dim, 1]
+            # Tổng hợp eta: (omega/sigma^2)*G + (2(1-omega)/gamma^3)*V^2
+            #  -> Đây là công thức quan trọng nhất
+            term1 = (omega / (sigma**2)) * k_gauss
+            term2 = (2 * (1 - omega) / (gamma**3)) * (k_versoria.pow(2))
             
-            # ---------------------------------------------------------
-            # Bước 4: Cập nhật Trọng số Classifier (Theta)
+            eta = term1 + term2
+            
+            # Chặn dưới an toàn
+            eta = torch.max(eta, torch.tensor(1e-8, device=X.device, dtype=torch.double))
+
+            # 4. Cập nhật Gain Vector (L_k) - Eq (44) 
+            # L_k = (eta * Omega * phi) / (1 + eta * phi^T * Omega * phi)
+            
+            P_phi = P @ phi_k  # Omega * phi
+            term_denominator = eta * (phi_k.T @ P_phi)
+            denominator = 1.0 + term_denominator
+            
+            L_k = (eta * P_phi) / denominator
+            
+            # 5. Cập nhật tham số (Weight/Theta) - Eq (43) 
             # theta_k = theta_{k-1} + L_k * e_k
-            # ---------------------------------------------------------
-            # [Dim, 1] @ [1, Class] -> [Dim, Class]
-            update_term = L_k @ e_k
-            self.weight += update_term
+            self.weight += L_k @ e_k
             
-            # ---------------------------------------------------------
-            # Bước 5: Cập nhật Ma trận Hiệp phương sai (Omega_k)
-            # Omega_k = Omega_{k-1} - (L_k * phi^T * Omega_{k-1})
-            # Biến đổi tương đương: P_new = P - (P_phi @ P_phi.T) * (eta / (1 + eta * phi_T_P_phi))
-            # ---------------------------------------------------------
-            # Để đúng công thức bạn đưa: 
-            # numerator = eta * (P_phi @ (phi_k.T @ P)) -> (P_phi @ P_phi.T) vì P đối xứng
-            
-            # Cách tính tối ưu trên GPU: Outer product của P_phi
-            outer_P = P_phi @ P_phi.T # [Dim, Dim] -> Nặng nhất
-            
-            # Hệ số scaling
-            scale_factor = eta / (1.0 + eta * phi_T_P_phi)
-            
-            P -= scale_factor * outer_P
-            
-            # [Tùy chọn] Giữ P đối xứng để tránh sai số tích lũy
-            # P = (P + P.T) / 2
-            
+            # 6. Cập nhật Covariance (Omega_k) - Eq (45) 
+            # Omega_k = (I - L_k * phi^T) * Omega_{k-1}
+            # Tối ưu hóa tính toán: P_new = P - L_k * (phi^T * P)
+            # phi^T * P chính là (P @ phi)^T = P_phi.T (do P đối xứng)
+            P -= L_k @ P_phi.T
+
         return P
