@@ -261,52 +261,52 @@ class MiNbaseNet(nn.Module):
         
         return logits, total_kl
 
-    # @torch.no_grad()
-    # def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
-    #     with autocast('cuda', enabled=False):
-    #         X = X.float().to(self.device)
-    #         Y = Y.float().to(self.device)
-    #         num_targets = Y.shape[1]
+    @torch.no_grad()
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
+        with autocast(enabled=False):
+            X = X.float().to(self.device)
+            Y = Y.float().to(self.device)
+            num_targets = Y.shape[1]
             
-    #         if self.weight.shape[1] == 0:
-    #             # [FIXED] Tính dummy feature cũng phải chuẩn [CLS] token
-    #             dummy_feat = self.backbone(X[0:2]).float()
-    #             dummy_feat = self.buffer(dummy_feat)
-    #             feat_dim = dummy_feat.shape[1]
-    #             self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
-    #         elif num_targets > self.weight.shape[1]:
-    #             increment = num_targets - self.weight.shape[1]
-    #             tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
-    #             self.weight = torch.cat((self.weight, tail), dim=1)
+            if self.weight.shape[1] == 0:
+                # [FIXED] Tính dummy feature cũng phải chuẩn [CLS] token
+                dummy_feat = self.backbone(X[0:2]).float()
+                dummy_feat = self.buffer(dummy_feat)
+                feat_dim = dummy_feat.shape[1]
+                self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            elif num_targets > self.weight.shape[1]:
+                increment = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
+                self.weight = torch.cat((self.weight, tail), dim=1)
 
-    #         N = X.shape[0]
-    #         feat_dim = self.weight.shape[0]
-    #         A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-    #         B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            N = X.shape[0]
+            feat_dim = self.weight.shape[0]
+            A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+            B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
             
-    #         for start in range(0, N, chunk_size):
-    #             end = min(start + chunk_size, N)
-    #             x_batch = X[start:end] 
-    #             y_batch = Y[start:end] 
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                x_batch = X[start:end] 
+                y_batch = Y[start:end] 
                 
-    #             features = self.backbone(x_batch).float()
-    #             features = self.buffer(features)
+                features = self.backbone(x_batch).float()
+                features = self.buffer(features)
                 
-    #             A += features.T @ features
-    #             B += features.T @ y_batch
-    #             del features, x_batch, y_batch 
+                A += features.T @ features
+                B += features.T @ y_batch
+                del features, x_batch, y_batch 
 
-    #         I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-    #         A += self.gamma * I 
+            I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+            A += self.gamma * I 
 
-    #         try:
-    #             W_solution = torch.linalg.solve(A, B)
-    #         except RuntimeError:
-    #             W_solution = torch.linalg.pinv(A) @ B
+            try:
+                W_solution = torch.linalg.solve(A, B)
+            except RuntimeError:
+                W_solution = torch.linalg.pinv(A) @ B
             
-    #         self.weight = W_solution
-    #         del A, B, I, X, Y
-    #         torch.cuda.empty_cache()
+            self.weight = W_solution
+            del A, B, I, X, Y
+            torch.cuda.empty_cache()
     # =========================================================================
     # [ANALYTIC LEARNING (OPTIMIZED FIT)]
     # =========================================================================
@@ -319,7 +319,7 @@ class MiNbaseNet(nn.Module):
         2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
         """
         # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
-        with autocast('cuda', enabled=False):
+        with autocast(enabled=False):
             
             # 1. Chuẩn bị dữ liệu (Float32)
             X = X.float().to(self.device)
@@ -388,93 +388,3 @@ class MiNbaseNet(nn.Module):
             
             del A, B, I, X, Y
             torch.cuda.empty_cache()
-    def fit_amkmmc_adaptive(self, X, Y, P_global, theta=0.5, lambda_student=3.0, max_iter=1, lambda_forget=0.98):
-        """
-        AMKMMC-RLS "Auto-Pilot": Tự động thích nghi Bandwidth.
-        Dựa trên bài báo: 2601.11971v1 (Adaptive Multi-Kernel Mixture Maximum Correntropy).
-        
-        Args:
-            X: Batch Features [Batch, Dim]
-            Y: Batch Targets [Batch, Num_Classes]
-            P_global: Ma trận Hiệp phương sai [Dim, Dim]
-            theta: Hệ số trộn (0.5 = 50% Student + 50% Cauchy)
-            lambda_student: Bậc tự do của Student-t (thường chọn 3.0)
-            max_iter: Số vòng lặp Fixed-point (1 là đủ nhanh và tốt)
-            lambda_forget: Hệ số quên (0.98 - 0.99) để duy trì khả năng học Task mới
-        """
-        # 1. Ép kiểu Double (Float64) để đảm bảo độ chính xác ma trận nghịch đảo
-        X = X.double()
-        Y = Y.double()
-        P = P_global.double()
-        
-        # Đảm bảo Weight cũng là Double
-        if self.weight.dtype != torch.float64:
-             self.weight = self.weight.double()
-        
-        batch_size = X.shape[0]
-
-        # 2. Vòng lặp Fixed-point Iteration (Theo Algorithm 1 bài báo)
-        for t in range(max_iter):
-            # Dự đoán và tính lỗi
-            pred = X @ self.weight 
-            error = Y - pred 
-            
-            # Bình phương lỗi từng mẫu: e^2
-            e_sq = error.pow(2).mean(dim=1) # [Batch]
-            
-            # --- [AUTO-PILOT: TỰ ĐỘNG CHỈNH BANDWIDTH] ---
-            # Tính độ lệch chuẩn (STD) của sai số trong batch này.
-            # - Nếu Task mới (sai số lớn) -> STD lớn -> Alpha/Omega lớn -> Học mạnh (như RLS).
-            # - Nếu Task cũ (sai số nhỏ) -> STD nhỏ -> Alpha/Omega nhỏ -> Lọc nhiễu kỹ (Robust).
-            batch_std = torch.sqrt(e_sq.mean()).item()
-            
-            # Tránh chia cho 0
-            if batch_std < 1e-6: batch_std = 1e-6
-
-            # Thiết lập Alpha (Student) và Omega (Cauchy) dựa trên thống kê
-            # Alpha bao phủ 3-sigma (99.7% dữ liệu)
-            curr_alpha = 3.0 * batch_std 
-            # Omega scale theo phương sai
-            curr_omega = 2.0 * (batch_std**2) 
-            # -----------------------------------------------
-
-            # 3. Tính trọng số Kernel (MKMMC)
-            # Eq (4): Student's t Kernel
-            term_student = 1.0 + e_sq / (lambda_student * (curr_alpha**2))
-            k_student = torch.pow(term_student, -(lambda_student + 2.0) / 2.0)
-            
-            # Eq (5): Cauchy Kernel
-            k_cauchy = 1.0 / (1.0 + e_sq / curr_omega)
-            
-            # Eq (26): Tổng hợp trọng số Eta
-            eta = theta * k_student + (1.0 - theta) * k_cauchy
-            
-            # Chặn dưới an toàn
-            eta = torch.clamp(eta, min=1e-8)
-            
-            # 4. Cập nhật RLS (Chỉ update P ở vòng lặp đầu tiên của batch)
-            if t == 0:
-                # Loop qua từng mẫu để update P chính xác theo công thức đệ quy
-                # (Có thể vector hóa nhưng loop đảm bảo toán học chuẩn nhất cho P)
-                for k in range(batch_size):
-                    x_k = X[k:k+1].T    # [Dim, 1]
-                    y_k = Y[k:k+1].T    # [Class, 1]
-                    err_k = error[k:k+1].T # [Class, 1] (Lấy error mới nhất)
-                    eta_k = eta[k]      # Scalar
-                    
-                    # Tính toán Gain (Sherman-Morrison)
-                    Px = P @ x_k
-                    xPx = x_k.T @ Px
-                    
-                    # Mẫu số có thêm Forgetting Factor (lambda)
-                    den = (lambda_forget / eta_k) + xPx
-                    L = Px / den
-                    
-                    # Update Weight: W = W + L * e
-                    self.weight += L @ err_k.T
-                    
-                    # Update P: P = (1/lambda) * (P - L * x.T * P)
-                    update_term = (1.0 / den) * (Px @ Px.T)
-                    P = (1.0 / lambda_forget) * (P - update_term)
-                    
-        return P
