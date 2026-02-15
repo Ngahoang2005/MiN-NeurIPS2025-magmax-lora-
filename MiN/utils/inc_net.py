@@ -261,52 +261,52 @@ class MiNbaseNet(nn.Module):
         
         return logits, total_kl
 
-    @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
-        with autocast('cuda', enabled=False):
-            X = X.float().to(self.device)
-            Y = Y.float().to(self.device)
-            num_targets = Y.shape[1]
+    # @torch.no_grad()
+    # def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
+    #     with autocast('cuda', enabled=False):
+    #         X = X.float().to(self.device)
+    #         Y = Y.float().to(self.device)
+    #         num_targets = Y.shape[1]
             
-            if self.weight.shape[1] == 0:
-                # [FIXED] Tính dummy feature cũng phải chuẩn [CLS] token
-                dummy_feat = self.backbone(X[0:2]).float()
-                dummy_feat = self.buffer(dummy_feat)
-                feat_dim = dummy_feat.shape[1]
-                self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
-            elif num_targets > self.weight.shape[1]:
-                increment = num_targets - self.weight.shape[1]
-                tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
-                self.weight = torch.cat((self.weight, tail), dim=1)
+    #         if self.weight.shape[1] == 0:
+    #             # [FIXED] Tính dummy feature cũng phải chuẩn [CLS] token
+    #             dummy_feat = self.backbone(X[0:2]).float()
+    #             dummy_feat = self.buffer(dummy_feat)
+    #             feat_dim = dummy_feat.shape[1]
+    #             self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+    #         elif num_targets > self.weight.shape[1]:
+    #             increment = num_targets - self.weight.shape[1]
+    #             tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
+    #             self.weight = torch.cat((self.weight, tail), dim=1)
 
-            N = X.shape[0]
-            feat_dim = self.weight.shape[0]
-            A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
-            B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+    #         N = X.shape[0]
+    #         feat_dim = self.weight.shape[0]
+    #         A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+    #         B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
             
-            for start in range(0, N, chunk_size):
-                end = min(start + chunk_size, N)
-                x_batch = X[start:end] 
-                y_batch = Y[start:end] 
+    #         for start in range(0, N, chunk_size):
+    #             end = min(start + chunk_size, N)
+    #             x_batch = X[start:end] 
+    #             y_batch = Y[start:end] 
                 
-                features = self.backbone(x_batch).float()
-                features = self.buffer(features)
+    #             features = self.backbone(x_batch).float()
+    #             features = self.buffer(features)
                 
-                A += features.T @ features
-                B += features.T @ y_batch
-                del features, x_batch, y_batch 
+    #             A += features.T @ features
+    #             B += features.T @ y_batch
+    #             del features, x_batch, y_batch 
 
-            I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
-            A += self.gamma * I 
+    #         I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+    #         A += self.gamma * I 
 
-            try:
-                W_solution = torch.linalg.solve(A, B)
-            except RuntimeError:
-                W_solution = torch.linalg.pinv(A) @ B
+    #         try:
+    #             W_solution = torch.linalg.solve(A, B)
+    #         except RuntimeError:
+    #             W_solution = torch.linalg.pinv(A) @ B
             
-            self.weight = W_solution
-            del A, B, I, X, Y
-            torch.cuda.empty_cache()
+    #         self.weight = W_solution
+    #         del A, B, I, X, Y
+    #         torch.cuda.empty_cache()
     # =========================================================================
     # [ANALYTIC LEARNING (OPTIMIZED FIT)]
     # =========================================================================

@@ -352,7 +352,7 @@ class MinNet(object):
         # 3. Training Loop
         print(f"--> [AMKMMC] Robust Learning (Student-Cauchy Mix)...")
         
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             with torch.no_grad():
                 for i, (_, inputs, targets) in enumerate(tqdm(train_loader, desc="AMKMMC Step")):
                     inputs, targets = inputs.to(self.device), targets.to(self.device)
