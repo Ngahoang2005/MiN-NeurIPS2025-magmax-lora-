@@ -341,7 +341,7 @@ class MinNet(object):
             kl_losses = 0.0 # Theo dõi riêng KL
             correct, total = 0, 0
 
-            beta_current = max_beta * min(1.0, epoch / (epochs / 3 + 1e-6))
+            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs = inputs.to(self.device)
