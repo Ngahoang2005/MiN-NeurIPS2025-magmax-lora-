@@ -16,7 +16,9 @@ from utils.toolkit import tensor2numpy, count_parameters
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
+import torch
+import matplotlib.pyplot as plt
+import numpy as np
 # Import Mixed Precision
 from torch.amp import autocast, GradScaler
 
@@ -144,6 +146,8 @@ class MinNet(object):
                                   num_workers=self.num_workers)
         test_loader = DataLoader(test_set, batch_size=self.buffer_batch, shuffle=False,
                                  num_workers=self.num_workers)
+        kurtosis_score = self.diagnose_noise(self._network, train_loader, self.device)
+        print(f"Kurtosis Score for Task {self.cur_task}: {kurtosis_score:.2f}")
         self.fit_fc(train_loader, test_loader)
 
         train_set = data_manger.get_task_data(source="train_no_aug", class_list=train_list)
@@ -191,7 +195,8 @@ class MinNet(object):
         if self.args['pretrained']:
             for param in self._network.backbone.parameters():
                 param.requires_grad = False
-        
+        kurtosis_score = self.diagnose_noise(self._network, train_loader, self.device)
+        print(f"Kurtosis Score for Task {self.cur_task}: {kurtosis_score:.2f}") 
         self.fit_fc(train_loader, test_loader)
 
         # [STEP 2] Training Noise (SGD)
@@ -477,3 +482,108 @@ class MinNet(object):
         prototype = torch.mean(all_features, dim=0).to(self.device)
         self._clear_gpu()
         return prototype
+    
+
+    def diagnose_noise(network, data_loader, device='cuda'):
+        """
+        Phân tích độ nhiễu của dữ liệu dựa trên mô hình RLS sơ bộ.
+        Trả về: Kurtosis score và lời khuyên.
+        """
+        print("\n" + "="*40)
+        print(">>> DATA NOISE DIAGNOSIS START <<<")
+        
+        network.eval()
+        network.to(device)
+        
+        all_features = []
+        all_targets = []
+        
+        # 1. Thu thập toàn bộ dữ liệu (hoặc 1 phần nếu data quá lớn)
+        with torch.no_grad():
+            for i, (_, inputs, targets) in enumerate(data_loader):
+                inputs, targets = inputs.to(device), targets.to(device)
+                
+                # Extract Feature
+                feats = network.extract_feature(inputs).float()
+                if hasattr(network, 'buffer'):
+                    feats = network.buffer(feats)
+                    
+                targets_oh = torch.nn.functional.one_hot(
+                    targets.long(), num_classes=network.known_class
+                ).float()
+                
+                all_features.append(feats)
+                all_targets.append(targets_oh)
+                
+                if i > 50: break # Chỉ cần check 50 batch đầu là đủ thống kê
+                
+        X = torch.cat(all_features, dim=0)
+        Y = torch.cat(all_targets, dim=0)
+        
+        # 2. Fit nhanh một cái RLS cơ bản (MSE) để tìm mặt phẳng tham chiếu
+        # W_temp = (X^T X + I)^-1 X^T Y
+        # Ta dùng lstsq cho nhanh
+        print("--> Fitting temporary RLS to check residuals...")
+        try:
+            # Giải hệ phương trình tuyến tính để tìm W tạm
+            # Dùng driver 'gels' cho tổng quát
+            W_temp = torch.linalg.lstsq(X, Y).solution
+        except:
+            # Fallback nếu lỗi
+            I = torch.eye(X.shape[1], device=device)
+            W_temp = torch.linalg.solve(X.T @ X + 1.0 * I, X.T @ Y)
+            
+        # 3. Tính sai số (Residuals)
+        # E = Y - X * W
+        preds = X @ W_temp
+        errors = Y - preds
+        
+        # Lấy giá trị tuyệt đối hoặc bình phương lỗi
+        # Ta quan tâm phân phối của nó
+        error_vals = errors.flatten().cpu().numpy()
+        
+        # 4. Tính toán chỉ số Kurtosis (Độ nhọn)
+        # Kurtosis cao = Có nhiều Outliers (Đuôi dài)
+        mean_e = np.mean(error_vals)
+        std_e = np.std(error_vals)
+        
+        # Công thức Kurtosis chuẩn hóa (Fisher definition: Normal = 0)
+        # Hoặc Pearson definition: Normal = 3. Ở đây dùng Pearson cho dễ hình dung.
+        numerator = np.mean((error_vals - mean_e)**4)
+        denominator = std_e**4
+        kurtosis = numerator / denominator
+        
+        # 5. Phân tích thêm Outlier Ratio
+        # Outlier là những điểm có lỗi > 3 * STD (quy tắc 3-sigma)
+        threshold = 3 * std_e
+        n_outliers = np.sum(np.abs(error_vals - mean_e) > threshold)
+        outlier_ratio = (n_outliers / len(error_vals)) * 100
+        
+        print("-" * 40)
+        print(f"Dataset Stats:")
+        print(f"  - Mean Error: {mean_e:.5f}")
+        print(f"  - Std Error:  {std_e:.5f}")
+        print(f"  - Max Error:  {np.max(np.abs(error_vals)):.5f}")
+        print(f"  - Kurtosis:   {kurtosis:.2f} (Gaussian approx 3.0)")
+        print(f"  - Outliers (>3std): {outlier_ratio:.2f}%")
+        print("-" * 40)
+        
+        # 6. Đưa ra lời khuyên
+        print(">>> CONCLUSION:")
+        if kurtosis > 5.0 or outlier_ratio > 1.0:
+            print("🔴 HIGH NOISE DETECTED (Non-Gaussian).")
+            print("   -> Feature/Label bị nhiễu hoặc có nhiều Hard Samples cực đoan.")
+            print("   -> KHUYÊN DÙNG: MMCC (Robust RLS).")
+            print("   -> Config: Tăng Omega lên 0.6, Sigma = 3.0")
+        elif kurtosis < 2.0:
+            print("🟡 LOW NOISE (Platykurtic - Phân phối bẹt).")
+            print("   -> Dữ liệu quá sạch hoặc phân tán đều.")
+            print("   -> KHUYÊN DÙNG: RLS Thường (Acc cao hơn).")
+        else: # 2.0 <= Kurtosis <= 5.0
+            print("🟢 CLEAN DATA (Gaussian-like).")
+            print("   -> Dữ liệu chuẩn, nhiễu ngẫu nhiên.")
+            print("   -> KHUYÊN DÙNG: RLS Thường (Tốt nhất).")
+            
+        print("="*40 + "\n")
+        
+        return kurtosis
