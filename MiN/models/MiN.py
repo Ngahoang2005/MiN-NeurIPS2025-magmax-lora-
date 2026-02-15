@@ -484,7 +484,8 @@ class MinNet(object):
         return prototype
     
 
-    def diagnose_noise(network, data_loader, device='cuda'):
+    # Thêm 'self' vào đầu
+    def diagnose_noise(self, network, data_loader, device='cuda'):
         """
         Phân tích độ nhiễu của dữ liệu dựa trên mô hình RLS sơ bộ.
         Trả về: Kurtosis score và lời khuyên.
