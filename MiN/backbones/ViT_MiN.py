@@ -88,6 +88,7 @@ class PiNoise(nn.Module):
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         
         self.feature_cache = [] 
+        self.is_caching = False
         self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
         self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
         
@@ -155,10 +156,11 @@ class PiNoise(nn.Module):
 
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
-        if self.training:
-            self.feature_cache.append(hyper_features.detach().cpu())
-        x_down = hyper_features @ self.w_down
         
+        x_down = hyper_features @ self.w_down
+        if not self.training and self.is_caching:
+            # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
+            self.feature_cache.append(x_down.detach().cpu())
         # 2. Variational Encoding
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
