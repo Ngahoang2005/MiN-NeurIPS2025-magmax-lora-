@@ -135,7 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(train_loader, mode='threshold', val=0.95)
+        self._network.collect_projections(train_loader, mode='threshold', val=0.9)
         
         
         self._clear_gpu()
@@ -203,7 +203,7 @@ class MinNet(object):
         self.run(train_loader_sgd)
         
         # Thu thập GPM Projection sau khi train xong noise
-        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.95)
+        self._network.collect_projections(train_loader_sgd, mode='threshold', val=0.9)
         self._clear_gpu()
 
         del train_set
@@ -315,7 +315,7 @@ class MinNet(object):
         lr = self.init_lr if self.cur_task == 0 else self.lr
         weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
 
-        current_scale = 0.85
+        current_scale = 0.6
         
         # Freeze/Unfreeze Logic
         for param in self._network.parameters(): param.requires_grad = False
@@ -333,7 +333,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 5e-5
+        max_beta = 1e-4
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             ce_losses = 0.0 # Theo dõi riêng CE
