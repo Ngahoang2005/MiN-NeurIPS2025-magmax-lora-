@@ -155,6 +155,8 @@ class PiNoise(nn.Module):
 
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
+        if self.training:
+            self.feature_cache.append(hyper_features.detach().cpu())
         x_down = hyper_features @ self.w_down
         
         # 2. Variational Encoding
@@ -222,6 +224,7 @@ class PiNoise(nn.Module):
             val: Epsilon hoặc Ratio tương ứng.
         """
         if not self.feature_cache: return
+        
         
         device = 'cpu' # Tiết kiệm VRAM tối đa
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
