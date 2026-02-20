@@ -103,6 +103,10 @@ class ROGOLinear(nn.Linear):
             return torch.sum((real_scale - self.identity) ** 2)
         return torch.tensor(0.0, device=self.weight.device)
 
+
+
+
+
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -132,12 +136,9 @@ class PiNoise(nn.Module):
         
         self.feature_cache = [] 
         self.is_caching = False
-        # [SỬA ĐỔI 1]: DÙNG ROGO LINEAR CHO FC_MU VÀ FC_RHO
-        self.fc_mu = ROGOLinear(hidden_dim, hidden_dim)
-        self.fc_rho = ROGOLinear(hidden_dim, hidden_dim)
-        # Không gian V của ROGO
-        self.relax_V_mu = None
-        self.relax_V_rho = None
+        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
+        
         # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
         # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
         nn.init.constant_(self.fc_rho.weight, 0.)
@@ -150,7 +151,7 @@ class PiNoise(nn.Module):
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
-     
+
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
@@ -207,11 +208,11 @@ class PiNoise(nn.Module):
         
         x_down = hyper_features @ self.w_down
         if not self.training and self.is_caching:
+            # Bắt buộc detach() và .cpu() để không bị tràn VRAM (OOM)
             self.feature_cache.append(x_down.detach().cpu())
-            
-        # [SỬA ĐỔI 2]: TRUYỀN KHÔNG GIAN V VÀO LINEAR
-        mu = self.fc_mu(x_down, space=self.relax_V_mu)
-        sigma = F.softplus(self.fc_rho(x_down, space=self.relax_V_rho)) + 1e-6 
+        # 2. Variational Encoding
+        mu = self.fc_mu(x_down)
+        sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
         
         if self.training:
             epsilon = torch.randn_like(sigma)
@@ -219,113 +220,66 @@ class PiNoise(nn.Module):
         else:
             z = mu 
         
+        # 3. Noise Injection
         noise_projected = z @ self.w_up
         effective_noise = self.noise_scale * noise_projected
         out = hyper_features + effective_noise
-        
         if self.training:
             with torch.no_grad():
+                # Tính norm trung bình trên chiều cuối cùng (dim=-1)
+                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
+                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
+                
                 self.last_debug_info = {
-                    "signal": hyper_features.norm(p=2, dim=-1).mean().item(),
-                    "noise": effective_noise.norm(p=2, dim=-1).mean().item(),
-                    "snr": hyper_features.norm(p=2, dim=-1).mean().item() / (effective_noise.norm(p=2, dim=-1).mean().item() + 1e-9),
+                    "signal": sig_norm,
+                    "noise": noise_norm,
+                    "snr": sig_norm / (noise_norm + 1e-9),
                     "sigma": sigma.mean().item(),
                     "scale": self.noise_scale.item()
                 }
-                
+        # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
         if return_kl:
             kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
             return out, kl_div.mean()
         else:
+            # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
             return out
     
-    # [THUẬT TOÁN ROGO]: TÌM KHÔNG GIAN NỚI LỎNG V BÊN TRONG U
-    def update_relaxing_space(self):
+    def apply_gradient_projection(self, scale=1.0):
+        """
+        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
+        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
+        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
+        """
         if self.core_U.shape[1] == 0: return
         
-        def find_V(grad, U_core):
-            thresholds = 0.97
-            space_thresholds = 0.90
-            frozen_space = U_core.clone()
-            current_grad = grad.t() 
-            
-            U, S, _ = torch.linalg.svd(current_grad, full_matrices=False)
-            sval_ratio = (S**2) / (S**2).sum()
-            r = 1
-            while torch.sum(sval_ratio[:r]) < thresholds and r < len(S): r += 1
-            U_grad = U[:, :r]
-            
-            UU = U_grad @ U_grad.t()
-            trusts = []
-            importance = 0
-            
-            while importance < space_thresholds and frozen_space.shape[1] > 0:
-                representation = frozen_space.t() @ UU @ frozen_space
-                try:
-                    Ux, Sx, _ = torch.linalg.svd(representation, full_matrices=False)
-                    x = Ux[:, 0:1]
-                except:
-                    break
-                
-                if torch.sum(x) == 0: break
-                u = frozen_space @ x
-                u /= torch.linalg.norm(u)
-                
-                replace = False
-                for idx in range(len(x)):
-                    if x[idx] != 0:
-                        if idx > 0 and idx < len(x) - 1:
-                            frozen_space = torch.cat([u, frozen_space[:, :idx], frozen_space[:, idx+1:]], dim=1)
-                        elif idx == 0:
-                            frozen_space = torch.cat([u, frozen_space[:, 1:]], dim=1)
-                        else:
-                            frozen_space = torch.cat([u, frozen_space[:, :idx]], dim=1)
-                        replace = True
-                        break
-                if not replace: break
-                
-                q, _ = torch.linalg.qr(frozen_space)
-                trust = q[:, 0:1]
-                projection = UU @ trust
-                score = torch.linalg.norm(projection) / (torch.linalg.norm(trust) + 1e-9)
-                if score < space_thresholds: break
-                
-                frozen_space = q[:, 1:]
-                trusts.append(trust)
-            
-            if len(trusts) > 0: return torch.cat(trusts, dim=1)
-            return None
-
-        # Tính V dựa trên Gradient của Warm-up
-        if self.fc_mu.weight.grad is not None:
-            self.relax_V_mu = find_V(self.fc_mu.weight.grad.data.detach(), self.core_U)
-        if self.fc_rho.weight.grad is not None:
-            self.relax_V_rho = find_V(self.fc_rho.weight.grad.data.detach(), self.core_U)
-            
-        r_mu = self.relax_V_mu.shape[1] if self.relax_V_mu is not None else 0
-        r_rho = self.relax_V_rho.shape[1] if self.relax_V_rho is not None else 0
-        print(f"ROGO Space Found: V_mu={r_mu}, V_rho={r_rho} (In Core_U={self.core_U.shape[1]})")
-
-    def apply_gradient_projection(self):
-        """CHIẾU TRỰC GIAO TUYỆT ĐỐI LÊN U_CORE (SCALE = 1.0)"""
-        if self.core_U.shape[1] == 0: return
         with torch.no_grad():
             U = self.core_U 
-            def project_grad(layer):
-                if layer.weight.grad is not None:
-                    g = layer.weight.grad
-                    g_proj = (g @ U) @ U.t()
-                    layer.weight.grad -= g_proj # Tước đoạt 100% gradient vi phạm
-            
-            project_grad(self.fc_mu)
-            project_grad(self.fc_rho)
-            project_grad(self.mu)
-            project_grad(self.sigma)
+            def project_grad(weight):
+                if weight.grad is not None:
+                    g_inner = weight.grad @ U 
+                    g_proj = g_inner @ U.t()
+                    
+                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
+                    # Nhân với scale để cho phép nới lỏng ràng buộc
+                    weight.grad -= (g_proj * scale)
+
+            project_grad(self.mu.weight)
+            project_grad(self.sigma.weight)
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
+        """
+        Tính SVD trên Covariance Matrix.
+        Args:
+            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
+            val: Epsilon hoặc Ratio tương ứng.
+        """
         if not self.feature_cache: return
-        device = 'cpu' 
+        
+        
+        device = 'cpu' # Tiết kiệm VRAM tối đa
         correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
+        
         for batch in self.feature_cache:
             b = batch.to(device)
             if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
@@ -335,23 +289,44 @@ class PiNoise(nn.Module):
         self.feature_cache = []
         gc.collect()
 
+        # 2. SVD
         try:
             U, S, _ = torch.linalg.svd(correlation_matrix)
         except:
             U, S, _ = torch.svd(correlation_matrix)
         
-        if mode == 'threshold':
+        # 3. CHỌN K
+        if mode == 'eigenvalue':
+            max_s = S[0]
+            if max_s == 0: k = 0
+            else:
+                relative_S = S / max_s
+                k = (relative_S > val).sum().item()
+            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
+
+        elif mode == 'threshold':
             total_var = torch.sum(S)
             s_cumsum = torch.cumsum(S, dim=0)
             k = torch.searchsorted(s_cumsum, total_var * val).item()
             if k == 0 and total_var > 0: k = 1
-        else: 
+            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
+            
+        else: # ratio
             k = max(1, int(self.hidden_dim * val))
+            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
 
-        MARGIN = 20 
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN 
+        # =================================================================
+        # 4. SAFETY MARGIN (BẮT BUỘC)
+        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
+        # dù Core Space đã đầy.
+        # =================================================================
+        MARGIN = 12 
+        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
+        
+        # Cắt bớt nếu vượt quá trần
         k = min(k, MAX_ALLOWED_RANK)
         
+        # 5. Update Memory
         U_new = U[:, :k+1].to(self.core_U.device)
 
         if self.core_U.shape[1] == 0:
@@ -359,9 +334,16 @@ class PiNoise(nn.Module):
         else:
             combined = torch.cat([self.core_U, U_new], dim=1)
             U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
+            
+            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
             final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
             self.core_U = U_final[:, :final_k]
-        print(f"--> GPM Core Rank Updated: {self.core_U.shape[1]} / {self.hidden_dim}")
+
+        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
+
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 

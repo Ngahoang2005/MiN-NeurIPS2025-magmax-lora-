@@ -170,7 +170,6 @@ class MiNbaseNet(nn.Module):
                 
         if hasattr(self.backbone, 'norm') and self.backbone.norm is not None:
             for p in self.backbone.norm.parameters(): p.requires_grad = True
-
     # =========================================================================
     # [ANALYTIC LEARNING (RLS) SECTION]
     # =========================================================================
@@ -239,13 +238,12 @@ class MiNbaseNet(nn.Module):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
             self.backbone.noise_maker[j].is_caching = False # Quan trọng: Tắt đi kẻo tràn RAM
-    def apply_gpm_to_grads(self):
+    def apply_gpm_to_grads(self, scale=1.0):
         """
-        Thực hiện chiếu trực giao TUYỆT ĐỐI gradient cho trọng số gốc (ROGO Hybrid).
+        Thực hiện chiếu trực giao gradient cho mu và sigma.
         """
         for j in range(self.backbone.layer_num):
-            # Xóa bỏ hoàn toàn biến scale ở đây
-            self.backbone.noise_maker[j].apply_gradient_projection()
+            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
     def forward_with_ib(self, x):
         """
         [FIXED] Forward với IB, thêm logic lấy [CLS] token cho ViT.
