@@ -200,27 +200,25 @@ class PiNoise(nn.Module):
             return out
     
     def apply_gradient_projection(self, scale=1.0):
-        """
-        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
-        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
-        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
-        """
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
             U = self.core_U 
             def project_grad(weight):
                 if weight.grad is not None:
+                    g_norm_before = weight.grad.norm().item()
                     g_inner = weight.grad @ U 
                     g_proj = g_inner @ U.t()
-                    
-                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
-                    # Nhân với scale để cho phép nới lỏng ràng buộc
                     weight.grad -= (g_proj * scale)
-
+                    g_norm_after = weight.grad.norm().item()
+                    # In ra tỷ lệ còn lại
+                    ratio = g_norm_after / (g_norm_before + 1e-9)
+                    print(f"GPM: grad retained {ratio*100:.1f}%")
+            
             project_grad(self.mu.weight)
             project_grad(self.sigma.weight)
-
+        
+        
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
         Tính SVD trên Covariance Matrix.
