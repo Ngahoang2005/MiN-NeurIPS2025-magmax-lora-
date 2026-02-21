@@ -174,11 +174,8 @@ class PiNoise(nn.Module):
 
     def after_task_training(self):
         # Snapshot
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
-        
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
+        self.history_mu.append(copy.deepcopy(self.fc_mu.state_dict()))
+        self.history_rho.append(copy.deepcopy(self.fc_rho.state_dict()))
         
         # MagMax Merge
         self._perform_magmax_merge()
@@ -197,9 +194,8 @@ class PiNoise(nn.Module):
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
 
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
-
+        self.fc_mu.load_state_dict(get_merged_state(self.history_mu))
+        self.fc_rho.load_state_dict(get_merged_state(self.history_rho))
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down
@@ -258,8 +254,9 @@ class PiNoise(nn.Module):
                     # Nhân với scale để cho phép nới lỏng ràng buộc
                     weight.grad -= (g_proj * scale)
 
-            project_grad(self.mu.weight)
-            project_grad(self.sigma.weight)
+            project_grad(self.fc_mu.weight)
+            project_grad(self.fc_rho.weight)
+          
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
