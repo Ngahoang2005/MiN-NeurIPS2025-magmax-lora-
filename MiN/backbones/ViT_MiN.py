@@ -60,49 +60,6 @@ class Noise_weigh(nn.Module):
 
     def forward(self, x):
         return x * self.weight
-class ROGOLinear(nn.Linear):
-    """Bản sao chuẩn xác của class Linear trong ROGO paper"""
-    def __init__(self, in_features, out_features, bias=True):
-        super(ROGOLinear, self).__init__(in_features, out_features, bias=bias)
-        scale = self.weight.data.new(in_features, in_features).fill_(0.)
-        scale.fill_diagonal_(1.)
-        self.scale = nn.Parameter(scale, requires_grad=True)
-        self.identity = None # Cache cho hàm Loss Phạt
-
-    def forward(self, input, space=None):
-        if space is not None and space.shape[1] > 0:
-            sz = self.weight.size(0)
-            real_scale = self.scale[:space.size(1), :space.size(1)]
-            norm_project = torch.mm(torch.mm(space, real_scale), space.transpose(1, 0))
-            proj_weight = torch.mm(self.weight.view(sz, -1), norm_project).view(self.weight.size())
-            diag_weight = torch.mm(self.weight.view(sz, -1), torch.mm(space, space.transpose(1,0))).view(self.weight.size())
-            masked_weight = proj_weight + self.weight - diag_weight
-        else:
-            masked_weight = self.weight
-        return F.linear(input, masked_weight, self.bias)
-
-    def consolidate(self, space=None):
-        if space is not None and space.shape[1] > 0:
-            sz = self.weight.size(0)
-            real_scale = self.scale[:space.size(1), :space.size(1)].float()
-            norm_project = torch.mm(torch.mm(space, real_scale), space.transpose(1, 0))
-            proj_weight = torch.mm(self.weight.view(sz, -1), norm_project).view(self.weight.size())
-            diag_weight = torch.mm(self.weight.view(sz, -1), torch.mm(space, space.transpose(1,0))).view(self.weight.size())
-            masked_weight = proj_weight + self.weight - diag_weight
-            self.weight.data = masked_weight.data
-            
-        self.scale.data.fill_(0.)
-        self.scale.data.fill_diagonal_(1.)
-
-    def get_penalty(self, space=None):
-        """Tính || Scale - I ||^2 để chống Forgetting"""
-        if space is not None and space.shape[1] > 0:
-            if self.identity is None or self.identity.shape[0] != space.shape[1]:
-                self.identity = torch.eye(space.shape[1], device=self.scale.device)
-            real_scale = self.scale[:space.size(1), :space.size(1)]
-            return torch.sum((real_scale - self.identity) ** 2)
-        return torch.tensor(0.0, device=self.weight.device)
-
 
 
 
@@ -164,8 +121,8 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = True
-        self.w_up.requires_grad = True
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
