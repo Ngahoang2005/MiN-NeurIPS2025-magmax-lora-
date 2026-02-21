@@ -63,7 +63,6 @@ class Noise_weigh(nn.Module):
 
 
 
-
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -86,7 +85,6 @@ class PiNoise(nn.Module):
         # --- History for MagMax ---
         self.history_mu = []    
         self.history_sigma = [] 
-        self.history_rho = []
         
         # --- GPM Buffers ---
         # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
@@ -112,12 +110,7 @@ class PiNoise(nn.Module):
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
-    def reset_to_zero(self):
-        """Đưa bộ não về lại trạng thái khởi thủy (Zero) cho Task mới"""
-        nn.init.constant_(self.fc_mu.weight, 0.)
-        nn.init.constant_(self.fc_mu.bias, 0.)
-        nn.init.constant_(self.fc_rho.weight, 0.)
-        nn.init.constant_(self.fc_rho.bias, -5.0)
+
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
         for param in self.mu.parameters(): param.requires_grad = True
@@ -137,8 +130,11 @@ class PiNoise(nn.Module):
 
     def after_task_training(self):
         # Snapshot
-        self.history_mu.append(copy.deepcopy(self.fc_mu.state_dict()))
-        self.history_rho.append(copy.deepcopy(self.fc_rho.state_dict()))
+        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        
+        self.history_mu.append(mu_state)
+        self.history_sigma.append(sigma_state)
         
         # MagMax Merge
         self._perform_magmax_merge()
@@ -157,8 +153,9 @@ class PiNoise(nn.Module):
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
 
-        self.fc_mu.load_state_dict(get_merged_state(self.history_mu))
-        self.fc_rho.load_state_dict(get_merged_state(self.history_rho))
+        self.mu.load_state_dict(get_merged_state(self.history_mu))
+        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
+
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down
@@ -217,9 +214,8 @@ class PiNoise(nn.Module):
                     # Nhân với scale để cho phép nới lỏng ràng buộc
                     weight.grad -= (g_proj * scale)
 
-            project_grad(self.fc_mu.weight)
-            project_grad(self.fc_rho.weight)
-          
+            project_grad(self.mu.weight)
+            project_grad(self.sigma.weight)
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
@@ -293,7 +289,6 @@ class PiNoise(nn.Module):
             self.core_U = U_final[:, :final_k]
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
 
 
 

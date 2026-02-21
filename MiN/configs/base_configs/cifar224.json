@@ -4,6 +4,6 @@
   "increment": 10,
   "img_size": 224,
   "save_all_checkpoint": false,
-  "shuffle": false,
-  "seed": 1992
+  "shuffle": true,
+  "seed": 1993
 }
