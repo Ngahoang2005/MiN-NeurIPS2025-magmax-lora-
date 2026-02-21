@@ -141,8 +141,7 @@ class PiNoise(nn.Module):
         self.update_noise()
         self.w_down.requires_grad = False
         self.w_up.requires_grad = False
-        # [THÊM DÒNG NÀY]: Cho phép van khuếch đại tự do điều chỉnh
-        self.noise_scale.requires_grad = True
+        
 
     def after_task_training(self):
         # Snapshot đúng lớp đang dùng
