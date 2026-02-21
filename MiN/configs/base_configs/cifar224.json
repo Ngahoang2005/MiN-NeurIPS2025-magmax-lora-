@@ -5,5 +5,5 @@
   "img_size": 224,
   "save_all_checkpoint": false,
   "shuffle": false,
-  "seed": 1993
+  "seed": 1992
 }
