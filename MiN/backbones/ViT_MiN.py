@@ -129,6 +129,7 @@ class PiNoise(nn.Module):
         # --- History for MagMax ---
         self.history_mu = []    
         self.history_sigma = [] 
+        self.history_rho = []
         
         # --- GPM Buffers ---
         # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
