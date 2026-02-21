@@ -112,7 +112,12 @@ class PiNoise(nn.Module):
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
         torch.nn.init.constant_(module.bias, 0.)
-
+    def reset_to_zero(self):
+        """Đưa bộ não về lại trạng thái khởi thủy (Zero) cho Task mới"""
+        nn.init.constant_(self.fc_mu.weight, 0.)
+        nn.init.constant_(self.fc_mu.bias, 0.)
+        nn.init.constant_(self.fc_rho.weight, 0.)
+        nn.init.constant_(self.fc_rho.bias, -5.0)
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
         for param in self.mu.parameters(): param.requires_grad = True

@@ -133,6 +133,10 @@ class MinNet(object):
         self._network.update_noise()
         
         self._clear_gpu()
+        for j in range(self._network.backbone.layer_num):
+            self._network.backbone.noise_maker[j].reset_to_zero()
+
+        self._clear_gpu()
         
         self.run(train_loader)
         print("--> Saving MagMax Snapshot for Task 0...")
