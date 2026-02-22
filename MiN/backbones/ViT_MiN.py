@@ -231,65 +231,91 @@ class PiNoise(nn.Module):
             project_grad(self.fc_rho.weight)
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
-        """
-        Tính SVD trực tiếp từ ma trận cộng dồn, tốn 0 MB RAM.
-        """
         if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
             return
         
-        # Đưa ma trận hiệp phương sai (192x192) về CPU để tính SVD cho nhẹ
-        correlation_matrix = self.corr_matrix.cpu()
+        # Đưa ma trận hiệp phương sai (192x192) về CPU
+        C = self.corr_matrix.cpu() 
+        self.corr_matrix = None # Dọn RAM
         
-        # Giải phóng bộ nhớ biến tích lũy để dùng cho Task sau
-        self.corr_matrix = None 
+        # Tổng năng lượng của Task hiện tại = Trace(C)
+        total_energy = torch.trace(C).item()
 
-        # 2. SVD
-        try:
-            U, S, _ = torch.linalg.svd(correlation_matrix)
-        except:
-            U, S, _ = torch.svd(correlation_matrix)
-        
-        # 3. CHỌN K
-        if mode == 'eigenvalue':
-            max_s = S[0]
-            if max_s == 0: k = 0
-            else:
-                relative_S = S / max_s
-                k = (relative_S > val).sum().item()
-            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
-
-        elif mode == 'threshold':
-            total_var = torch.sum(S)
-            s_cumsum = torch.cumsum(S, dim=0)
-            k = torch.searchsorted(s_cumsum, total_var * val).item()
-            if k == 0 and total_var > 0: k = 1
-            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
-            
-        else: # ratio
-            k = max(1, int(self.hidden_dim * val))
-            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
-
-        # =================================================================
-        # 4. SAFETY MARGIN
-        # =================================================================
-        MARGIN = 12 
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
-        k = min(k, MAX_ALLOWED_RANK)
-        
-        # 5. Update Memory
-        U_new = U[:, :k+1].to(self.core_U.device)
-
+        # ==========================================
+        # TRƯỜNG HỢP 1: TASK 0 (CHƯA CÓ BỘ NHỚ)
+        # ==========================================
         if self.core_U.shape[1] == 0:
-            self.core_U = U_new
+            try:
+                U, S, _ = torch.linalg.svd(C)
+            except:
+                U, S, _ = torch.svd(C)
+            
+            s_cumsum = torch.cumsum(S, dim=0)
+            k = torch.searchsorted(s_cumsum, total_energy * val).item()
+            if k == 0 and total_energy > 0: k = 1
+            
+            MARGIN = 12 
+            MAX_ALLOWED_RANK = self.hidden_dim - MARGIN
+            k = min(k, MAX_ALLOWED_RANK)
+            
+            self.core_U = U[:, :k+1].to(self.device) # Cập nhật thẳng
+            print(f"--> GPM Task 0: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
+
+        # ==========================================
+        # TRƯỜNG HỢP 2: TASK > 0 (CHUẨN EQ.8 VÀ EQ.9)
+        # ==========================================
         else:
-            combined = torch.cat([self.core_U, U_new], dim=1)
-            U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
-            final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
-            self.core_U = U_final[:, :final_k]
-
-        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
-
+            U_old = self.core_U.cpu()
+            
+            # 1. Tính ma trận chiếu (Projection Matrix): P = U * U^T
+            P = U_old @ U_old.t()
+            I = torch.eye(self.hidden_dim)
+            
+            # 2. Eq 8 (Toán học): Tính Residual Covariance trực tiếp
+            # C_hat = (I - P) * C * (I - P)
+            I_minus_P = I - P
+            C_hat = I_minus_P @ C @ I_minus_P
+            
+            # Năng lượng Residual (Phần mới hoàn toàn)
+            residual_energy = torch.trace(C_hat).item()
+            
+            # Năng lượng đã được Cover bởi các Task cũ
+            proj_energy = total_energy - residual_energy
+            
+            # Nếu Task cũ đã cover đủ ngưỡng (val) -> KHÔNG CẦN THÊM CHIỀU MỚI!
+            if proj_energy >= total_energy * val:
+                print(f"--> GPM Task mới: Đã cover {proj_energy/total_energy*100:.1f}%. KHÔNG thêm chiều mới!")
+                return
+            
+            # 3. SVD trên phần Residual (Phần khác biệt)
+            try:
+                U_new, S_new, _ = torch.linalg.svd(C_hat)
+            except:
+                U_new, S_new, _ = torch.svd(C_hat)
+                
+            # 4. Eq 9: ||proj||^2 + ||residual_k||^2 >= eps * ||R||^2
+            # Suy ra: ||residual_k||^2 >= eps * ||R||^2 - ||proj||^2
+            target_residual_energy = (total_energy * val) - proj_energy
+            
+            s_cumsum = torch.cumsum(S_new, dim=0)
+            k = torch.searchsorted(s_cumsum, target_residual_energy).item()
+            if k == 0 and target_residual_energy > 0: k = 1
+            
+            MARGIN = 12 
+            MAX_ALLOWED_RANK = self.hidden_dim - MARGIN
+            
+            # Lấy đúng k vector mới nhất. Vì C_hat đã trừ đi không gian cũ,
+            # U_new này ĐẢM BẢO trực giao 100% với U_old.
+            U_new_k = U_new[:, :k+1].to(self.device)
+            
+            # 5. Nối thẳng vào bộ nhớ (Giống hệt Line 21 trong Algorithm 1 của Paper)
+            self.core_U = torch.cat([self.core_U, U_new_k], dim=1)
+            
+            # Cắt bớt nếu vượt ngưỡng Margin
+            if self.core_U.shape[1] > MAX_ALLOWED_RANK:
+                self.core_U = self.core_U[:, :MAX_ALLOWED_RANK]
+                
+            print(f"--> GPM Task mới: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
