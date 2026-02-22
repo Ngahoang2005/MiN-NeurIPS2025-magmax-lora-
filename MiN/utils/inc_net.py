@@ -208,13 +208,24 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, mode='threshold', val=0.95):
-        """
-        Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
-        """
-        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
+    def collect_projections(self, dataloader, mode='threshold', val=0.95):
+        print("--> [GPM] Đang thu thập đặc trưng để tính SVD...")
+        
+        # 1. BẬT cờ cho phép thu thập (ở tất cả các block Noise)
+        for block in self.backbone.noise_maker: # Sửa lại đường dẫn tới PiNoise nếu tên khác
+            block.is_caching = True
+            
+        # 2. CHẠY 1 VÒNG DATALOADER (Để dữ liệu chảy qua PiNoise)
+        self.eval()
+        with torch.no_grad():
+            for _, inputs, _ in dataloader:
+                inputs = inputs.to(self.device)
+                _ = self.forward(inputs) # Dữ liệu tự động chui vào feature_cache
+                
+        # 3. TÍNH SVD & TẮT CỜ
+        for block in self.backbone.noise_maker:
+            block.compute_projection_matrix(mode=mode, val=val)
+            block.is_caching = False # Quan trọng: Phải tắt đi!
     def apply_gpm_to_grads(self, scale=1.0):
         """
         Thực hiện chiếu trực giao gradient cho mu và sigma.

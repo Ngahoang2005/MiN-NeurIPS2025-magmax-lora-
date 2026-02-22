@@ -135,12 +135,7 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        print("--> Saving MagMax Snapshot for Task 0...")
-        for j in range(self._network.backbone.layer_num):
-            self._network.backbone.noise_maker[j].after_task_training()
-        self._network.collect_projections(mode='threshold', val=0.95)
-        
-        
+        self._network.collect_projections(dataloader=train_loader)
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -203,14 +198,7 @@ class MinNet(object):
                                         num_workers=self.num_workers)
         
         self._clear_gpu()
-        print("--> Resetting Noise Modules for independent Task Vector...")
-        for j in range(self._network.backbone.layer_num):
-            self._network.backbone.noise_maker[j].reset_to_zero()
-        # ===============================================================
         self.run(train_loader_sgd)
-        print("--> Applying MagMax Merge...")
-        for j in range(self._network.backbone.layer_num):
-            self._network.backbone.noise_maker[j].after_task_training()
         
         # Thu thập GPM Projection sau khi train xong noise
         self._network.collect_projections(mode='threshold', val=0.95)
@@ -343,7 +331,7 @@ class MinNet(object):
         self._network.to(self.device)
 
         WARMUP_EPOCHS = 2
-        max_beta = 1e-2 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
+        max_beta = 1e-4 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
         
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
@@ -365,7 +353,6 @@ class MinNet(object):
                         with torch.no_grad():
                             logits1 = self._network(inputs, new_forward=False)['logits']
                         logits2, batch_kl = self._network.forward_with_ib(inputs)
-                    
                         logits_final = logits2 + logits1
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
@@ -381,17 +368,10 @@ class MinNet(object):
                 # 3. BACKWARD
                 self.scaler.scale(loss).backward()
                 
-                
-                if i == 0 and epoch == 0:
-                    print("\n=== GRADIENT CHECK (Task {}) ===".format(self.cur_task))
-                    for name, param in self._network.backbone.named_parameters():
-                        if 'fc_mu' in name or 'fc_rho' in name:
-                            has_grad = param.grad is not None and param.grad.abs().sum() > 0
-                            print(f"  {name}: requires_grad={param.requires_grad}, has_grad={has_grad}, "
-                                f"grad_norm={param.grad.norm().item() if param.grad is not None else 'None'}")
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
                     self.scaler.unscale_(optimizer)
                     self._network.apply_gpm_to_grads(scale=current_scale)
+                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 

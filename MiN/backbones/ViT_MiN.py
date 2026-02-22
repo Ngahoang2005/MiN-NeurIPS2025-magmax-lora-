@@ -67,6 +67,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import gc
 
+
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -80,68 +81,57 @@ class PiNoise(nn.Module):
         
         self.hidden_dim = hidden_dim
         
-        # --- Trainable Parts (VIB & MagMax targets) ---
+        # --- Trainable Parts (MagMax targets) ---
         self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
         self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
-        
-        # Khởi tạo Mu với nhiễu cực nhỏ để mồi gradient
-        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.fc_mu.bias, 0.)
-        
-        # Nâng Bias lên -3.0 để Sigma khởi đầu không bị quá "ngạt thở"
-        nn.init.normal_(self.fc_rho.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.fc_rho.bias, -3.0)
-
+        self._init_zero(self.fc_mu)
+        nn.init.constant_(self.fc_rho.weight, 0.)
+        nn.init.constant_(self.fc_rho.bias, -5.0)
         # --- History for MagMax ---
         self.history_mu = []    
-        self.history_rho = []
+        self.history_sigma = [] 
         
         # --- GPM Buffers ---
         # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
+        
         self.feature_cache = [] 
         
         # [AN TOÀN 2] Learnable Scaling Factor
-        # KHUYẾN NGHỊ: Dùng 0.1 để gradient truyền ngược không bị quá nghẽn
+        # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.1))
         self.last_debug_info = {}
 
-    def reset_to_zero(self):
-        """BẮT BUỘC CHO MAGMAX: Đưa não bộ về trạng thái ban đầu để có Task Vector độc lập"""
-        nn.init.normal_(self.fc_mu.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.fc_mu.bias, 0.)
-        
-        nn.init.normal_(self.fc_rho.weight, mean=0.0, std=0.01)
-        nn.init.constant_(self.fc_rho.bias, -3.0)
+    def _init_zero(self, module):
+        torch.nn.init.constant_(module.weight, 0.)
+        torch.nn.init.constant_(module.bias, 0.)
 
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
         for param in self.fc_mu.parameters(): param.requires_grad = True
         for param in self.fc_rho.parameters(): param.requires_grad = True
-
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = True
-        self.w_up.requires_grad = True
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
-        for param in self.parameters(): param.requires_grad = False
-        self.update_noise() # Mở khóa fc_mu và fc_rho
-        self.w_down.requires_grad = True
-        self.w_up.requires_grad = True
-        # CỐ TÌNH ĐỂ noise_scale BỊ KHÓA ĐỂ ÉP MẠNG HỌC FC_MU & FC_RHO
+        self.update_noise()
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
     def after_task_training(self):
-        # Snapshot đúng lớp đang dùng
+        # Snapshot
+        # SỬA 3: Lấy snapshot của fc_mu và fc_rho
         mu_state = {k: v.detach().cpu().clone() for k, v in self.fc_mu.state_dict().items()}
-        rho_state = {k: v.detach().cpu().clone() for k, v in self.fc_rho.state_dict().items()}
+        sigma_state = {k: v.detach().cpu().clone() for k, v in self.fc_rho.state_dict().items()}
         
         self.history_mu.append(mu_state)
-        self.history_rho.append(rho_state)
+        self.history_sigma.append(sigma_state)
         
-        # Gộp trọng số MagMax
+        # MagMax Merge
         self._perform_magmax_merge()
 
     def _perform_magmax_merge(self):
@@ -158,16 +148,15 @@ class PiNoise(nn.Module):
                 merged_dict[key] = best_param.to(self.w_down.device)
             return merged_dict
 
-        # Load ngược lại vào đúng fc_mu và fc_rho
+        # SỬA 4: Load MagMax vào đúng fc_mu và fc_rho
         self.fc_mu.load_state_dict(get_merged_state(self.history_mu))
-        self.fc_rho.load_state_dict(get_merged_state(self.history_rho))
+        self.fc_rho.load_state_dict(get_merged_state(self.history_sigma))
+        
 
     def forward(self, hyper_features, return_kl=False):
-        # [GPM LOGIC] Thu thập đặc trưng nếu cờ is_caching bật
+        # 1. Down Projection
         if getattr(self, 'is_caching', False):
             self.feature_cache.append(hyper_features.detach().cpu())
-
-        # 1. Down Projection
         x_down = hyper_features @ self.w_down
         
         # 2. Variational Encoding
@@ -184,7 +173,6 @@ class PiNoise(nn.Module):
         noise_projected = z @ self.w_up
         effective_noise = self.noise_scale * noise_projected
         out = hyper_features + effective_noise
-        
         if self.training:
             with torch.no_grad():
                 # Tính norm trung bình trên chiều cuối cùng (dim=-1)
@@ -198,7 +186,6 @@ class PiNoise(nn.Module):
                     "sigma": sigma.mean().item(),
                     "scale": self.noise_scale.item()
                 }
-                
         # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
         if return_kl:
             kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
@@ -221,15 +208,21 @@ class PiNoise(nn.Module):
                 if weight.grad is not None:
                     g_inner = weight.grad @ U 
                     g_proj = g_inner @ U.t()
+                    
+                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
+                    # Nhân với scale để cho phép nới lỏng ràng buộc
                     weight.grad -= (g_proj * scale)
 
-            # [ĐÃ VÁ LỖI CHÍ MẠNG] Chiếu thẳng vào fc_mu và fc_rho
+            # SỬA 5: Chiếu đúng vào fc_mu và fc_rho
             project_grad(self.fc_mu.weight)
             project_grad(self.fc_rho.weight)
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         """
         Tính SVD trên Covariance Matrix.
+        Args:
+            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
+            val: Epsilon hoặc Ratio tương ứng.
         """
         if not self.feature_cache: return
         
