@@ -122,15 +122,15 @@ class PiNoise(nn.Module):
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
+        self.w_down.requires_grad = True
+        self.w_up.requires_grad = True
 
     def unfreeze_incremental(self):
         """Task > 0: Train noise only"""
         for param in self.parameters(): param.requires_grad = False
         self.update_noise() # Mở khóa fc_mu và fc_rho
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
+        self.w_down.requires_grad = True
+        self.w_up.requires_grad = True
         # CỐ TÌNH ĐỂ noise_scale BỊ KHÓA ĐỂ ÉP MẠNG HỌC FC_MU & FC_RHO
 
     def after_task_training(self):
