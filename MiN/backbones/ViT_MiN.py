@@ -154,10 +154,13 @@ class PiNoise(nn.Module):
         
 
     def forward(self, hyper_features, return_kl=False):
-        # 1. Down Projection
+        # 1. Down Projection (Thực hiện TRƯỚC)
+        x_down = hyper_features @ self.w_down
+        
+        # [ĐÃ SỬA]: Thu thập x_down (chiều 192) thay vì hyper_features (chiều 768)
         if getattr(self, 'is_caching', False):
             with torch.no_grad():
-                b = hyper_features.detach()
+                b = x_down.detach() # Lấy x_down đưa vào ma trận
                 if b.dim() > 2: 
                     b = b.reshape(-1, b.shape[-1])
                 
@@ -167,8 +170,7 @@ class PiNoise(nn.Module):
                 
                 # Cộng dồn trực tiếp A = A + X^T @ X
                 self.corr_matrix += b.t() @ b
-        x_down = hyper_features @ self.w_down
-        
+
         # 2. Variational Encoding
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
@@ -183,6 +185,7 @@ class PiNoise(nn.Module):
         noise_projected = z @ self.w_up
         effective_noise = self.noise_scale * noise_projected
         out = hyper_features + effective_noise
+        
         if self.training:
             with torch.no_grad():
                 # Tính norm trung bình trên chiều cuối cùng (dim=-1)
@@ -196,6 +199,7 @@ class PiNoise(nn.Module):
                     "sigma": sigma.mean().item(),
                     "scale": self.noise_scale.item()
                 }
+                
         # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
         if return_kl:
             kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
@@ -203,7 +207,6 @@ class PiNoise(nn.Module):
         else:
             # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
             return out
-    
     def apply_gradient_projection(self, scale=1.0):
         """
         GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
