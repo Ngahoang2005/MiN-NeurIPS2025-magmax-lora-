@@ -217,18 +217,40 @@ class PiNoise(nn.Module):
         
         with torch.no_grad():
             U = self.core_U 
-            def project_grad(weight):
+            def project_grad(weight, name=""):
                 if weight.grad is not None:
+                    # Lưu lại Gradient gốc để đo lường
+                    g_orig = weight.grad.clone()
+                    
+                    # Tính toán GPM
                     g_inner = weight.grad @ U 
                     g_proj = g_inner @ U.t()
-                    
-                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
-                    # Nhân với scale để cho phép nới lỏng ràng buộc
                     weight.grad -= (g_proj * scale)
 
-            # SỬA 5: Chiếu đúng vào fc_mu và fc_rho
-            project_grad(self.fc_mu.weight)
-            project_grad(self.fc_rho.weight)
+                    # --- DEBUG GRADIENT (In ngẫu nhiên để tránh ngập Log) ---
+                    import random
+                    if random.random() < 0.001: # Xác suất 0.1% in ra
+                        mag_orig = torch.norm(g_orig).item()
+                        mag_proj = torch.norm(g_proj).item()
+                        mag_new = torch.norm(weight.grad).item()
+                        
+                        # Đo lượng vi phạm CÒN LẠI của g_new lên U_core
+                        # Nếu scale = 1.0, cái này phải bằng 0. 
+                        # Nếu scale = 0.3, cái này phải bằng đúng 70% mag_proj ban đầu.
+                        g_new_proj = (weight.grad @ U) @ U.t()
+                        mag_remaining = torch.norm(g_new_proj).item()
+                        
+                        print(f"\n   [Debug Grad - {name}] Scale={scale}")
+                        print(f"      - Độ lớn G gốc     : {mag_orig:.4f}")
+                        print(f"      - Độ lớn Bóng(phạt) : {mag_proj:.4f} (Chiếm {mag_proj/mag_orig*100:.1f}%)")
+                        print(f"      - Lực vi phạm CÒN LẠI: {mag_remaining:.4f} (Kỳ vọng: {mag_proj * (1 - scale):.4f})")
+                    # --- DEBUG GRADIENT ---
+                    
+            # Gọi hàm (truyền thêm tên để dễ nhìn)
+            project_grad(self.fc_mu.weight, "fc_mu")
+            project_grad(self.fc_rho.weight, "fc_rho")
+
+          
 
     def compute_projection_matrix(self, mode='threshold', val=0.95):
         if not hasattr(self, 'corr_matrix') or self.corr_matrix is None:
@@ -310,7 +332,17 @@ class PiNoise(nn.Module):
             
             # 5. Nối thẳng vào bộ nhớ (Giống hệt Line 21 trong Algorithm 1 của Paper)
             self.core_U = torch.cat([self.core_U, U_new_k], dim=1)
+            # --- DEBUG SVD (Bắt đầu) ---
+            # 1. Kiểm tra tính trực giao (Orthogonality Check)
+            # Tích vô hướng của U_old và U_new_k phải xấp xỉ 0 (mức e-07 hoặc e-08)
+            dot_product_matrix = U_old.t() @ U_new_k.cpu()
+            max_violation = torch.max(torch.abs(dot_product_matrix)).item()
             
+            # 2. In ra chi tiết phân bổ năng lượng
+            print(f"   [Debug SVD] Total Energy: {total_energy:.2f} | Residual: {residual_energy:.2f}")
+            print(f"   [Debug SVD] Target Residual cần bù: {target_residual_energy:.2f} | Đã bù được: {torch.sum(S_new[:k+1]).item():.2f}")
+            print(f"   [Debug SVD] Max Ortho Violation (Must be ~0): {max_violation:.2e}")
+            # --- DEBUG SVD (Kết thúc) ---
             # Cắt bớt nếu vượt ngưỡng Margin
             if self.core_U.shape[1] > MAX_ALLOWED_RANK:
                 self.core_U = self.core_U[:, :MAX_ALLOWED_RANK]
