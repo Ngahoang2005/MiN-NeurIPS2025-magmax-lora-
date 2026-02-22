@@ -107,7 +107,7 @@ class PiNoise(nn.Module):
 
         # [AN TOÀN 2] Learnable Scaling Factor
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
-        self.noise_scale = nn.Parameter(torch.tensor(0.1))
+        self.noise_scale = nn.Parameter(torch.tensor(0.01))
         self.last_debug_info = {}
 
     def _init_zero(self, module):
@@ -125,8 +125,9 @@ class PiNoise(nn.Module):
 
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
+        # [ĐÃ SỬA]: Trỏ đúng vào fc_mu và fc_rho đang dùng ở forward
+        for param in self.fc_mu.parameters(): param.requires_grad = True
+        for param in self.fc_rho.parameters(): param.requires_grad = True
 
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
