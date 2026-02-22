@@ -258,7 +258,7 @@ class PiNoise(nn.Module):
             MAX_ALLOWED_RANK = self.hidden_dim - MARGIN
             k = min(k, MAX_ALLOWED_RANK)
             
-            self.core_U = U[:, :k+1].to(self.device) # Cập nhật thẳng
+            self.core_U = U[:, :k+1].to(self.core_U.device)
             print(f"--> GPM Task 0: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
 
         # ==========================================
@@ -306,7 +306,7 @@ class PiNoise(nn.Module):
             
             # Lấy đúng k vector mới nhất. Vì C_hat đã trừ đi không gian cũ,
             # U_new này ĐẢM BẢO trực giao 100% với U_old.
-            U_new_k = U_new[:, :k+1].to(self.device)
+            U_new_k = U_new[:, :k+1].to(self.core_U.device)
             
             # 5. Nối thẳng vào bộ nhớ (Giống hệt Line 21 trong Algorithm 1 của Paper)
             self.core_U = torch.cat([self.core_U, U_new_k], dim=1)
@@ -316,6 +316,10 @@ class PiNoise(nn.Module):
                 self.core_U = self.core_U[:, :MAX_ALLOWED_RANK]
                 
             print(f"--> GPM Task mới: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
+
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
