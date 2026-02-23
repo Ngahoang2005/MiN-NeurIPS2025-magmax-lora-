@@ -140,7 +140,7 @@ class MinNet(object):
             block.rogo_consolidate()
             
         # Thu thập GPM Projection như bình thường
-        self._network.collect_projections(dataloader=train_loader, mode='threshold', val=0.95)
+        self._network.collect_projections(dataloader=train_loader, mode='threshold')
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -210,7 +210,9 @@ class MinNet(object):
             block.rogo_consolidate()
             
         # Thu thập GPM Projection như bình thường
-        self._network.collect_projections(dataloader=train_loader_sgd, mode='threshold', val=0.95)
+        # XÓA CÁI val=0.95 ĐI LÀ XONG! 
+        # Vì bên trong collect_projections nó tự động giảm dần val từ 0.96 xuống 0.85 rồi.
+        self._network.collect_projections(dataloader=train_loader, mode='threshold')
         self._clear_gpu()
 
         del train_set
