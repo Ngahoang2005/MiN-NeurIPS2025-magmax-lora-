@@ -175,7 +175,7 @@ class PiNoise(nn.Module):
 
         # 2. Variational Encoding
         x_rogo = x_down @ self.rogo_scale
-        mu = self.fc_mu(x_down)
+        mu = self.fc_mu(x_rogo)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
         
         if self.training:
