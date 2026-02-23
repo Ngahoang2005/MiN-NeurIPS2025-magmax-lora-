@@ -101,6 +101,7 @@ class PiNoise(nn.Module):
         # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
         self.noise_scale = nn.Parameter(torch.tensor(0.2))
         self.last_debug_info = {}
+        self.rogo_scale = nn.Parameter(torch.eye(hidden_dim))
 
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
@@ -110,6 +111,7 @@ class PiNoise(nn.Module):
         """Unfreeze trainable parts for new task"""
         for param in self.fc_mu.parameters(): param.requires_grad = True
         for param in self.fc_rho.parameters(): param.requires_grad = True
+        self.rogo_scale.requires_grad = True
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
@@ -172,6 +174,7 @@ class PiNoise(nn.Module):
                 self.corr_matrix += b.t() @ b
 
         # 2. Variational Encoding
+        x_rogo = x_down @ self.rogo_scale
         mu = self.fc_mu(x_down)
         sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
         
@@ -216,6 +219,8 @@ class PiNoise(nn.Module):
         if self.core_U.shape[1] == 0: return
         
         with torch.no_grad():
+            project_grad(self.fc_mu.weight, "fc_mu")
+
             U = self.core_U 
             def project_grad(weight, name=""):
                 if weight.grad is not None:
@@ -349,7 +354,15 @@ class PiNoise(nn.Module):
                 
             print(f"--> GPM Task mới: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
 
-
+    def rogo_consolidate(self):
+        """Hòa tan Scale vào Weight và Reset"""
+        with torch.no_grad():
+            # Toán học: y = (x @ S) @ W^T = x @ (W @ S^T)^T
+            # Nên W_mới = W_cũ @ S^T
+            self.fc_mu.weight.data = self.fc_mu.weight.data @ self.rogo_scale.data.t()
+            
+            # Reset lại Scale về ma trận Đơn vị
+            self.rogo_scale.data.copy_(torch.eye(self.hidden_dim, device=self.rogo_scale.device))
 
 
 class Attention(nn.Module):

@@ -208,23 +208,30 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, dataloader, mode='threshold', val=0.85):
+    
+    def collect_projections(self, dataloader, mode='threshold'):
         print("--> [GPM] Đang thu thập đặc trưng để tính SVD...")
         
-        # 1. BẬT cờ cho phép thu thập (ở tất cả các block Noise)
-        for block in self.backbone.noise_maker: # Sửa lại đường dẫn tới PiNoise nếu tên khác
+        # 1. BẬT cờ cho phép thu thập
+        for block in self.backbone.noise_maker: 
             block.is_caching = True
             
-        # 2. CHẠY 1 VÒNG DATALOADER (Để dữ liệu chảy qua PiNoise)
+        # 2. CHẠY 1 VÒNG DATALOADER
         self.eval()
         with torch.no_grad():
             for _, inputs, _ in dataloader:
                 inputs = inputs.to(self.device)
-                _ = self.forward(inputs) # Dữ liệu tự động chui vào feature_cache
+                _ = self.forward(inputs) 
                 
-        # 3. TÍNH SVD & TẮT CỜ
-        for block in self.backbone.noise_maker:
-            block.compute_projection_matrix(mode=mode, val=val)
+        # 3. TÍNH SVD THEO NGƯỠNG GIẢM DẦN & TẮT CỜ
+        num_layers = len(self.backbone.noise_maker)
+        for i, block in enumerate(self.backbone.noise_maker):
+            # Tự động tính val theo độ sâu của layer
+            depth_ratio = i / max(1, (num_layers - 1))
+            current_val = 0.96 - depth_ratio * (0.96 - 0.85)
+            
+            # Gọi tính SVD với current_val vừa tính
+            block.compute_projection_matrix(mode=mode, val=current_val)
             block.is_caching = False # Quan trọng: Phải tắt đi!
     def apply_gpm_to_grads(self, scale=1.0):
         """

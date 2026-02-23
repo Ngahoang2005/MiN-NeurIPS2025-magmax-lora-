@@ -135,7 +135,12 @@ class MinNet(object):
         self._clear_gpu()
         
         self.run(train_loader)
-        self._network.collect_projections(dataloader=train_loader)
+        print("--> Đang gộp trọng số ROGO (Consolidation)...")
+        for block in self._network.backbone.noise_maker:
+            block.rogo_consolidate()
+            
+        # Thu thập GPM Projection như bình thường
+        self._network.collect_projections(dataloader=train_loader, mode='threshold', val=0.95)
         self._clear_gpu()
         
         train_loader = DataLoader(train_set, batch_size=self.buffer_batch, shuffle=True,
@@ -200,8 +205,12 @@ class MinNet(object):
         self._clear_gpu()
         self.run(train_loader_sgd)
         
-        # Thu thập GPM Projection sau khi train xong noise
-        self._network.collect_projections(dataloader=train_loader_sgd, mode='threshold', val=0.98)
+        print("--> Đang gộp trọng số ROGO (Consolidation)...")
+        for block in self._network.backbone.noise_maker:
+            block.rogo_consolidate()
+            
+        # Thu thập GPM Projection như bình thường
+        self._network.collect_projections(dataloader=train_loader_sgd, mode='threshold', val=0.95)
         self._clear_gpu()
 
         del train_set
@@ -223,6 +232,120 @@ class MinNet(object):
         del train_set_no_aug, test_set
         self._clear_gpu()
 
+
+    def run(self, train_loader):
+        epochs = self.init_epochs if self.cur_task == 0 else self.epochs
+        lr = self.init_lr if self.cur_task == 0 else self.lr
+        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
+
+        current_scale = 0.999
+        
+        # Freeze/Unfreeze Logic
+        for param in self._network.parameters(): param.requires_grad = False
+        for param in self._network.normal_fc.parameters(): param.requires_grad = True
+        
+        if self.cur_task == 0: self._network.init_unfreeze()
+        else: self._network.unfreeze_noise()
+            
+        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+
+        prog_bar = tqdm(range(epochs))
+        self._network.train()
+        self._network.to(self.device)
+
+        WARMUP_EPOCHS = 2
+        max_beta = 1e-4 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
+        
+        for _, epoch in enumerate(prog_bar):
+            losses = 0.0
+            ce_losses = 0.0 # Theo dõi riêng CE
+            kl_losses = 0.0 # Theo dõi riêng KL
+            correct, total = 0, 0
+
+            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
+
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+                
+                optimizer.zero_grad(set_to_none=True) 
+
+                # 1. FORWARD
+                with autocast('cuda'):
+                    if self.cur_task > 0:
+                        with torch.no_grad():
+                            logits1 = self._network(inputs, new_forward=False)['logits']
+                        logits2, batch_kl = self._network.forward_with_ib(inputs)
+                        logits_final = logits2 + logits1
+                    else:
+                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
+
+                # 2. CALC LOSS
+               # 2. CALC LOSS
+                logits_final = logits_final.float() 
+                if targets.dim() > 1: targets = targets.reshape(-1)
+                targets = targets.long()
+
+                ce_loss = F.cross_entropy(logits_final, targets)
+                rogo_penalty = 0.0
+                
+                # CHỈ ÁP DỤNG PHẠT ROGO TỪ TASK 1 TRỞ ĐI
+                if self.cur_task > 0:
+                    rogo_weight = 10.0 # Bác có thể tune (1.0 -> 10.0)
+                    for block in self._network.backbone.noise_maker:
+                        I = torch.eye(block.hidden_dim, device=self.device)
+                        rogo_penalty += torch.sum((block.rogo_scale - I) ** 2)
+                    
+                    loss = ce_loss + beta_current * batch_kl + rogo_weight * rogo_penalty
+                else:
+                    # Task 0 chạy trần, không bị vướng bận gì cả
+                    loss = ce_loss + beta_current * batch_kl
+                self.scaler.scale(loss).backward()
+                
+                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
+                    self.scaler.unscale_(optimizer)
+                    self._network.apply_gpm_to_grads(scale=current_scale)
+                
+                self.scaler.step(optimizer)
+                self.scaler.update()
+                
+                # 4. METRICS & LOGGING
+                losses += loss.item()
+                ce_losses += ce_loss.item()      # Cộng dồn CE
+                kl_losses += batch_kl.item()     # Cộng dồn KL
+                
+                _, preds = torch.max(logits_final, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+                
+                del inputs, targets, loss, logits_final, batch_kl
+
+                # In bảng Noise mỗi 50 batch
+                if i % 50 == 0:
+                     if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
+                        self.print_noise_status()
+
+            scheduler.step()
+            train_acc = 100. * correct / total
+
+            # [HIỂN THỊ CHI TIẾT LOSS]
+            # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
+            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, 
+                losses / len(train_loader), 
+                ce_losses / len(train_loader),
+                kl_losses / len(train_loader),
+                train_acc
+            )
+            self.logger.info(info)
+            prog_bar.set_description(info)
+            
+            if epoch % 5 == 0:
+                self._clear_gpu()
+    
+    
     def fit_fc(self, train_loader, test_loader):
         # [FIX 2: MEMORY ACCUMULATION]
         # RLS cần nhớ ma trận tương quan (A) và (B) của các task cũ.
@@ -308,107 +431,6 @@ class MinNet(object):
         print(f"--> Refitting Task {self.cur_task} (No Augmentation)...")
         self.fit_fc(train_loader, test_loader)
        
-    def run(self, train_loader):
-        epochs = self.init_epochs if self.cur_task == 0 else self.epochs
-        lr = self.init_lr if self.cur_task == 0 else self.lr
-        weight_decay = self.init_weight_decay if self.cur_task == 0 else self.weight_decay
-
-        current_scale = 0.999
-        
-        # Freeze/Unfreeze Logic
-        for param in self._network.parameters(): param.requires_grad = False
-        for param in self._network.normal_fc.parameters(): param.requires_grad = True
-        
-        if self.cur_task == 0: self._network.init_unfreeze()
-        else: self._network.unfreeze_noise()
-            
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
-        scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
-
-        prog_bar = tqdm(range(epochs))
-        self._network.train()
-        self._network.to(self.device)
-
-        WARMUP_EPOCHS = 2
-        max_beta = 1e-4 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
-        
-        for _, epoch in enumerate(prog_bar):
-            losses = 0.0
-            ce_losses = 0.0 # Theo dõi riêng CE
-            kl_losses = 0.0 # Theo dõi riêng KL
-            correct, total = 0, 0
-
-            beta_current = max_beta * min(1.0, epoch / (epochs / 2 + 1e-6))
-
-            for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
-                
-                optimizer.zero_grad(set_to_none=True) 
-
-                # 1. FORWARD
-                with autocast('cuda'):
-                    if self.cur_task > 0:
-                        with torch.no_grad():
-                            logits1 = self._network(inputs, new_forward=False)['logits']
-                        logits2, batch_kl = self._network.forward_with_ib(inputs)
-                        logits_final = logits2 + logits1
-                    else:
-                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
-
-                # 2. CALC LOSS
-                logits_final = logits_final.float() 
-                if targets.dim() > 1: targets = targets.reshape(-1)
-                targets = targets.long()
-
-                ce_loss = F.cross_entropy(logits_final, targets)
-                loss = ce_loss + beta_current * batch_kl
-
-                # 3. BACKWARD
-                self.scaler.scale(loss).backward()
-                
-                if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
-                    self.scaler.unscale_(optimizer)
-                    self._network.apply_gpm_to_grads(scale=current_scale)
-                
-                self.scaler.step(optimizer)
-                self.scaler.update()
-                
-                # 4. METRICS & LOGGING
-                losses += loss.item()
-                ce_losses += ce_loss.item()      # Cộng dồn CE
-                kl_losses += batch_kl.item()     # Cộng dồn KL
-                
-                _, preds = torch.max(logits_final, dim=1)
-                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-                total += len(targets)
-                
-                del inputs, targets, loss, logits_final, batch_kl
-
-                # In bảng Noise mỗi 50 batch
-                if i % 50 == 0:
-                     if self.cur_task > 0 or (self.cur_task == 0 and epoch == epochs - 1):
-                        self.print_noise_status()
-
-            scheduler.step()
-            train_acc = 100. * correct / total
-
-            # [HIỂN THỊ CHI TIẾT LOSS]
-            # L: Tổng | CE: CrossEntropy (Dự đoán) | KL: IB Loss (Nén)
-            info = "T {} | Ep {} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
-                self.cur_task, epoch + 1, 
-                losses / len(train_loader), 
-                ce_losses / len(train_loader),
-                kl_losses / len(train_loader),
-                train_acc
-            )
-            self.logger.info(info)
-            prog_bar.set_description(info)
-            
-            if epoch % 5 == 0:
-                self._clear_gpu()
-    
     
     def print_noise_status(self):
         print("\n" + "="*85)
