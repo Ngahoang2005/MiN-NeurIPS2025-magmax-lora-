@@ -116,9 +116,9 @@ class PiNoise(nn.Module):
 
     def update_noise(self):
         """Unfreeze trainable parts for new task"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
-
+        # SỬA MU VÀ SIGMA THÀNH FC_MU VÀ FC_RHO
+        for param in self.fc_mu.parameters(): param.requires_grad = True
+        for param in self.fc_rho.parameters(): param.requires_grad = True
     def unfreeze_task_0(self):
         """Task 0: Train everything"""
         for param in self.parameters(): param.requires_grad = True
