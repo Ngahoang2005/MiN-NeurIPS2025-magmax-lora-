@@ -64,12 +64,12 @@ class MinNet(object):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     def _snapshot_local_weights(self):
-        """Lưu toàn bộ trọng số của Noise Generator (Cả Mu và Rho)"""
+        """Lưu toàn bộ trọng số của Noise Generator (Cả mu và sigma)"""
         self.old_noise_weights = []
         for block in self._network.backbone.noise_maker:
             self.old_noise_weights.append({
-                'mu': block.fc_mu.weight.detach().clone(),
-                'rho': block.fc_rho.weight.detach().clone()
+                'mu': block.mu.weight.detach().clone(),
+                'sigma': block.sigma.weight.detach().clone()
             })
     def after_train(self, data_manger):
         if self.cur_task == 0:
