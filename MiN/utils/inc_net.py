@@ -208,19 +208,7 @@ class MiNbaseNet(nn.Module):
         
         logits = self.normal_fc(hyper_features)['logits']
         return {"logits": logits}
-    def collect_projections(self, mode='threshold', val=0.95):
-        """
-        Duyệt qua các lớp PiNoise và tính toán ma trận chiếu.
-        """
-        print(f"--> [IncNet] Collecting Projections (Mode: {mode}, Val: {val})...")
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].compute_projection_matrix(mode=mode, val=val)
-    def apply_gpm_to_grads(self, scale=1.0):
-        """
-        Thực hiện chiếu trực giao gradient cho mu và sigma.
-        """
-        for j in range(self.backbone.layer_num):
-            self.backbone.noise_maker[j].apply_gradient_projection(scale=scale)
+    
     def forward_with_ib(self, x):
         """
         [FIXED] Forward với IB, thêm logic lấy [CLS] token cho ViT.

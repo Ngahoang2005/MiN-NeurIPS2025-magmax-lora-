@@ -139,26 +139,7 @@ class PiNoise(nn.Module):
         self.history_mu.append(mu_state)
         self.history_sigma.append(sigma_state)
         
-        # MagMax Merge
-        self._perform_magmax_merge()
-
-    def _perform_magmax_merge(self):
-        if not self.history_mu: return
-
-        def get_merged_state(history_list):
-            keys = history_list[0].keys()
-            merged_dict = {}
-            for key in keys:
-                stacked = torch.stack([d[key] for d in history_list], dim=0)
-                magnitudes = torch.abs(stacked)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_param = torch.gather(stacked, 0, max_indices).squeeze(0)
-                merged_dict[key] = best_param.to(self.w_down.device)
-            return merged_dict
-
-        self.mu.load_state_dict(get_merged_state(self.history_mu))
-        self.sigma.load_state_dict(get_merged_state(self.history_sigma))
-
+      
     def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
         x_down = hyper_features @ self.w_down
@@ -198,101 +179,7 @@ class PiNoise(nn.Module):
             # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
             return out
     
-    def apply_gradient_projection(self, scale=1.0):
-        """
-        GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
-        scale = 1.0: Strict GPM (Bảo vệ tuyệt đối)
-        scale < 1.0 (ví dụ 0.85): Cho phép mượn 15% không gian cũ
-        """
-        if self.core_U.shape[1] == 0: return
-        
-        with torch.no_grad():
-            U = self.core_U 
-            def project_grad(weight):
-                if weight.grad is not None:
-                    g_inner = weight.grad @ U 
-                    g_proj = g_inner @ U.t()
-                    
-                    # [QUAN TRỌNG: SỬA TẠI ĐÂY]
-                    # Nhân với scale để cho phép nới lỏng ràng buộc
-                    weight.grad -= (g_proj * scale)
-
-            project_grad(self.mu.weight)
-            project_grad(self.sigma.weight)
-
-    def compute_projection_matrix(self, mode='threshold', val=0.95):
-        """
-        Tính SVD trên Covariance Matrix.
-        Args:
-            mode: 'eigenvalue' (Cắt theo tỷ lệ S[i]/S[0]), 'threshold' (Cumsum energy)
-            val: Epsilon hoặc Ratio tương ứng.
-        """
-        if not self.feature_cache: return
-        
-        device = 'cpu' # Tiết kiệm VRAM tối đa
-        correlation_matrix = torch.zeros(self.hidden_dim, self.hidden_dim).to(device)
-        
-        for batch in self.feature_cache:
-            b = batch.to(device)
-            if b.dim() > 2: b = b.reshape(-1, b.shape[-1])
-            correlation_matrix += b.t() @ b
-            del b
-            
-        self.feature_cache = []
-        gc.collect()
-
-        # 2. SVD
-        try:
-            U, S, _ = torch.linalg.svd(correlation_matrix)
-        except:
-            U, S, _ = torch.svd(correlation_matrix)
-        
-        # 3. CHỌN K
-        if mode == 'eigenvalue':
-            max_s = S[0]
-            if max_s == 0: k = 0
-            else:
-                relative_S = S / max_s
-                k = (relative_S > val).sum().item()
-            print(f"--> GPM Selection (Eigenvalue > {val}): Found {k} dims.")
-
-        elif mode == 'threshold':
-            total_var = torch.sum(S)
-            s_cumsum = torch.cumsum(S, dim=0)
-            k = torch.searchsorted(s_cumsum, total_var * val).item()
-            if k == 0 and total_var > 0: k = 1
-            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
-            
-        else: # ratio
-            k = max(1, int(self.hidden_dim * val))
-            print(f"--> GPM Selection (Fixed Ratio {val}): Need {k} dims.")
-
-        # =================================================================
-        # 4. SAFETY MARGIN (BẮT BUỘC)
-        # Giữ lại khoảng trống nhỏ (ví dụ 12 chiều) để task mới luôn có chỗ học
-        # dù Core Space đã đầy.
-        # =================================================================
-        MARGIN = 12 
-        MAX_ALLOWED_RANK = self.hidden_dim - MARGIN # 192 - 12 = 180
-        
-        # Cắt bớt nếu vượt quá trần
-        k = min(k, MAX_ALLOWED_RANK)
-        
-        # 5. Update Memory
-        U_new = U[:, :k+1].to(self.core_U.device)
-
-        if self.core_U.shape[1] == 0:
-            self.core_U = U_new
-        else:
-            combined = torch.cat([self.core_U, U_new], dim=1)
-            U_final, _, _ = torch.linalg.svd(combined, full_matrices=False)
-            
-            # Giới hạn tổng rank không vượt quá MAX_ALLOWED_RANK
-            final_k = min(U_final.shape[1], MAX_ALLOWED_RANK)
-            self.core_U = U_final[:, :final_k]
-
-        print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
-
+   
 
 
 
