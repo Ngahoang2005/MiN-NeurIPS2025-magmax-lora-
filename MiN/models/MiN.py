@@ -242,6 +242,7 @@ class MinNet(object):
         params = filter(lambda p: p.requires_grad, self._network.parameters())
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
+        print(f"DEBUG: Optimizer is tracking {len(optimizer.param_groups[0]['params'])} parameters.")
 
         prog_bar = tqdm(range(epochs))
         self._network.train()
@@ -305,6 +306,16 @@ class MinNet(object):
                 # [XÓA] Xóa đoạn unscale và apply_gpm_to_grads đi!
                 
                 self.scaler.step(optimizer)
+                # Sau lệnh self.scaler.update() trong hàm run()
+                if i % 100 == 0: # Cứ 100 batch in 1 lần
+                    with torch.no_grad():
+                        mu_weight = self._network.backbone.noise_maker[0].fc_mu.weight
+                        mu_grad = mu_weight.grad
+                        
+                        weight_norm = torch.norm(mu_weight).item()
+                        grad_norm = torch.norm(mu_grad).item() if mu_grad is not None else 0.0
+                        
+                        print(f"\n[Weight Check L0] Norm: {weight_norm:.6f} | Grad: {grad_norm:.6e}")
                 self.scaler.update()
                 
                 # METRICS & LOGGING
