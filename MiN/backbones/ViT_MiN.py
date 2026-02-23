@@ -66,7 +66,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gc
-
 class PiNoise(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=192):
         super(PiNoise, self).__init__()
@@ -95,6 +94,21 @@ class PiNoise(nn.Module):
         self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
         
         self.feature_cache = [] 
+        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
+        self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
+        
+        # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
+        # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
+        nn.init.constant_(self.fc_rho.weight, 0.)
+        nn.init.constant_(self.fc_rho.bias, -5.0) 
+        
+        nn.init.constant_(self.fc_mu.weight, 0.)
+        nn.init.constant_(self.fc_mu.bias, 0.)
+
+        # [AN TOÀN 2] Learnable Scaling Factor
+        # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
+        self.noise_scale = nn.Parameter(torch.tensor(0.1))
+        self.last_debug_info = {}
 
     def _init_zero(self, module):
         torch.nn.init.constant_(module.weight, 0.)
@@ -145,22 +159,45 @@ class PiNoise(nn.Module):
         self.mu.load_state_dict(get_merged_state(self.history_mu))
         self.sigma.load_state_dict(get_merged_state(self.history_sigma))
 
-    def forward(self, hyper_features, new_forward=False):
+    def forward(self, hyper_features, return_kl=False):
         # 1. Down Projection
-        x_down = hyper_features @ self.w_down 
+        x_down = hyper_features @ self.w_down
         
-        # 2. Caching for GPM
+        # 2. Variational Encoding
+        mu = self.fc_mu(x_down)
+        sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
+        
         if self.training:
-            # Cache vừa đủ để tính SVD, không cần quá nhiều gây OOM
-            if len(self.feature_cache) < 50: 
-                self.feature_cache.append(x_down.detach().cpu().float())
+            epsilon = torch.randn_like(sigma)
+            z = mu + sigma * epsilon
+        else:
+            z = mu 
         
-        # 3. Generate Noise
-        noise = self.mu(x_down) + self.sigma(x_down)
-        
-        # 4. Add Noise & Up Projection
-        return hyper_features + (noise @ self.w_up)
-
+        # 3. Noise Injection
+        noise_projected = z @ self.w_up
+        effective_noise = self.noise_scale * noise_projected
+        out = hyper_features + effective_noise
+        if self.training:
+            with torch.no_grad():
+                # Tính norm trung bình trên chiều cuối cùng (dim=-1)
+                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
+                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
+                
+                self.last_debug_info = {
+                    "signal": sig_norm,
+                    "noise": noise_norm,
+                    "snr": sig_norm / (noise_norm + 1e-9),
+                    "sigma": sigma.mean().item(),
+                    "scale": self.noise_scale.item()
+                }
+        # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
+        if return_kl:
+            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
+            return out, kl_div.mean()
+        else:
+            # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
+            return out
+    
     def apply_gradient_projection(self, scale=1.0):
         """
         GPM Scaled (SGP): g_new = g - scale * (g @ U) @ U.T
@@ -223,7 +260,8 @@ class PiNoise(nn.Module):
             total_var = torch.sum(S)
             s_cumsum = torch.cumsum(S, dim=0)
             k = torch.searchsorted(s_cumsum, total_var * val).item()
-            print(f"--> GPM Selection (Energy {val}): Need {k} dims.")
+            if k == 0 and total_var > 0: k = 1
+            print(f"--> GPM Selection (Energy {val*100}%): Need {k} dims.", flush=True)
             
         else: # ratio
             k = max(1, int(self.hidden_dim * val))
@@ -255,6 +293,73 @@ class PiNoise(nn.Module):
 
         print(f"GPM Updated: Core Rank = {self.core_U.shape[1]}/{self.hidden_dim} (Max Cap: {MAX_ALLOWED_RANK})")
 
+
+
+
+class Attention(nn.Module):
+    fused_attn: Final[bool]
+
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: nn.Module = nn.LayerNorm,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = use_fused_attn()
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+
+class LayerScale(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            init_values: float = 1e-5,
+            inplace: bool = False,
+    ) -> None:
+        super().__init__()
+        self.inplace = inplace
+        self.gamma = nn.Parameter(init_values * torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
