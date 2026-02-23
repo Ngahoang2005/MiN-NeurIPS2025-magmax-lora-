@@ -146,20 +146,34 @@ class PiNoise(nn.Module):
 
     # [NEW] Hàm snapshot trọng số mu cũ để làm mốc phạt
     def snapshot_old_weights(self):
-        self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach()
-
+    # Đảm bảo cùng device và dtype với fc_mu.weight hiện tại
+        self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach().to(
+            device=self.fc_mu.weight.device,
+            dtype=self.fc_mu.weight.dtype
+    )
     # [NEW] Hàm tính Soft Orthogonal Penalty
     def compute_soft_ortho_penalty(self):
-        if self.core_U.shape[1] == 0 or self.old_fc_mu_weight is None:
-            return torch.tensor(0.0, device=self.fc_mu.weight.device)
+    # 1. Kiểm tra xem đã có bộ nhớ GPM chưa
+    if self.core_U.shape[1] == 0:
+        # Nếu dòng này in ra ở Task 1, nghĩa là SVD Task 0 bị xịt
+        # print("DEBUG: core_U is EMPTY!") 
+        return torch.tensor(0.0, device=self.fc_mu.weight.device)
         
-        # Delta W = W_new - W_old
-        delta_W = self.fc_mu.weight - self.old_fc_mu_weight
-        # Chiếu Delta W lên không gian U_core: (Delta W @ U_core)
-        projection = delta_W @ self.core_U
-        # Lấy Frobenius norm bình phương
-        penalty = torch.sum(projection ** 2)
-        return penalty
+    if self.old_fc_mu_weight is None:
+        # Nếu dòng này in ra, nghĩa là chưa gọi snapshot_noise_weights
+        # print("DEBUG: old_weight is NONE!")
+        return torch.tensor(0.0, device=self.fc_mu.weight.device)
+    
+    delta_W = self.fc_mu.weight - self.old_fc_mu_weight
+    
+    # 2. Kiểm tra xem trọng số có nhúc nhích tí nào không
+    # weight_change = torch.norm(delta_W).item()
+    # if weight_change < 1e-9:
+    #    print("DEBUG: Weight is NOT moving!")
+
+    projection = delta_W @ self.core_U
+    penalty = torch.sum(projection ** 2)
+    return penalty
 
     def forward(self, hyper_features, return_kl=False):
         x_down = hyper_features @ self.w_down
