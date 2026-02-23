@@ -266,6 +266,9 @@ class PiNoise(nn.Module):
                 self.core_U = self.core_U[:, :MAX_ALLOWED_RANK]
                 
             print(f"--> GPM Task mới: Thêm {k+1} chiều. Core Rank = {self.core_U.shape[1]}/{self.hidden_dim}")
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 

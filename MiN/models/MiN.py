@@ -198,6 +198,7 @@ class MinNet(object):
                                         num_workers=self.num_workers)
         
         self._clear_gpu()
+        self._network.snapshot_noise_weights()
         self.run(train_loader_sgd)
         
      
