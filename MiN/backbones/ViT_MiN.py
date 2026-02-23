@@ -100,7 +100,8 @@ class PiNoise(nn.Module):
         # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
         # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
         nn.init.constant_(self.fc_rho.weight, 0.)
-        nn.init.constant_(self.fc_rho.bias, -5.0) 
+        # Trong __init__ của PiNoise
+        nn.init.constant_(self.fc_rho.bias, -3.0) # Softplus(-3) ~= 0.048 
         
         nn.init.constant_(self.fc_mu.weight, 0.)
         nn.init.constant_(self.fc_mu.bias, 0.)
