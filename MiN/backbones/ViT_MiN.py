@@ -146,11 +146,8 @@ class PiNoise(nn.Module):
 
     # [NEW] Hàm snapshot trọng số mu cũ để làm mốc phạt
     def snapshot_old_weights(self):
-    # Đảm bảo cùng device và dtype với fc_mu.weight hiện tại
-        self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach().to(
-            device=self.fc_mu.weight.device,
-            dtype=self.fc_mu.weight.dtype
-    )
+        self.old_fc_mu_weight = self.fc_mu.weight.data.clone().detach().float()
+        print(f"[SNAPSHOT] fc_mu weight norm = {self.old_fc_mu_weight.norm().item():.6f}")
     # [NEW] Hàm tính Soft Orthogonal Penalty
     def compute_soft_ortho_penalty(self):
         if self.core_U.shape[1] == 0:
