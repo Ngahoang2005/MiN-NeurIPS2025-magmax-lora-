@@ -343,7 +343,7 @@ class MinNet(object):
 
         WARMUP_EPOCHS = 2
         max_beta = 1e-4 # [LƯU Ý] Chỉnh lại max_beta tùy ý bạn (1e-4 hoặc 1e-5)
-        LAMBDA_ORTHO = 1
+        LAMBDA_ORTHO = 1000
         for _, epoch in enumerate(prog_bar):
             losses = 0.0
             ce_losses = 0.0 # Theo dõi riêng CE
@@ -402,7 +402,7 @@ class MinNet(object):
                 
                 if self.cur_task > 0 and epoch >= WARMUP_EPOCHS:
                     self.scaler.unscale_(optimizer)
-                    self._network.apply_gpm_to_grads(scale=current_scale)
+                    
                 
                 self.scaler.step(optimizer)
                 self.scaler.update()
