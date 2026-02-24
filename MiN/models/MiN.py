@@ -285,12 +285,10 @@ class MinNet(object):
 
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
                 optimizer.zero_grad(set_to_none=True)
                 
-                # [NEW] MANG AUTOCAST TRỞ LẠI (TĂNG TỐC x2)
+                # 1. CHỈ BỌC AUTOCAST Ở ĐOẠN FORWARD ĐỂ TĂNG TỐC
                 with autocast('cuda'):
-                    # 1. Forward với IB (Sinh KL Loss)
                     if self.cur_task > 0:
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
@@ -300,46 +298,54 @@ class MinNet(object):
                     else:
                         logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                    # 2. CE Loss
-                    ce_loss = F.cross_entropy(logits_final, targets.long())
-                    
-                    # 3. Ortho Loss (Tối ưu ép kiểu)
-                    # =================================================================
-                    # TÍNH ORTHO TRÊN TRỌNG SỐ TỪ MODULE LIST (Không cần old_dict)
-                    # =================================================================
-                    batch_ortho = 0.0
-                    if self.cur_task > 0:
-                        for block in self._network.backbone.noise_maker:
-                            # 1. Lấy trọng số của Task HIỆN TẠI (vị trí -1 trong list)
-                            w_mu_curr = block.mu[-1].weight.float()
-                            w_sigma_curr = block.sigma[-1].weight.float()
+                # 2. RÚT RA NGOÀI AUTOCAST, TÍNH BẰNG FLOAT32 ĐỂ CHỐNG NAN
+                logits_final = logits_final.float()
+                ce_loss = F.cross_entropy(logits_final, targets.long())
+                
+                # TÍNH ORTHO TRÊN TRỌNG SỐ TỪ MODULE LIST BẰNG TORCH.SUM
+                batch_ortho = 0.0
+                if self.cur_task > 0:
+                    for block in self._network.backbone.noise_maker:
+                        w_mu_curr = block.mu[-1].weight.float()
+                        w_sigma_curr = block.sigma[-1].weight.float()
+                        
+                        for task_idx in range(len(block.mu) - 1):
+                            w_mu_old = block.mu[task_idx].weight.detach().float()
+                            w_sigma_old = block.sigma[task_idx].weight.detach().float()
                             
-                            # 2. Lặp qua tất cả các Task CŨ trong lịch sử (từ 0 đến n-1)
-                            for task_idx in range(len(block.mu) - 1):
-                                w_mu_old = block.mu[task_idx].weight.detach().float()
-                                w_sigma_old = block.sigma[task_idx].weight.detach().float()
-                                
-                                # Tính trực giao
-                                batch_ortho += torch.mean(torch.matmul(w_mu_curr, w_mu_old.t()).pow(2))
-                                batch_ortho += torch.mean(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
-                    # 4. Total Loss
-                    # loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
-                    loss = ce_loss + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 and torch.is_tensor(batch_ortho) else 0.0)
-                # [NEW] BACKWARD BẰNG SCALER
+                            # DÙNG SUM thay vì MEAN
+                            batch_ortho += torch.sum(torch.matmul(w_mu_curr, w_mu_old.t()).pow(2))
+                            batch_ortho += torch.sum(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
+
+                # Đảm bảo không bị lỗi kiểu dữ liệu
+                batch_kl_float = batch_kl.float() if torch.is_tensor(batch_kl) else float(batch_kl)
+                
+                # GOM LOSS CHUẨN XÁC
+                LAMBDA_ORTHO = 0.01 
+                loss = ce_loss + beta_current * batch_kl_float + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 and torch.is_tensor(batch_ortho) else 0.0)
+
+                # 3. BACKWARD AN TOÀN
                 scaler.scale(loss).backward()
+                
+                # Clip gradient chống nổ số
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=2.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 
+                # LOGGING
                 losses += loss.item()
                 ce_losses += ce_loss.item()
-                kl_losses += batch_kl.item()
+                kl_losses += float(batch_kl_float)
                 if self.cur_task > 0 and torch.is_tensor(batch_ortho):
-                    ortho_losses += (LAMBDA_ORTHO * batch_ortho).item()
+                    ortho_losses += (LAMBDA_ORTHO * float(batch_ortho))
 
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
 
+            # ... (Đoạn scheduler.step() và print info bên dưới bác giữ nguyên) ...
             scheduler.step()
             train_acc = 100. * correct / total
 
