@@ -105,7 +105,7 @@ class PiNoise(torch.nn.Linear):
         self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
         self.base_sig_sd = {k: v.detach().clone() for k, v in self.sigmma.state_dict().items()}
         self.history_tau_mu = []; self.history_tau_sig = []
-
+        self.register_buffer('basis', None)
     def after_task_training(self):
         """Hàm MagMax chốt sổ sau mỗi task"""
         t_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}

@@ -142,6 +142,7 @@ class MinNet(object):
         for block in self._network.backbone.noise_maker:
             if hasattr(block, 'after_task_training'):
                 block.after_task_training()
+        self.update_subspace(train_loader)
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
@@ -208,7 +209,7 @@ class MinNet(object):
         for block in self._network.backbone.noise_maker:
             if hasattr(block, 'after_task_training'):
                 block.after_task_training()
-            
+        self.update_subspace(train_loader)
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
@@ -302,31 +303,31 @@ class MinNet(object):
             losses = 0.0
             correct, total = 0, 0
 
+            # --- Trong Min.py, hàm run ---
             for i, (_, inputs, targets) in enumerate(train_loader):
                 inputs, targets = inputs.to(self.device), targets.to(self.device)
-                
-                # [ADDED] set_to_none=True tiết kiệm RAM hơn
-                optimizer.zero_grad(set_to_none=True) 
+                optimizer.zero_grad(set_to_none=True)
 
-                # [ADDED] Autocast để giảm 50% VRAM khi train
                 with autocast('cuda'):
-                    if self.cur_task > 0:
-                        with torch.no_grad():
-                            outputs1 = self._network(inputs, new_forward=False)
-                            logits1 = outputs1['logits']
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
-                    else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
+                    logits_final = self._network(inputs)['logits']
+                    loss = F.cross_entropy(logits_final, targets.long())
 
-                # [ADDED] Backward với Scaler
                 self.scaler.scale(loss).backward()
+                
+                # [QUAN TRỌNG]: Giải nén gradient để project chính xác
+                self.scaler.unscale_(optimizer) 
+                
+                # Thực hiện Gradient Projection cho từng Layer
+                for block in self._network.backbone.noise_maker:
+                    if hasattr(block, 'basis') and block.basis is not None:
+                        # U là ma trận basis [Dim, K], ta project không gian đầu vào (input space)
+                        # g_proj = g - g @ (U @ U.T)
+                        U = block.basis
+                        for param in [block.mu.weight, block.sigmma.weight]:
+                            if param.grad is not None:
+                                # Phép chiếu gradient: đảm bảo dW không thay đổi output ở các hướng cũ
+                                param.grad.data -= param.grad.data @ (U @ U.t())
+
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
@@ -355,7 +356,38 @@ class MinNet(object):
             # [ADDED] Clear cache sau mỗi epoch
             if epoch % 5 == 0:
                 self._clear_gpu()
+    def update_subspace(self, train_loader):
+        self._network.eval()
+        all_features = []
+        with torch.no_grad():
+            # Chỉ lấy 1 lượng nhỏ dữ liệu để lấy "mẫu" không gian đặc trưng
+            for i, (_, inputs, _) in enumerate(train_loader):
+                if i > 20: break 
+                # Lấy đặc trưng đầu vào của Adapter (x_down)
+                # Bác có thể dùng hook hoặc trích xuất feature tùy kiến trúc
+                feat = self._network.extract_feature(inputs.to(self.device))
+                all_features.append(feat.cpu())
+                
+        mat = torch.cat(all_features, dim=0).t() # [Dim, N]
+        # SVD để tìm basis
+        U, S, V = torch.svd(mat)
+        
+        # Giữ lại basis đại diện cho 99% phương sai
+        threshold = 0.99
+        s_sq = S.pow(2)
+        energy = torch.cumsum(s_sq, dim=0) / s_sq.sum()
+        k = (energy < threshold).sum().item() + 1
+        new_u = U[:, :k].to(self.device)
 
+        # Cập nhật basis cho các layer (Hợp nhất với basis cũ)
+        for block in self._network.backbone.noise_maker:
+            if block.basis is None:
+                block.basis = new_u
+            else:
+                # Concatenate và Orthogonalize để mở rộng subspace
+                combined = torch.cat([block.basis, new_u], dim=1)
+                u_comb, _, _ = torch.svd(combined)
+                block.basis = u_comb[:, :min(u_comb.size(1), block.hidden_dim - 1)]
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
