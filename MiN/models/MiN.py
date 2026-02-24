@@ -317,16 +317,7 @@ class MinNet(object):
                 # [QUAN TRỌNG]: Giải nén gradient để project chính xác
                 self.scaler.unscale_(optimizer) 
                 
-                # Thực hiện Gradient Projection cho từng Layer
-                for block in self._network.backbone.noise_maker:
-                    if hasattr(block, 'basis') and block.basis is not None:
-                        # U là ma trận basis [Dim, K], ta project không gian đầu vào (input space)
-                        # g_proj = g - g @ (U @ U.T)
-                        U = block.basis
-                        for param in [block.mu.weight, block.sigmma.weight]:
-                            if param.grad is not None:
-                                # Phép chiếu gradient: đảm bảo dW không thay đổi output ở các hướng cũ
-                                param.grad.data -= param.grad.data @ (U @ U.t())
+              
 
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -358,21 +349,20 @@ class MinNet(object):
                 self._clear_gpu()
     
     
-    
     def update_subspace(self, train_loader):
         self._network.eval()
-        all_features = []
+        features = []
         with torch.no_grad():
             for i, (_, inputs, _) in enumerate(train_loader):
-                if i > 20: break 
-                # Lấy đặc trưng 768-d trước khi đi vào PiNoise
+                if i > 10: break # Lấy mẫu ít thôi cho nhanh
+                # Trích xuất hyper_features (768-d)
                 feat = self._network.extract_feature(inputs.to(self.device))
-                all_features.append(feat.cpu())
-                
-        mat = torch.cat(all_features, dim=0).t() # [768, N]
-        U, S, V = torch.svd(mat)
+                features.append(feat.cpu())
         
-        # Giữ lại 99% phương sai
+        X = torch.cat(features, dim=0).t() # [768, N]
+        U, S, V = torch.svd(X)
+        
+        # Lấy Basis đại diện 99% phương sai
         k = (torch.cumsum(S**2, dim=0) / torch.sum(S**2) < 0.99).sum().item() + 1
         new_basis = U[:, :k].to(self.device)
 
@@ -381,13 +371,8 @@ class MinNet(object):
                 block.basis = new_basis
             else:
                 # Hợp nhất không gian cũ và mới
-                combined = torch.cat([block.basis, new_basis], dim=1)
-                u_comb, _, _ = torch.svd(combined)
-                # Khóa không gian: không để vượt quá 768
-                block.basis = u_comb[:, :min(u_comb.size(1), 767)]
+                block.basis = torch.svd(torch.cat([block.basis, new_basis], dim=1))[0][:, :767]
         
-        
-    
     
     def eval_task(self, test_loader):
         model = self._network.eval()

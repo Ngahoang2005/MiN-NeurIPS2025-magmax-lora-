@@ -126,16 +126,18 @@ class PiNoise(torch.nn.Linear):
         x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
         
-        # 1. Tính noise thô (Raw Noise)
+        # 1. Tính Noise thô
         noise = (self.mu(x_down) + self.sigmma(x_down)) @ self.w_up
         
-        # 2. Chiếu trực giao (Orthogonal Projection) 768-d
-        if self.basis is not None:
-            # Công thức: noise = noise - noise @ U @ U^T
-            # Giúp triệt tiêu mọi thành phần noise trùng với không gian Task cũ
-            projection = (noise @ self.basis) @ self.basis.t()
-            noise = noise - projection
+        # 2. ACTIVATION PROJECTION (Option 1)
+        # Chiếu trực tiếp trên output 768-d trước khi cộng vào x1
+        if hasattr(self, 'basis') and self.basis is not None:
+            # Công thức: h = h - (h @ U) @ U.T
+            # U là basis 768-d
+            proj = (noise @ self.basis) @ self.basis.t()
+            noise = noise - proj
             
+        return x1 + noise + hyper_features
         return x1 + noise + hyper_features
     def reset_to_base(self):
         """Đưa trọng số về trạng thái 'nguyên thủy' trước khi học Task mới"""
