@@ -66,124 +66,108 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import gc
-class PiNoise(nn.Module):
-    def __init__(self, in_dim, out_dim, hidden_dim=192):
-        super(PiNoise, self).__init__()
-        
-        # --- Shared Fixed Parts (LoRA-style) ---
-        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.w_down)
-        
-        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        nn.init.xavier_uniform_(self.w_up)
-        
+
+class PiNoise(torch.nn.Linear):
+    def __init__(self, in_dim, out_dim, hidden_dim=384):
+        super(torch.nn.Linear, self).__init__()
+
+        self.bias = None
+
+        self.MLP = nn.Linear(in_dim, out_dim)
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
+
+        device = torch.device("cuda:{}".format(0))
+        factory_kwargs = {"device": device, "dtype": torch.float}
+
         self.hidden_dim = hidden_dim
-        
-        # --- Trainable Parts (MagMax targets) ---
-        self.mu = nn.Linear(hidden_dim, hidden_dim)
-        self.sigma = nn.Linear(hidden_dim, hidden_dim)
-        self._init_zero(self.mu)
-        self._init_zero(self.sigma)
-        
-        # --- History for MagMax ---
-        self.history_mu = []    
-        self.history_sigma = [] 
-        
-        # --- GPM Buffers ---
-        # Lưu U_core: Basis của không gian đặc trưng quan trọng [Hidden, Rank]
-        self.register_buffer('core_U', torch.zeros(hidden_dim, 0))  
-        
-        self.feature_cache = [] 
-        self.fc_mu = nn.Linear(hidden_dim, hidden_dim)
-        self.fc_rho = nn.Linear(hidden_dim, hidden_dim)
-        
-        # [AN TOÀN 1] Khởi tạo Bias âm để Sigma bắt đầu cực nhỏ
-        # Softplus(-5) ~= 0.006. Nhiễu khởi đầu gần như bằng 0.
-        nn.init.constant_(self.fc_rho.weight, 0.)
-        # Trong __init__ của PiNoise
-        nn.init.constant_(self.fc_rho.bias, -3.0) # Softplus(-3) ~= 0.048 
-        
-        nn.init.constant_(self.fc_mu.weight, 0.)
-        nn.init.constant_(self.fc_mu.bias, 0.)
 
-        # [AN TOÀN 2] Learnable Scaling Factor
-        # Dù phân phối bên trong có chuẩn hóa, ta vẫn có quyền thu nhỏ nó lại
-        self.noise_scale = nn.Parameter(torch.tensor(0.1))
-        self.last_debug_info = {}
+        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_down)
 
-    def _init_zero(self, module):
-        torch.nn.init.constant_(module.weight, 0.)
-        torch.nn.init.constant_(module.bias, 0.)
+        self.reset_parameters()
+
+        self.act = nn.GELU()
+
+        self.mu = nn.ModuleList()
+        self.sigmma = nn.ModuleList()
+
+        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_up)
+        self.reset_parameters()
+
+        self.weight_noise = None
 
     def update_noise(self):
-        """Unfreeze trainable parts for new task"""
-        # SỬA MU VÀ SIGMA THÀNH FC_MU VÀ FC_RHO
-        for param in self.fc_mu.parameters(): param.requires_grad = True
-        for param in self.fc_rho.parameters(): param.requires_grad = True
-    def unfreeze_task_0(self):
-        """Task 0: Train everything"""
-        for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    def unfreeze_incremental(self):
-        """Task > 0: Train noise only"""
-        self.update_noise()
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    def after_task_training(self):
-        # Snapshot
-        mu_state = {k: v.detach().cpu().clone() for k, v in self.mu.state_dict().items()}
-        sigma_state = {k: v.detach().cpu().clone() for k, v in self.sigma.state_dict().items()}
+        # [NEW] Gán bias của sigmma = -3.0 để chống chết gradient
+        self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+        torch.nn.init.constant_(self.mu[-1].weight, 0.)
+        torch.nn.init.constant_(self.mu[-1].bias, 0.)
         
-        self.history_mu.append(mu_state)
-        self.history_sigma.append(sigma_state)
-        
-      
+        self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+        torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+        torch.nn.init.constant_(self.sigmma[-1].bias, -3.0)
+    def init_weight_noise(self, prototypes):
+        if len(prototypes) <= 1:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+        else:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+            weight = torch.ones(len(self.mu))
+            for i in range(len(prototypes)):
+                mu_t = prototypes[-1]
+                mu_i = prototypes[i]
+                dot_product = torch.dot(mu_t, mu_i)
+                norm_t = torch.norm(mu_t)
+                norm_i = torch.norm(mu_i)
+                s_i = dot_product / (norm_t * norm_i)
+                weight[i] = s_i.detach().clone()
+            weight = torch.softmax(weight, dim=-1)
+            self.weight_noise = weight
+            self.weight_noise.requires_grad = True
+            
+    def unfreeze_noise(self):
+        for param in self.mu[-1].parameters():
+            param.requires_grad = True
+        for param in self.sigmma[-1].parameters():
+            param.requires_grad = True
+
     def forward(self, hyper_features, return_kl=False):
-        # 1. Down Projection
+        x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
         
-        # 2. Variational Encoding
-        mu = self.fc_mu(x_down)
-        sigma = F.softplus(self.fc_rho(x_down)) + 1e-6 
+        noise = None
+        total_kl = 0.0
+
+        for i in range(len(self.mu)):
+            mu = self.mu[i](x_down)
+            # [NEW] Dùng softplus để đảm bảo sigma > 0 (chuẩn VAE)
+            sigma = F.softplus(self.sigmma[i](x_down)) + 1e-6 
+            
+            # [NEW] KL Loss và nhiễu chỉ bật trên Task ĐANG TRAIN (task cuối)
+            if self.training and i == len(self.mu) - 1:
+                eps = torch.randn_like(sigma)
+                z = mu + sigma * eps
+                kl = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
+                total_kl = kl.mean()
+            else:
+                z = mu # Quá khứ đóng băng, chỉ xuất Mean
+
+            # An toàn nếu weight_noise chưa được init (ví dụ: epoch đầu Task 0)
+            w = 1.0 if self.weight_noise is None else self.weight_noise[i]
+
+            if noise is None:
+                noise = z * w
+            else:
+                noise += z * w
+
+        noise = noise @ self.w_up
+        out = x1 + noise + hyper_features
         
-        if self.training:
-            epsilon = torch.randn_like(sigma)
-            z = mu + sigma * epsilon
-        else:
-            z = mu 
-        
-        # 3. Noise Injection
-        noise_projected = z @ self.w_up
-        effective_noise = self.noise_scale * noise_projected
-        out = hyper_features + effective_noise
-        if self.training:
-            with torch.no_grad():
-                # Tính norm trung bình trên chiều cuối cùng (dim=-1)
-                sig_norm = hyper_features.norm(p=2, dim=-1).mean().item()
-                noise_norm = effective_noise.norm(p=2, dim=-1).mean().item()
-                
-                self.last_debug_info = {
-                    "signal": sig_norm,
-                    "noise": noise_norm,
-                    "snr": sig_norm / (noise_norm + 1e-9),
-                    "sigma": sigma.mean().item(),
-                    "scale": self.noise_scale.item()
-                }
-        # [QUAN TRỌNG] Chỉ trả về Tuple khi được yêu cầu explicitly
-        if return_kl:
-            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma) - mu.pow(2) - sigma.pow(2), dim=1)
-            return out, kl_div.mean()
-        else:
-            # Mặc định chỉ trả về Tensor để không phá vỡ pipeline của Backbone cũ
-            return out
-    
-   
+        if return_kl: return out, total_kl
+        return out
 
-
-
+    def forward_new(self, hyper_features):
+        return self.forward(hyper_features)
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
