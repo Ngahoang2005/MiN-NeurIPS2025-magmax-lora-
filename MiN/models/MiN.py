@@ -58,7 +58,7 @@ class MinNet(object):
         for block in self._network.backbone.noise_maker:
             self.old_noise_weights.append({
                 'mu': block.mu[-1].weight.detach().clone(),      # Trọng số của task vừa học xong
-                'sigma': block.sigmma[-1].weight.detach().clone() 
+                'sigma': block.sigma[-1].weight.detach().clone() 
             })
 
     def after_train(self, data_manger):
