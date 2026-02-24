@@ -77,116 +77,107 @@ class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(torch.nn.Linear, self).__init__()
 
+        self.bias = None
+
+        self.MLP = nn.Linear(in_dim, out_dim)
+        torch.nn.init.constant_(self.MLP.weight, 0)
+        torch.nn.init.constant_(self.MLP.bias, 0)
+
+        device = torch.device("cuda:{}".format(0))
+        factory_kwargs = {"device": device, "dtype": torch.float}
+
         self.hidden_dim = hidden_dim
 
-        # --- Shared Fixed Parts (Down/Up Projection) ---
-        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
-        nn.init.xavier_uniform_(self.w_down)
-        
-        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
-        nn.init.xavier_uniform_(self.w_up)
+        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_down)
 
-        # =====================================================================
-        # [SEQUENTIAL]: CHỈ DÙNG 1 BỘ MU & SIGMA DUY NHẤT
-        # =====================================================================
-        self.mu = nn.Linear(self.hidden_dim, self.hidden_dim)
-        self.sigma = nn.Linear(self.hidden_dim, self.hidden_dim)
-        
-        torch.nn.init.constant_(self.mu.weight, 0.)
-        torch.nn.init.constant_(self.mu.bias, 0.)
-        torch.nn.init.constant_(self.sigma.weight, 0.)
-        torch.nn.init.constant_(self.sigma.bias, 0.0) # Bias=0 để Softplus mồi dốc
-        
-        # =====================================================================
-        # [MAGMAX]: LƯU TRẠNG THÁI GỐC ĐỂ TÍNH TASK VECTOR
-        # =====================================================================
-        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
-        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigma.state_dict().items()}
-        
-        self.history_tau_mu = []    
-        self.history_tau_sigma = [] 
-        
-        self.noise_scale = nn.Parameter(torch.tensor(0.1))
+        self.reset_parameters()
+
+        self.act = nn.GELU()
+
+        self.mu = nn.ModuleList()
+        self.sigmma = nn.ModuleList()
+
+        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
+        self.register_buffer("weight", self.w_up)
+        self.reset_parameters()
+
+        self.weight_noise = None
 
     def update_noise(self):
-        """Mở khóa bộ mu/sigma duy nhất để train đè lên cho Task mới"""
-        for param in self.mu.parameters(): param.requires_grad = True
-        for param in self.sigma.parameters(): param.requires_grad = True
 
-    def unfreeze_noise(self):
-        self.update_noise()
-
-    def unfreeze_task_0(self):
-        """Task 0: Train cả Noise Scale (Các layer Down/Up vẫn đóng băng)"""
-        for param in self.parameters(): param.requires_grad = True
-        self.w_down.requires_grad = False
-        self.w_up.requires_grad = False
-
-    # =====================================================================
-    # [MAGMAX LOGIC]
-    # =====================================================================
-    def after_task_training(self):
-        """Chụp ảnh lại Task Vector và Merge sau mỗi Task"""
-        # 1. Tính Task Vector (Tau = W_current - W_base)
-        tau_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}
-        tau_sigma = {k: self.sigma.state_dict()[k].detach().cpu() - self.base_sigma_sd[k].cpu() for k in self.base_sigma_sd.keys()}
-        
-        self.history_tau_mu.append(tau_mu)
-        self.history_tau_sigma.append(tau_sigma)
-        
-        # 2. Hợp nhất bằng MagMax
-        self._perform_magmax_merge()
-
-    def _perform_magmax_merge(self):
-        if not self.history_tau_mu: return
-
-        def get_merged_state(base_sd, history_tau):
-            merged_dict = {}
-            for key in base_sd.keys():
-                # Lấy giá trị tuyệt đối lớn nhất qua các Task
-                stacked_tau = torch.stack([d[key] for d in history_tau], dim=0)
-                magnitudes = torch.abs(stacked_tau)
-                max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
-                best_tau = torch.gather(stacked_tau, 0, max_indices).squeeze(0)
-                
-                # Ghi đè: W_final = W_base + W_tau_max
-                merged_dict[key] = base_sd[key].to(self.w_down.device) + best_tau.to(self.w_down.device)
-            return merged_dict
-
-        self.mu.load_state_dict(get_merged_state(self.base_mu_sd, self.history_tau_mu))
-        self.sigma.load_state_dict(get_merged_state(self.base_sigma_sd, self.history_tau_sigma))
-
-    # =====================================================================
-    # [FORWARD & VIB LOGIC]
-    # =====================================================================
-    def forward(self, hyper_features, return_kl=False):
-        x_down = hyper_features @ self.w_down
-        
-        mu = self.mu(x_down)
-        sigma = F.softplus(self.sigma(x_down).float()) + 1e-4 
-        
-        if self.training:
-            eps = torch.randn_like(sigma)
-            z = mu + sigma * eps
-            
-            # Tính VIB Loss (KL Divergence)
-            mu_f32 = mu.float()
-            sigma_f32 = sigma.float()
-            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma_f32) - mu_f32.pow(2) - sigma_f32.pow(2), dim=1)
-            total_kl = kl_div.mean()
+        if len(self.mu) == 0:
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[0].weight, 0.)
+            torch.nn.init.constant_(self.mu[0].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[0].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[0].bias, 0.)
         else:
-            z = mu 
-            total_kl = torch.tensor(0.0, device=hyper_features.device)
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[-1].weight, 0.)
+            torch.nn.init.constant_(self.mu[-1].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+    
+    def init_weight_noise(self, prototypes):
+        if len(prototypes) <= 1:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+        else:
+            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
+            weight = torch.ones(len(self.mu))
+            for i in range(len(prototypes)):
+                mu_t = prototypes[-1]
+                mu_i = prototypes[i]
+                dot_product = torch.dot(mu_t, mu_i)
+                norm_t = torch.norm(mu_t)
+                norm_i = torch.norm(mu_i)
+                s_i = dot_product / (norm_t * norm_i)
+                weight[i] = s_i.detach().clone()
+            weight = torch.softmax(weight, dim=-1)
+            self.weight_noise = weight
+            self.weight_noise.requires_grad = True
             
-        z = z.to(hyper_features.dtype)
-        
-        noise = z @ self.w_up
-        out = hyper_features + noise * self.noise_scale
-        
-        if return_kl: return out, total_kl
-        return out
+    def unfreeze_noise(self):
 
+        for param in self.mu[-1].parameters():
+            param.requires_grad = True
+        for param in self.sigmma[-1].parameters():
+            param.requires_grad = True
 
+    def forward(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+
+        x_down = hyper_features @ self.w_down
+
+        noise = None
+
+        for i in range(len(self.mu)):
+            mu = self.mu[i](x_down)
+            sigmma = self.sigmma[i](x_down)
+            if noise is None:
+                noise = (mu + sigmma) * self.weight_noise[i]
+            else:
+                noise += (mu + sigmma) * self.weight_noise[i]
+
+        noise = noise @ self.w_up
+
+        return x1 + noise + hyper_features
+
+    def forward_new(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+
+        x_down = hyper_features @ self.w_down
+
+        mu = self.mu[-1](x_down)
+        sigmma = self.sigmma[-1](x_down)
+
+        noise = (mu + sigmma) * self.weight_noise[-1]
+
+        noise = noise @ self.w_up
+
+        return x1 + noise + hyper_features
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
