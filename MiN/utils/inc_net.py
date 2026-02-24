@@ -142,29 +142,37 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        """Tăng tốc tối đa bằng Batch Accumulation thay vì Iterative Inverse"""
+        # Giữ nguyên Autocast False để đảm bảo độ chính xác
         with autocast(enabled=False):
-            # 1. Trích xuất đặc trưng (Luôn đi qua Backbone có PiNoise)
             X = self.backbone(X).float()
             X = self.buffer(X) 
-            X, Y = X.to(self.device), Y.to(self.device).float()
+            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
 
-            # 2. Quản lý kích thước trọng số (Mở rộng nếu có class mới)
             num_targets = Y.shape[1]
-            if num_targets > self.out_features:
-                self.weight = torch.cat((self.weight, torch.zeros((self.weight.shape[0], num_targets - self.out_features), device=self.device)), dim=1)
-
-            # 3. Tích lũy tri thức (Cực nhanh trên GPU)
-            # Thay vì tính nghịch đảo ma trận R cồng kềnh, ta tính ma trận hiệp biến A và B
-            # Nếu bác muốn giữ nguyên cơ chế R thì dùng đoạn này là tối ưu nhất:
-            I = torch.eye(X.shape[0], device=self.device)
-            # Công thức nhanh: K = (I + X R X^T)^-1
-            K = torch.linalg.solve(I + X @ self.R @ X.T + 1e-6 * I, X @ self.R)
             
-            # Cập nhật R và Weight theo RLS chuẩn nhưng dùng linalg.solve cho tốc độ
-            self.weight += K.T @ (Y - X @ self.weight)
-            self.R -= K.T @ X @ self.R
+            # --- GIỮ NGUYÊN LOGIC GỐC CỦA BÁC ĐỂ CHỐNG LỖI DIMENSION ---
+            if num_targets > self.out_features:
+                # Mở rộng weight khi sang Task mới
+                diff = num_targets - self.out_features
+                self.weight = torch.cat((self.weight, torch.zeros((self.weight.shape[0], diff), device=X.device)), dim=1)
+            elif num_targets < self.out_features:
+                # [ĐÃ THÊM LẠI]: Bù cột 0 cho Y nếu batch thiếu class (Sửa lỗi 4 vs 5)
+                diff = self.out_features - num_targets
+                Y = torch.cat((Y, torch.zeros((Y.shape[0], diff), device=Y.device)), dim=1)
+            # --------------------------------------------------------
 
+            # --- TĂNG TỐC TOÁN HỌC (Dùng solve thay vì inverse) ---
+            XR = X @ self.R 
+            # term = I + X @ R @ X^T
+            term = torch.eye(X.shape[0], device=X.device) + XR @ X.T
+            
+            # Giải hệ phương trình (linalg.solve nhanh hơn inverse 2-3 lần)
+            # K_XR tương đương với R * X^T * (I + X R X^T)^-1
+            K_XR = torch.linalg.solve(term + 1e-6 * torch.eye(X.shape[0], device=X.device), XR) 
+            
+            # Cập nhật R và Weight theo công thức RLS chuẩn
+            self.R -= K_XR.T @ XR
+            self.weight += K_XR.T @ (Y - X @ self.weight)
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
