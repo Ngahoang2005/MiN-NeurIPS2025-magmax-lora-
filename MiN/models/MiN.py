@@ -358,7 +358,8 @@ class MinNet(object):
                 batch_kl_float = batch_kl.float() if torch.is_tensor(batch_kl) else float(batch_kl)
                 
                 # TỔNG LOSS = CrossEntropy + VIB Loss
-                loss = ce_loss + beta_current * batch_kl_float
+                loss = ce_loss 
+                #+ beta_current * batch_kl_float
 
                 # =========================================================
                 # BACKWARD QUA SCALER
