@@ -124,7 +124,7 @@ class MiNbaseNet(nn.Module):
         2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
         """
         # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
-        with autocast('cuda', enabled=False):
+        with torch.autocast('cuda', enabled=False):
             
             # 1. Chuẩn bị dữ liệu (Float32)
             X = X.float().to(self.device)
