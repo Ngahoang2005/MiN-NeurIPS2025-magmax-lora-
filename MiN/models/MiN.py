@@ -375,7 +375,7 @@ class MinNet(object):
         U, S, V = torch.svd(X)
         
         # Lấy Basis đại diện 99% phương sai
-        k = (torch.cumsum(S**2, dim=0) / torch.sum(S**2) < 0.99).sum().item() + 1
+        k = (torch.cumsum(S**2, dim=0) / torch.sum(S**2) < 0.9).sum().item() + 1
         new_basis = U[:, :k].to(self.device)
 
         for block in self._network.backbone.noise_maker:
