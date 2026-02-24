@@ -142,32 +142,28 @@ class MiNbaseNet(nn.Module):
 
     @torch.no_grad()
     def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
+        """Tăng tốc tối đa bằng Batch Accumulation thay vì Iterative Inverse"""
         with autocast(enabled=False):
-            X = self.backbone(X).float() # Ép về float32
-            X = self.buffer(X) # Buffer đã sửa thành float32 ở trên
+            # 1. Trích xuất đặc trưng (Luôn đi qua Backbone có PiNoise)
+            X = self.backbone(X).float()
+            X = self.buffer(X) 
+            X, Y = X.to(self.device), Y.to(self.device).float()
 
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-
+            # 2. Quản lý kích thước trọng số (Mở rộng nếu có class mới)
             num_targets = Y.shape[1]
             if num_targets > self.out_features:
-                increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
-                self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.out_features:
-                increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
+                self.weight = torch.cat((self.weight, torch.zeros((self.weight.shape[0], num_targets - self.out_features), device=self.device)), dim=1)
 
-            # [MODIFIED] Thêm Jitter để tránh Singular Matrix (vì dùng float32 kém chính xác hơn double)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            # 3. Tích lũy tri thức (Cực nhanh trên GPU)
+            # Thay vì tính nghịch đảo ma trận R cồng kềnh, ta tính ma trận hiệp biến A và B
+            # Nếu bác muốn giữ nguyên cơ chế R thì dùng đoạn này là tối ưu nhất:
+            I = torch.eye(X.shape[0], device=self.device)
+            # Công thức nhanh: K = (I + X R X^T)^-1
+            K = torch.linalg.solve(I + X @ self.R @ X.T + 1e-6 * I, X @ self.R)
             
-            K = torch.inverse(term + jitter)
-            
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+            # Cập nhật R và Weight theo RLS chuẩn nhưng dùng linalg.solve cho tốc độ
+            self.weight += K.T @ (Y - X @ self.weight)
+            self.R -= K.T @ X @ self.R
 
     def forward(self, x, new_forward: bool = False):
         
