@@ -375,8 +375,8 @@ class MinNet(object):
                 targets = targets.long()
 
                 ce_loss = F.cross_entropy(logits_final, targets)
-                loss = ce_loss + beta_current * batch_kl
-
+                # loss = ce_loss + beta_current * batch_kl
+                loss = ce_loss  
                 # 3. TÍNH ORTHO LOSS (THÀNH PHẦN 3)
                 batch_ortho = 0.0
                 if self.cur_task > 0 and len(self.old_noise_weights) > 0:
