@@ -137,13 +137,11 @@ class PiNoise(torch.nn.Linear):
 
             
     def unfreeze_noise(self):
-
-        for param in self.mu[-1].parameters():
+        # Bỏ [-1] vì mu và sigmma giờ là lớp Linear đơn, không phải List
+        for param in self.mu.parameters():
             param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
+        for param in self.sigmma.parameters():
             param.requires_grad = True
-
-    
     
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
