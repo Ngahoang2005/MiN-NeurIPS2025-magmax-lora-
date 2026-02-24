@@ -304,20 +304,24 @@ class MinNet(object):
                     ce_loss = F.cross_entropy(logits_final, targets.long())
                     
                     # 3. Ortho Loss (Tối ưu ép kiểu)
+                    # =================================================================
+                    # TÍNH ORTHO TRÊN TRỌNG SỐ TỪ MODULE LIST (Không cần old_dict)
+                    # =================================================================
                     batch_ortho = 0.0
-                    if self.cur_task > 0 and len(self.old_noise_weights) > 0:
-                        for idx, block in enumerate(self._network.backbone.noise_maker):
-                            old_dict = self.old_noise_weights[idx]
+                    if self.cur_task > 0:
+                        for block in self._network.backbone.noise_maker:
+                            # 1. Lấy trọng số của Task HIỆN TẠI (vị trí -1 trong list)
+                            w_mu_curr = block.mu[-1].weight.float()
+                            w_sigma_curr = block.sigma[-1].weight.float()
                             
-                            # Tính trực tiếp không cần to().float() thừa thãi vì snapshot đã làm rồi
-                            w_mu_curr = block.mu.weight
-                            w_mu_old = old_dict['mu']
-                            batch_ortho += torch.mean(torch.matmul(w_mu_curr, w_mu_old.t()).pow(2))
-                            
-                            w_sigma_curr = block.sigma.weight
-                            w_sigma_old = old_dict['sigma']
-                            batch_ortho += torch.mean(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
-
+                            # 2. Lặp qua tất cả các Task CŨ trong lịch sử (từ 0 đến n-1)
+                            for task_idx in range(len(block.mu) - 1):
+                                w_mu_old = block.mu[task_idx].weight.detach().float()
+                                w_sigma_old = block.sigma[task_idx].weight.detach().float()
+                                
+                                # Tính trực giao
+                                batch_ortho += torch.mean(torch.matmul(w_mu_curr, w_mu_old.t()).pow(2))
+                                batch_ortho += torch.mean(torch.matmul(w_sigma_curr, w_sigma_old.t()).pow(2))
                     # 4. Total Loss
                     # loss = ce_loss + beta_current * batch_kl + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 else 0.0)
                     loss = ce_loss + (LAMBDA_ORTHO * batch_ortho if self.cur_task > 0 and torch.is_tensor(batch_ortho) else 0.0)
