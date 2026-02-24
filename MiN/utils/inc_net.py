@@ -237,3 +237,34 @@ class MiNbaseNet(nn.Module):
                 p.requires_grad = True
         for p in self.backbone.norm.parameters():
             p.requires_grad = True
+    def forward_with_ib(self, x):
+        kl_losses = []
+        
+        x = self.backbone.patch_embed(x)
+        if hasattr(self.backbone, '_pos_embed'):
+            x = self.backbone._pos_embed(x)
+        else:
+            if self.backbone.pos_embed is not None:
+                x = x + self.backbone.pos_embed
+            x = self.backbone.pos_drop(x)
+
+        for i, block in enumerate(self.backbone.blocks):
+            x = block(x) 
+            if hasattr(self.backbone, 'noise_maker'):
+                # [QUAN TRỌNG]: Bật return_kl = True
+                x, kl = self.backbone.noise_maker[i](x, return_kl=True)
+                kl_losses.append(kl)
+        
+        if hasattr(self.backbone, 'norm'):
+            x = self.backbone.norm(x)
+
+        if x.dim() == 3: x = x[:, 0]
+
+        x = self.buffer(x.to(self.buffer.weight.dtype))
+        x = x.to(self.normal_fc.weight.dtype)
+        logits = self.normal_fc(x)['logits']
+        
+        # Gom KL Loss của toàn bộ 12 layers
+        total_kl = sum(kl_losses) if kl_losses else torch.tensor(0.0, device=self.device)
+        
+        return logits, total_kl

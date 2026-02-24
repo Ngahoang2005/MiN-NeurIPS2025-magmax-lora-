@@ -139,6 +139,9 @@ class MinNet(object):
         self._network.extend_task_prototype(prototype)
         
         self.run(train_loader)
+        for block in self._network.backbone.noise_maker:
+            if hasattr(block, 'after_task_training'):
+                block.after_task_training()
         
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
@@ -202,7 +205,9 @@ class MinNet(object):
         self._network.extend_task_prototype(prototype)
         
         self.run(train_loader)
-        
+        for block in self._network.backbone.noise_maker:
+            if hasattr(block, 'after_task_training'):
+                block.after_task_training()
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.update_task_prototype(prototype)
@@ -275,81 +280,125 @@ class MinNet(object):
             lr = self.lr
             weight_decay = self.weight_decay
 
-        for param in self._network.parameters():
+        # 1. Đóng băng toàn bộ, chỉ mở khóa Normal FC
+        for param in self._network.parameters(): 
             param.requires_grad = False
-        for param in self._network.normal_fc.parameters():
+        for param in self._network.normal_fc.parameters(): 
             param.requires_grad = True
             
-        if self.cur_task == 0:
+        # 2. Mở khóa Noise Generator
+        if self.cur_task == 0: 
             self._network.init_unfreeze()
-        else:
+        else: 
             self._network.unfreeze_noise()
             
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        # [QUAN TRỌNG]: Ép kiểu thành list() để tránh lỗi rỗng tham số (empty parameter list)
+        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
+        
+        # (Tùy chọn) In ra những thứ đang được train để debug
+        if self.cur_task == 0 or self.cur_task == 1:
+            print("\n" + "="*50)
+            print(f"🔍 NHỮNG THAM SỐ ĐANG ĐƯỢC TRAIN (TASK {self.cur_task}):")
+            print("="*50)
+            trainable_params_count = 0
+            for name, param in self._network.named_parameters():
+                if param.requires_grad:
+                    print(f"✅ {name} | Size: {list(param.shape)}")
+                    trainable_params_count += param.numel()
+            print(f"🔥 Tổng tham số đang học: {trainable_params_count:,}")
+            print("="*50 + "\n")
+
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
         prog_bar = tqdm(range(epochs))
         self._network.train()
         self._network.to(self.device)
+        
+        # Lực kéo VIB (Bác có thể chỉnh 1e-4 hoặc 1e-5 tùy thuộc vào độ lớn của Loss)
+        max_beta = 1e-4 
+
         for _, epoch in enumerate(prog_bar):
-            losses = 0.0
+            losses, ce_losses, kl_losses = 0.0, 0.0, 0.0
             correct, total = 0, 0
+            
+            # Warm-up Beta (Cho VIB Loss)
+            beta_current = max_beta * min(1.0, (epoch + 1) / (epochs / 2 + 1e-6))
 
             for i, (_, inputs, targets) in enumerate(train_loader):
-                inputs, targets = inputs.to(self.device), targets.to(self.device)
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
                 
-                # [ADDED] set_to_none=True tiết kiệm RAM hơn
+                # set_to_none=True giúp dọn rác RAM hiệu quả hơn
                 optimizer.zero_grad(set_to_none=True) 
 
-                # [ADDED] Autocast để giảm 50% VRAM khi train
-                with autocast('cuda'):
+                # =========================================================
+                # FORWARD VỚI MIXED PRECISION (Tăng tốc x2, Giảm 50% VRAM)
+                # =========================================================
+                with torch.amp.autocast('cuda'):
                     if self.cur_task > 0:
+                        # Lấy Logits của Task cũ (Không đạo hàm)
                         with torch.no_grad():
                             outputs1 = self._network(inputs, new_forward=False)
                             logits1 = outputs1['logits']
-                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits2 = outputs2['logits']
-                        logits2 = logits2 + logits1
-                        loss = F.cross_entropy(logits2, targets.long())
-                        logits_final = logits2
+                        # Sinh nhiễu và lấy Logits mới + KL Loss
+                        logits2, batch_kl = self._network.forward_with_ib(inputs)
+                        logits_final = logits2 + logits1
                     else:
-                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
-                        logits = outputs["logits"]
-                        loss = F.cross_entropy(logits, targets.long())
-                        logits_final = logits
+                        logits_final, batch_kl = self._network.forward_with_ib(inputs)
 
-                # [ADDED] Backward với Scaler
+                # =========================================================
+                # TÍNH LOSS (Đưa về Float32 để chống nổ số NaN)
+                # =========================================================
+                logits_final = logits_final.float() 
+                if targets.dim() > 1: targets = targets.reshape(-1)
+                targets = targets.long()
+
+                ce_loss = F.cross_entropy(logits_final, targets)
+                batch_kl_float = batch_kl.float() if torch.is_tensor(batch_kl) else float(batch_kl)
+                
+                # TỔNG LOSS = CrossEntropy + VIB Loss
+                loss = ce_loss + beta_current * batch_kl_float
+
+                # =========================================================
+                # BACKWARD QUA SCALER
+                # =========================================================
                 self.scaler.scale(loss).backward()
+                
+                # Clip Gradient để an toàn 100%, không bao giờ bị văng số
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self._network.parameters(), max_norm=2.0)
+                
                 self.scaler.step(optimizer)
                 self.scaler.update()
                 
+                # Ghi nhận kết quả
                 losses += loss.item()
-
+                ce_losses += ce_loss.item()
+                kl_losses += float(batch_kl_float)
+                
                 _, preds = torch.max(logits_final, dim=1)
                 correct += preds.eq(targets.expand_as(preds)).cpu().sum()
                 total += len(targets)
                 
-                # [ADDED] Xóa biến tạm
                 del inputs, targets, loss, logits_final
 
             scheduler.step()
             train_acc = 100. * correct / total
 
-            info = "Task {} --> Learning Beneficial Noise!: Epoch {}/{} => Loss {:.3f}, train_accy {:.2f}".format(
-                self.cur_task,
-                epoch + 1,
-                epochs,
-                losses / len(train_loader),
-                train_acc,
+            # Hiển thị tiến trình rõ ràng: Tổng Loss (CE | KL)
+            info = "T {} | Ep {}/{} | L {:.3f} (CE {:.3f} | KL {:.1f}) | Acc {:.2f}".format(
+                self.cur_task, epoch + 1, epochs, 
+                losses / len(train_loader), 
+                ce_losses / len(train_loader), 
+                kl_losses / len(train_loader), 
+                train_acc
             )
             self.logger.info(info)
             prog_bar.set_description(info)
             
-            # [ADDED] Clear cache sau mỗi epoch
             if epoch % 5 == 0:
-                self._clear_gpu()
-
+                self._clear_gpu()    
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
