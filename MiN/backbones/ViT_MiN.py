@@ -130,6 +130,14 @@ class PiNoise(torch.nn.Linear):
         s = self.sigmma(x_down)
         noise = (m + s) @ self.w_up
         return x1 + noise + hyper_features
+    def reset_to_base(self):
+        """Đưa trọng số về trạng thái 'nguyên thủy' trước khi học Task mới"""
+        # Load lại từ bản backup base_mu_sd, base_sig_sd đã lưu trong __init__
+        self.mu.load_state_dict(self.base_mu_sd)
+        self.sigmma.load_state_dict(self.base_sig_sd)
+        # Nếu bác dùng MagMax cho cả MLP thì reset cả MLP luôn
+        if hasattr(self, 'base_MLP_sd'):
+            self.MLP.load_state_dict(self.base_MLP_sd)
     def update_noise(self):
         # Chỉ đơn giản là mở khóa để học đè (Sequential)
         for param in self.mu.parameters(): param.requires_grad = True

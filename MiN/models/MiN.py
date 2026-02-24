@@ -202,7 +202,8 @@ class MinNet(object):
         self._clear_gpu()
         prototype = self.get_task_prototype(self._network, train_loader)
         self._network.extend_task_prototype(prototype)
-        
+        for block in self._network.backbone.noise_maker:
+            block.reset_to_base()
         self.run(train_loader)
         for block in self._network.backbone.noise_maker:
             if hasattr(block, 'after_task_training'):
