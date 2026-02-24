@@ -262,7 +262,7 @@ class MinNet(object):
         if self.cur_task == 0: self._network.init_unfreeze()
         else: self._network.unfreeze_noise()
             
-        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
+        params = filter(lambda p: p.requires_grad, self._network.parameters())
         if self.cur_task ==0 or self.cur_task == 1:
             print("\n" + "="*50)
             print("🔍 NHỮNG THAM SỐ ĐANG ĐƯỢC TRAIN TRONG EPOCH NÀY:")
@@ -276,8 +276,7 @@ class MinNet(object):
             print("="*50 + "\n")
             
         # Dòng cũ của bác ở đây:
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
-        optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
+       
         optimizer = get_optimizer(self.args['optimizer_type'], params, lr, weight_decay)
         scheduler = get_scheduler(self.args['scheduler_type'], optimizer, epochs)
 
