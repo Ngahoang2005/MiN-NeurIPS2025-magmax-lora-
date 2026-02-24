@@ -262,7 +262,7 @@ class MinNet(object):
         if self.cur_task == 0: self._network.init_unfreeze()
         else: self._network.unfreeze_noise()
             
-        params = filter(lambda p: p.requires_grad, self._network.parameters())
+        params = list(filter(lambda p: p.requires_grad, self._network.parameters()))
         if self.cur_task ==0 or self.cur_task == 1:
             print("\n" + "="*50)
             print("🔍 NHỮNG THAM SỐ ĐANG ĐƯỢC TRAIN TRONG EPOCH NÀY:")
