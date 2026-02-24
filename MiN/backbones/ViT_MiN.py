@@ -90,7 +90,7 @@ class PiNoise(torch.nn.Linear):
         self.act = nn.GELU()
 
         self.mu = nn.ModuleList()
-        self.sigma = nn.ModuleList()
+        self.sigmma = nn.ModuleList()
 
         self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_up)
@@ -99,14 +99,22 @@ class PiNoise(torch.nn.Linear):
         self.weight_noise = None
 
     def update_noise(self):
-        # [NEW] Gán bias của sigma = -3.0 để chống chết gradient
-        self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-        torch.nn.init.constant_(self.mu[-1].weight, 0.)
-        torch.nn.init.constant_(self.mu[-1].bias, 0.)
-        
-        self.sigma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-        torch.nn.init.constant_(self.sigma[-1].weight, 0.)
-        torch.nn.init.constant_(self.sigma[-1].bias, -3.0)
+
+        if len(self.mu) == 0:
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[0].weight, 0.)
+            torch.nn.init.constant_(self.mu[0].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[0].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[0].bias, 0.)
+        else:
+            self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.mu[-1].weight, 0.)
+            torch.nn.init.constant_(self.mu[-1].bias, 0.)
+            self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+            torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
+            torch.nn.init.constant_(self.sigmma[-1].bias, 0.)
+    
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
@@ -126,54 +134,44 @@ class PiNoise(torch.nn.Linear):
             self.weight_noise.requires_grad = True
             
     def unfreeze_noise(self):
+
         for param in self.mu[-1].parameters():
             param.requires_grad = True
-        for param in self.sigma[-1].parameters():
+        for param in self.sigmma[-1].parameters():
             param.requires_grad = True
 
-    def forward(self, hyper_features, return_kl=False):
+    def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
+
         x_down = hyper_features @ self.w_down
-        
+
         noise = None
-        total_kl = 0.0
 
         for i in range(len(self.mu)):
             mu = self.mu[i](x_down)
-            # [NEW] Dùng softplus để đảm bảo sigma > 0 (chuẩn VAE)
-            sigma = F.softplus(self.sigma[i](x_down)) + 1e-6 
-            
-            # [NEW] KL Loss và nhiễu chỉ bật trên Task ĐANG TRAIN (task cuối)
-            if self.training:
-                eps = torch.randn_like(sigma)
-                z = mu + sigma * eps
-                
-                # [CHỐNG NAN]: Ép kiểu về Float32 trước khi bình phương và tính Sum
-                mu_f32 = mu.float()
-                sigma_f32 = sigma.float()
-                kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma_f32) - mu_f32.pow(2) - sigma_f32.pow(2), dim=1)
-                total_kl = kl_div.mean()
-            else:
-                z = mu 
-                total_kl = 0.0
-            # An toàn nếu weight_noise chưa được init (ví dụ: epoch đầu Task 0)
-            w = 1.0 if self.weight_noise is None else self.weight_noise[i]
-
+            sigmma = self.sigmma[i](x_down)
             if noise is None:
-                noise = z * w
+                noise = (mu + sigmma) * self.weight_noise[i]
             else:
-                noise += z * w
+                noise += (mu + sigmma) * self.weight_noise[i]
 
         noise = noise @ self.w_up
-        out = x1 + noise + hyper_features
-        
-        if return_kl: return out, total_kl
-        return out
+
+        return x1 + noise + hyper_features
 
     def forward_new(self, hyper_features):
-        return self.forward(hyper_features)
+        x1 = self.MLP(hyper_features)
 
+        x_down = hyper_features @ self.w_down
 
+        mu = self.mu[-1](x_down)
+        sigmma = self.sigmma[-1](x_down)
+
+        noise = (mu + sigmma) * self.weight_noise[-1]
+
+        noise = noise @ self.w_up
+
+        return x1 + noise + hyper_features
 
 class Attention(nn.Module):
     fused_attn: Final[bool]
