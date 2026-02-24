@@ -221,8 +221,7 @@ class MiNbaseNet(nn.Module):
     def update_noise(self):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].update_noise()
-            self.backbone.noise_maker[j].init_weight_noise(self.task_prototypes)
-
+            
     def unfreeze_noise(self):
         for j in range(self.backbone.layer_num):
             self.backbone.noise_maker[j].unfreeze_noise()

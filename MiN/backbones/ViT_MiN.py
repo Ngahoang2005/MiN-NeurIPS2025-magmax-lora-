@@ -69,168 +69,124 @@ import gc
 import torch
 from torch import nn
 from torch.nn import functional as F
+import torch
+from torch import nn
+from torch.nn import functional as F
 
 class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
         super(torch.nn.Linear, self).__init__()
 
-        self.bias = None
-
-        self.MLP = nn.Linear(in_dim, out_dim)
-        torch.nn.init.constant_(self.MLP.weight, 0)
-        torch.nn.init.constant_(self.MLP.bias, 0)
-
-        device = torch.device("cuda:{}".format(0))
-        factory_kwargs = {"device": device, "dtype": torch.float}
-
         self.hidden_dim = hidden_dim
 
-        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
-        self.register_buffer("weight", self.w_down)
-
-        self.reset_parameters()
-
-        self.act = nn.GELU()
-
-        self.mu = nn.ModuleList()
-        self.sigmma = nn.ModuleList()
-
-        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
-        self.register_buffer("weight_up", self.w_up) # Tránh trùng tên
-        self.reset_parameters()
-
-        self.weight_noise = None
+        # --- Shared Fixed Parts (Down/Up Projection) ---
+        self.w_down = nn.Parameter(torch.empty(in_dim, hidden_dim))
+        nn.init.xavier_uniform_(self.w_down)
         
-        # [MAGMAX]: Lưu state ban đầu
-        self.base_mu_sd = {}
-        self.base_sigma_sd = {}
+        self.w_up = nn.Parameter(torch.empty(hidden_dim, out_dim))
+        nn.init.xavier_uniform_(self.w_up)
+
+        # =====================================================================
+        # [SEQUENTIAL]: CHỈ DÙNG 1 BỘ MU & SIGMA DUY NHẤT
+        # =====================================================================
+        self.mu = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.sigma = nn.Linear(self.hidden_dim, self.hidden_dim)
+        
+        torch.nn.init.constant_(self.mu.weight, 0.)
+        torch.nn.init.constant_(self.mu.bias, 0.)
+        torch.nn.init.constant_(self.sigma.weight, 0.)
+        torch.nn.init.constant_(self.sigma.bias, 0.0) # Bias=0 để Softplus mồi dốc
+        
+        # =====================================================================
+        # [MAGMAX]: LƯU TRẠNG THÁI GỐC ĐỂ TÍNH TASK VECTOR
+        # =====================================================================
+        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
+        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigma.state_dict().items()}
+        
+        self.history_tau_mu = []    
+        self.history_tau_sigma = [] 
+        
+        self.noise_scale = nn.Parameter(torch.tensor(0.1))
 
     def update_noise(self):
-        # Khởi tạo Layer mới cho Task mới
-        new_mu = nn.Linear(self.hidden_dim, self.hidden_dim)
-        new_sigma = nn.Linear(self.hidden_dim, self.hidden_dim)
-        
-        torch.nn.init.constant_(new_mu.weight, 0.)
-        torch.nn.init.constant_(new_mu.bias, 0.)
-        torch.nn.init.constant_(new_sigma.weight, 0.)
-        # [QUAN TRỌNG]: Bias = 0.0 để Sigma học được VIB
-        torch.nn.init.constant_(new_sigma.bias, 0.0)
-        
-        self.mu.append(new_mu)
-        self.sigmma.append(new_sigma)
-        
-        # Lưu state ban đầu của Layer MỚI NHẤT
-        self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu[-1].state_dict().items()}
-        self.base_sigma_sd = {k: v.detach().clone() for k, v in self.sigmma[-1].state_dict().items()}
+        """Mở khóa bộ mu/sigma duy nhất để train đè lên cho Task mới"""
+        for param in self.mu.parameters(): param.requires_grad = True
+        for param in self.sigma.parameters(): param.requires_grad = True
 
-    def init_weight_noise(self, prototypes):
-        if len(prototypes) <= 1:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
-        else:
-            self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
-            weight = torch.ones(len(self.mu))
-            for i in range(len(prototypes)):
-                mu_t = prototypes[-1]
-                mu_i = prototypes[i]
-                dot_product = torch.dot(mu_t, mu_i)
-                norm_t = torch.norm(mu_t)
-                norm_i = torch.norm(mu_i)
-                s_i = dot_product / (norm_t * norm_i)
-                weight[i] = s_i.detach().clone()
-            weight = torch.softmax(weight, dim=-1)
-            self.weight_noise = weight
-            self.weight_noise.requires_grad = True
-            
     def unfreeze_noise(self):
-        # Chỉ học Layer mới nhất
-        for param in self.mu[-1].parameters():
-            param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
-            param.requires_grad = True
+        self.update_noise()
+
+    def unfreeze_task_0(self):
+        """Task 0: Train cả Noise Scale (Các layer Down/Up vẫn đóng băng)"""
+        for param in self.parameters(): param.requires_grad = True
+        self.w_down.requires_grad = False
+        self.w_up.requires_grad = False
 
     # =====================================================================
-    # [MAGMAX MERGE LOGIC (Cho ModuleList)]
+    # [MAGMAX LOGIC]
     # =====================================================================
     def after_task_training(self):
-        """Thay vì tạo list riêng, ta lấy trực tiếp từ ModuleList"""
-        if len(self.mu) <= 1: return
+        """Chụp ảnh lại Task Vector và Merge sau mỗi Task"""
+        # 1. Tính Task Vector (Tau = W_current - W_base)
+        tau_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}
+        tau_sigma = {k: self.sigma.state_dict()[k].detach().cpu() - self.base_sigma_sd[k].cpu() for k in self.base_sigma_sd.keys()}
         
-        def merge_list(module_list, base_dict):
-            keys = base_dict.keys()
+        self.history_tau_mu.append(tau_mu)
+        self.history_tau_sigma.append(tau_sigma)
+        
+        # 2. Hợp nhất bằng MagMax
+        self._perform_magmax_merge()
+
+    def _perform_magmax_merge(self):
+        if not self.history_tau_mu: return
+
+        def get_merged_state(base_sd, history_tau):
             merged_dict = {}
-            for key in keys:
-                # Tính Task Vectors của TẤT CẢ các layer trong ModuleList
-                all_taus = []
-                for layer in module_list:
-                    tau = layer.state_dict()[key].detach().cpu() - base_dict[key].cpu()
-                    all_taus.append(tau)
-                
-                # MagMax: Chọn giá trị lớn nhất
-                stacked_tau = torch.stack(all_taus, dim=0)
+            for key in base_sd.keys():
+                # Lấy giá trị tuyệt đối lớn nhất qua các Task
+                stacked_tau = torch.stack([d[key] for d in history_tau], dim=0)
                 magnitudes = torch.abs(stacked_tau)
                 max_indices = torch.argmax(magnitudes, dim=0, keepdim=True)
                 best_tau = torch.gather(stacked_tau, 0, max_indices).squeeze(0)
                 
-                # Cập nhật TRỰC TIẾP vào Layer cuối cùng (Layer đại diện)
-                merged_dict[key] = base_dict[key].to(self.w_down.device) + best_tau.to(self.w_down.device)
+                # Ghi đè: W_final = W_base + W_tau_max
+                merged_dict[key] = base_sd[key].to(self.w_down.device) + best_tau.to(self.w_down.device)
             return merged_dict
 
-        # Ghi đè trọng số MagMax vào Layer MỚI NHẤT
-        self.mu[-1].load_state_dict(merge_list(self.mu, self.base_mu_sd))
-        self.sigmma[-1].load_state_dict(merge_list(self.sigmma, self.base_sigma_sd))
+        self.mu.load_state_dict(get_merged_state(self.base_mu_sd, self.history_tau_mu))
+        self.sigma.load_state_dict(get_merged_state(self.base_sigma_sd, self.history_tau_sigma))
 
-
+    # =====================================================================
+    # [FORWARD & VIB LOGIC]
+    # =====================================================================
     def forward(self, hyper_features, return_kl=False):
-        x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
-
-        noise = None
-        total_kl = 0.0
-
-        for i in range(len(self.mu)):
-            mu = self.mu[i](x_down)
-            # [CHUẨN VAE]: Softplus để đảm bảo dương
-            sigma = F.softplus(self.sigmma[i](x_down).float()) + 1e-4
-
-            # [VIB]: Chỉ sinh nhiễu và tính KL cho Task cuối cùng
-            if self.training and i == len(self.mu) - 1:
-                eps = torch.randn_like(sigma)
-                z = mu + sigma * eps
-                
-                mu_f32 = mu.float()
-                sigma_f32 = sigma.float()
-                kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma_f32) - mu_f32.pow(2) - sigma_f32.pow(2), dim=1)
-                total_kl = kl_div.mean()
-            else:
-                z = mu
-
-            z = z.to(hyper_features.dtype)
-            w = 1.0 if self.weight_noise is None else self.weight_noise[i]
-
-            if noise is None:
-                noise = z * w
-            else:
-                noise += z * w
-
-        noise = noise @ self.w_up
-        out = x1 + noise + hyper_features
+        
+        mu = self.mu(x_down)
+        sigma = F.softplus(self.sigma(x_down).float()) + 1e-4 
+        
+        if self.training:
+            eps = torch.randn_like(sigma)
+            z = mu + sigma * eps
+            
+            # Tính VIB Loss (KL Divergence)
+            mu_f32 = mu.float()
+            sigma_f32 = sigma.float()
+            kl_div = -0.5 * torch.sum(1 + 2 * torch.log(sigma_f32) - mu_f32.pow(2) - sigma_f32.pow(2), dim=1)
+            total_kl = kl_div.mean()
+        else:
+            z = mu 
+            total_kl = torch.tensor(0.0, device=hyper_features.device)
+            
+        z = z.to(hyper_features.dtype)
+        
+        noise = z @ self.w_up
+        out = hyper_features + noise * self.noise_scale
         
         if return_kl: return out, total_kl
         return out
 
-    def forward_new(self, hyper_features):
-        x1 = self.MLP(hyper_features)
-        x_down = hyper_features @ self.w_down
 
-        mu = self.mu[-1](x_down)
-        sigma = F.softplus(self.sigmma[-1](x_down).float()) + 1e-4
-
-        z = mu.to(hyper_features.dtype)
-        w = 1.0 if self.weight_noise is None else self.weight_noise[-1]
-        noise = z * w
-
-        noise = noise @ self.w_up
-        return x1 + noise + hyper_features
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
