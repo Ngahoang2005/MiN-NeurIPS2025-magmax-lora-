@@ -15,7 +15,7 @@ import os
 from data_process.data_manger import DataManger
 from utils.training_tool import get_optimizer, get_scheduler
 from utils.toolkit import calculate_class_metrics, calculate_task_metrics
-
+from torch.amp import autocast
 EPSILON = 1e-8
 
 

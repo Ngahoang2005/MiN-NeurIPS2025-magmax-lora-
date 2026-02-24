@@ -14,6 +14,7 @@ import scipy.stats as stats
 import timm
 import random
 
+from torch.amp import autocast
 class BaseIncNet(nn.Module):
     def __init__(self, args: dict):
         super(BaseIncNet, self).__init__()
@@ -123,7 +124,7 @@ class MiNbaseNet(nn.Module):
         2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
         """
         # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
-        with autocast(enabled=False):
+        with autocast('cuda', enabled=False):
             
             # 1. Chuẩn bị dữ liệu (Float32)
             X = X.float().to(self.device)
