@@ -134,8 +134,10 @@ class PiNoise(torch.nn.Linear):
         if hasattr(self, 'basis') and self.basis is not None:
             # Công thức: h = h - (h @ U) @ U.T
             # U là basis 768-d
+            print(f"Raw noise norm: {noise.norm().item()}")
             proj = (noise @ self.basis) @ self.basis.t()
             noise = noise - proj
+            print(f"Projected noise norm: {noise.norm().item()}")
             
         return x1 + noise + hyper_features
         return x1 + noise + hyper_features
