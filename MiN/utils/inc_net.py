@@ -116,38 +116,83 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = fc
 
     @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        X = self.buffer(self.backbone(X))
-        X, Y = X.to(self.weight), Y.to(self.weight)
-
-        num_targets = Y.shape[1]
-        if num_targets > self.out_features:
-            increment_size = num_targets - self.out_features
-            tail = torch.zeros((self.weight.shape[0], increment_size), device=self.weight.device, dtype=self.weight.dtype)
-            self.weight = torch.cat((self.weight, tail), dim=1)
-        elif num_targets < self.out_features:
-            increment_size = self.out_features - num_targets
-            tail = torch.zeros((Y.shape[0], increment_size), device=Y.device, dtype=Y.dtype)
-            Y = torch.cat((Y, tail), dim=1)
-
-        # ====================================================================
-        # [TỐI ƯU TOÁN HỌC]: Lưu sẵn (X @ R) để tái sử dụng 3 lần, tiết kiệm 500 tỷ FLOPs
-        # ====================================================================
-        XR = X @ self.R  # Kích thước chỉ là (B, D)
-
-        # Dùng lại XR ở đây
-        term = torch.eye(X.shape[0], device=X.device, dtype=X.dtype) + XR @ X.T
-        
-        try:
-            # Dùng lại XR ở đây
-            K = torch.linalg.solve(term, XR).T
-        except RuntimeError:
-            K = self.R @ X.T @ torch.linalg.pinv(term)
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
+        """
+        Tối ưu hóa Analytic Learning (Chunking RLS):
+        1. Sử dụng Accumulation (Cộng dồn) để tránh OOM khi tính X^T * X trên dataset lớn.
+        2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
+        """
+        # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
+        with autocast(enabled=False):
             
-        # Dùng lại XR ở đây (Nhanh gấp 70 lần so với K @ X @ self.R cũ)
-        self.R -= K @ XR 
-        
-        self.weight += K @ (Y - X @ self.weight)
+            # 1. Chuẩn bị dữ liệu (Float32)
+            X = X.float().to(self.device)
+            Y = Y.float().to(self.device)
+            
+            # 2. Mở rộng Classifier nếu có class mới
+            num_targets = Y.shape[1]
+            
+            # Nếu chưa có weight (lần đầu fit), khởi tạo
+            if self.weight.shape[1] == 0:
+                # Tạm tính feature dim sau khi qua buffer
+                dummy_feat = self.backbone(X[0:2]).float()
+                dummy_feat = self.buffer(dummy_feat)
+                feat_dim = dummy_feat.shape[1]
+                
+                self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+                
+            elif num_targets > self.weight.shape[1]:
+                # Mở rộng weight cũ (Padding 0 cho class mới)
+                increment = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
+                self.weight = torch.cat((self.weight, tail), dim=1)
+
+            # 3. Tính toán Ma trận A (Autocorrelation) và B (Cross-correlation)
+            # A = X^T * X + lambda * I
+            # B = X^T * Y
+            
+            N = X.shape[0]
+            feat_dim = self.weight.shape[0]
+            
+            A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+            B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            
+            # Kỹ thuật Chunking: Duyệt qua từng batch nhỏ
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                
+                # Lấy raw images
+                x_batch = X[start:end] 
+                y_batch = Y[start:end] 
+                
+                # Extract features qua backbone + buffer
+                features = self.backbone(x_batch).float()
+                features = self.buffer(features) # Qua Random Projection
+                
+                # Cộng dồn
+                A += features.T @ features
+                B += features.T @ y_batch
+                
+                del features, x_batch, y_batch 
+
+            # 4. Áp dụng Regularization (Ridge)
+            I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+            A += self.gamma * I 
+
+            # 5. Giải hệ phương trình tuyến tính A * W = B
+            try:
+                # linalg.solve tự động chọn thuật toán (Cholesky/LU) tối ưu
+                W_solution = torch.linalg.solve(A, B)
+            except RuntimeError:
+                # Fallback dùng Pseudo-Inverse nếu ma trận suy biến
+                W_solution = torch.linalg.pinv(A) @ B
+            
+            # 6. Cập nhật Weight
+            self.weight = W_solution
+            
+            del A, B, I, X, Y
+            torch.cuda.empty_cache()
+    
     def forward(self, x, new_forward: bool = False):
         if new_forward:
             hyper_features = self.backbone(x, new_forward=True)
