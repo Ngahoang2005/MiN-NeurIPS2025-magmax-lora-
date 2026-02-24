@@ -309,7 +309,7 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast('cuda'):
-                    logits_final = self._network(inputs)['logits']
+                    logits_final = self._network.forward_normal_fc(inputs)['logits']
                     loss = F.cross_entropy(logits_final, targets.long())
 
                 self.scaler.scale(loss).backward()
