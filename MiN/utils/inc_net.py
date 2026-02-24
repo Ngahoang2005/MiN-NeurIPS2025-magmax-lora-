@@ -141,34 +141,82 @@ class MiNbaseNet(nn.Module):
             self.normal_fc = fc
 
     @torch.no_grad()
-    def fit(self, X: torch.Tensor, Y: torch.Tensor) -> None:
-        # [MODIFIED] Tắt Autocast ở đây. Ma trận nghịch đảo cần chạy FP32.
+    def fit(self, X: torch.Tensor, Y: torch.Tensor, chunk_size=2048) -> None:
+        """
+        Tối ưu hóa Analytic Learning (Chunking RLS):
+        1. Sử dụng Accumulation (Cộng dồn) để tránh OOM khi tính X^T * X trên dataset lớn.
+        2. Sử dụng torch.linalg.solve thay vì torch.inverse (Nhanh hơn & Ổn định hơn).
+        """
+        # [QUAN TRỌNG] Tắt Mixed Precision để đảm bảo độ chính xác ma trận
         with autocast(enabled=False):
-            X = self.backbone(X).float() # Ép về float32
-            X = self.buffer(X) # Buffer đã sửa thành float32 ở trên
-
-            X, Y = X.to(self.weight.device), Y.to(self.weight.device).float()
-
+            
+            # 1. Chuẩn bị dữ liệu (Float32)
+            X = X.float().to(self.device)
+            Y = Y.float().to(self.device)
+            
+            # 2. Mở rộng Classifier nếu có class mới
             num_targets = Y.shape[1]
-            if num_targets > self.out_features:
-                increment_size = num_targets - self.out_features
-                tail = torch.zeros((self.weight.shape[0], increment_size)).to(self.weight)
+            
+            # Nếu chưa có weight (lần đầu fit), khởi tạo
+            if self.weight.shape[1] == 0:
+                # Tạm tính feature dim sau khi qua buffer
+                dummy_feat = self.backbone(X[0:2]).float()
+                dummy_feat = self.buffer(dummy_feat)
+                feat_dim = dummy_feat.shape[1]
+                
+                self.weight = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+                
+            elif num_targets > self.weight.shape[1]:
+                # Mở rộng weight cũ (Padding 0 cho class mới)
+                increment = num_targets - self.weight.shape[1]
+                tail = torch.zeros((self.weight.shape[0], increment), device=self.device, dtype=torch.float32)
                 self.weight = torch.cat((self.weight, tail), dim=1)
-            elif num_targets < self.out_features:
-                increment_size = self.out_features - num_targets
-                tail = torch.zeros((Y.shape[0], increment_size)).to(Y)
-                Y = torch.cat((Y, tail), dim=1)
 
-            # [MODIFIED] Thêm Jitter để tránh Singular Matrix (vì dùng float32 kém chính xác hơn double)
-            I = torch.eye(X.shape[0]).to(X)
-            term = I + X @ self.R @ X.T
-            jitter = 1e-6 * torch.eye(term.shape[0], device=term.device)
+            # 3. Tính toán Ma trận A (Autocorrelation) và B (Cross-correlation)
+            # A = X^T * X + lambda * I
+            # B = X^T * Y
             
-            K = torch.inverse(term + jitter)
+            N = X.shape[0]
+            feat_dim = self.weight.shape[0]
             
-            self.R -= self.R @ X.T @ K @ X @ self.R
-            self.weight += self.R @ X.T @ (Y - X @ self.weight)
+            A = torch.zeros((feat_dim, feat_dim), device=self.device, dtype=torch.float32)
+            B = torch.zeros((feat_dim, num_targets), device=self.device, dtype=torch.float32)
+            
+            # Kỹ thuật Chunking: Duyệt qua từng batch nhỏ
+            for start in range(0, N, chunk_size):
+                end = min(start + chunk_size, N)
+                
+                # Lấy raw images
+                x_batch = X[start:end] 
+                y_batch = Y[start:end] 
+                
+                # Extract features qua backbone + buffer
+                features = self.backbone(x_batch).float()
+                features = self.buffer(features) # Qua Random Projection
+                
+                # Cộng dồn
+                A += features.T @ features
+                B += features.T @ y_batch
+                
+                del features, x_batch, y_batch 
 
+            # 4. Áp dụng Regularization (Ridge)
+            I = torch.eye(feat_dim, device=self.device, dtype=torch.float32)
+            A += self.gamma * I 
+
+            # 5. Giải hệ phương trình tuyến tính A * W = B
+            try:
+                # linalg.solve tự động chọn thuật toán (Cholesky/LU) tối ưu
+                W_solution = torch.linalg.solve(A, B)
+            except RuntimeError:
+                # Fallback dùng Pseudo-Inverse nếu ma trận suy biến
+                W_solution = torch.linalg.pinv(A) @ B
+            
+            # 6. Cập nhật Weight
+            self.weight = W_solution
+            
+            del A, B, I, X, Y
+            torch.cuda.empty_cache()
     def forward(self, x, new_forward: bool = False):
         
         if new_forward:
