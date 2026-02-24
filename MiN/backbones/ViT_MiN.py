@@ -90,7 +90,7 @@ class PiNoise(torch.nn.Linear):
         self.act = nn.GELU()
 
         self.mu = nn.ModuleList()
-        self.sigmma = nn.ModuleList()
+        self.sigma = nn.ModuleList()
 
         self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
         self.register_buffer("weight", self.w_up)
@@ -99,14 +99,14 @@ class PiNoise(torch.nn.Linear):
         self.weight_noise = None
 
     def update_noise(self):
-        # [NEW] Gán bias của sigmma = -3.0 để chống chết gradient
+        # [NEW] Gán bias của sigma = -3.0 để chống chết gradient
         self.mu.append(nn.Linear(self.hidden_dim, self.hidden_dim))
         torch.nn.init.constant_(self.mu[-1].weight, 0.)
         torch.nn.init.constant_(self.mu[-1].bias, 0.)
         
-        self.sigmma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
-        torch.nn.init.constant_(self.sigmma[-1].weight, 0.)
-        torch.nn.init.constant_(self.sigmma[-1].bias, -3.0)
+        self.sigma.append(nn.Linear(self.hidden_dim, self.hidden_dim))
+        torch.nn.init.constant_(self.sigma[-1].weight, 0.)
+        torch.nn.init.constant_(self.sigma[-1].bias, -3.0)
     def init_weight_noise(self, prototypes):
         if len(prototypes) <= 1:
             self.weight_noise = torch.zeros(len(self.mu), requires_grad=True)
@@ -128,7 +128,7 @@ class PiNoise(torch.nn.Linear):
     def unfreeze_noise(self):
         for param in self.mu[-1].parameters():
             param.requires_grad = True
-        for param in self.sigmma[-1].parameters():
+        for param in self.sigma[-1].parameters():
             param.requires_grad = True
 
     def forward(self, hyper_features, return_kl=False):
@@ -141,7 +141,7 @@ class PiNoise(torch.nn.Linear):
         for i in range(len(self.mu)):
             mu = self.mu[i](x_down)
             # [NEW] Dùng softplus để đảm bảo sigma > 0 (chuẩn VAE)
-            sigma = F.softplus(self.sigmma[i](x_down)) + 1e-6 
+            sigma = F.softplus(self.sigma[i](x_down)) + 1e-6 
             
             # [NEW] KL Loss và nhiễu chỉ bật trên Task ĐANG TRAIN (task cuối)
             if self.training:
@@ -172,6 +172,9 @@ class PiNoise(torch.nn.Linear):
 
     def forward_new(self, hyper_features):
         return self.forward(hyper_features)
+
+
+
 class Attention(nn.Module):
     fused_attn: Final[bool]
 
