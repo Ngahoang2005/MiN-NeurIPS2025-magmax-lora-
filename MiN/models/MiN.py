@@ -309,9 +309,21 @@ class MinNet(object):
                 optimizer.zero_grad(set_to_none=True)
 
                 with autocast('cuda'):
-                    logits_final = self._network.forward_normal_fc(inputs)['logits']
-                    loss = F.cross_entropy(logits_final, targets.long())
-
+                    # --- GIỮ NGUYÊN LOGIC CŨ CỦA BÁC ---
+                    if self.cur_task > 0:
+                        # Kết hợp tri thức Task cũ (Analytic) và Task mới (SGD)
+                        with torch.no_grad():
+                            outputs1 = self._network(inputs, new_forward=False)
+                            logits1 = outputs1['logits']
+                        outputs2 = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits2 = outputs2['logits']
+                        logits_final = logits2 + logits1 # Cộng logits
+                        loss = F.cross_entropy(logits_final, targets.long())
+                    else:
+                        # Task 0 chỉ dùng normal_fc
+                        outputs = self._network.forward_normal_fc(inputs, new_forward=False)
+                        logits_final = outputs["logits"]
+                        loss = F.cross_entropy(logits_final, targets.long())
                 self.scaler.scale(loss).backward()
                 
                 # [QUAN TRỌNG]: Giải nén gradient để project chính xác
