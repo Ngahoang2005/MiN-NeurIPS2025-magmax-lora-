@@ -125,10 +125,17 @@ class PiNoise(torch.nn.Linear):
     def forward(self, hyper_features):
         x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
-        # Gọi trực tiếp vì mu/sigmma giờ là Linear, không phải ModuleList
-        m = self.mu(x_down)
-        s = self.sigmma(x_down)
-        noise = (m + s) @ self.w_up
+        
+        # 1. Tính noise thô (Raw Noise)
+        noise = (self.mu(x_down) + self.sigmma(x_down)) @ self.w_up
+        
+        # 2. Chiếu trực giao (Orthogonal Projection) 768-d
+        if self.basis is not None:
+            # Công thức: noise = noise - noise @ U @ U^T
+            # Giúp triệt tiêu mọi thành phần noise trùng với không gian Task cũ
+            projection = (noise @ self.basis) @ self.basis.t()
+            noise = noise - projection
+            
         return x1 + noise + hyper_features
     def reset_to_base(self):
         """Đưa trọng số về trạng thái 'nguyên thủy' trước khi học Task mới"""

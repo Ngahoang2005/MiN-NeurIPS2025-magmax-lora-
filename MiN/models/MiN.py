@@ -356,38 +356,39 @@ class MinNet(object):
             # [ADDED] Clear cache sau mỗi epoch
             if epoch % 5 == 0:
                 self._clear_gpu()
+    
+    
+    
     def update_subspace(self, train_loader):
         self._network.eval()
         all_features = []
         with torch.no_grad():
-            # Chỉ lấy 1 lượng nhỏ dữ liệu để lấy "mẫu" không gian đặc trưng
             for i, (_, inputs, _) in enumerate(train_loader):
                 if i > 20: break 
-                # Lấy đặc trưng đầu vào của Adapter (x_down)
-                # Bác có thể dùng hook hoặc trích xuất feature tùy kiến trúc
+                # Lấy đặc trưng 768-d trước khi đi vào PiNoise
                 feat = self._network.extract_feature(inputs.to(self.device))
                 all_features.append(feat.cpu())
                 
-        mat = torch.cat(all_features, dim=0).t() # [Dim, N]
-        # SVD để tìm basis
+        mat = torch.cat(all_features, dim=0).t() # [768, N]
         U, S, V = torch.svd(mat)
         
-        # Giữ lại basis đại diện cho 99% phương sai
-        threshold = 0.99
-        s_sq = S.pow(2)
-        energy = torch.cumsum(s_sq, dim=0) / s_sq.sum()
-        k = (energy < threshold).sum().item() + 1
-        new_u = U[:, :k].to(self.device)
+        # Giữ lại 99% phương sai
+        k = (torch.cumsum(S**2, dim=0) / torch.sum(S**2) < 0.99).sum().item() + 1
+        new_basis = U[:, :k].to(self.device)
 
-        # Cập nhật basis cho các layer (Hợp nhất với basis cũ)
         for block in self._network.backbone.noise_maker:
             if block.basis is None:
-                block.basis = new_u
+                block.basis = new_basis
             else:
-                # Concatenate và Orthogonalize để mở rộng subspace
-                combined = torch.cat([block.basis, new_u], dim=1)
+                # Hợp nhất không gian cũ và mới
+                combined = torch.cat([block.basis, new_basis], dim=1)
                 u_comb, _, _ = torch.svd(combined)
-                block.basis = u_comb[:, :min(u_comb.size(1), block.hidden_dim - 1)]
+                # Khóa không gian: không để vượt quá 768
+                block.basis = u_comb[:, :min(u_comb.size(1), 767)]
+        
+        
+    
+    
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
