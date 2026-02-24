@@ -316,7 +316,7 @@ class MinNet(object):
         self._network.to(self.device)
         
         # Lực kéo VIB (Bác có thể chỉnh 1e-4 hoặc 1e-5 tùy thuộc vào độ lớn của Loss)
-        max_beta = 1e-2
+        max_beta = 1e-4
 
         for _, epoch in enumerate(prog_bar):
             losses, ce_losses, kl_losses = 0.0, 0.0, 0.0
