@@ -79,64 +79,62 @@ import math
 
 class PiNoise(torch.nn.Linear):
     def __init__(self, in_dim, out_dim, hidden_dim=384):
-        super(torch.nn.Linear, self).__init__()
-
+        super(torch.nn.Linear, self).__init__() # Giữ nguyên super của bác
         self.bias = None
-
-        self.MLP = nn.Linear(in_dim, out_dim)
-        torch.nn.init.constant_(self.MLP.weight, 0)
-        torch.nn.init.constant_(self.MLP.bias, 0)
-
-        device = torch.device("cuda:{}".format(0))
-        factory_kwargs = {"device": device, "dtype": torch.float}
-
         self.hidden_dim = hidden_dim
 
-        self.w_down = torch.empty((in_dim, self.hidden_dim), **factory_kwargs)
-        self.register_buffer("weight", self.w_down)
+        # 1. Nhánh MLP chính
+        self.MLP = nn.Linear(in_dim, out_dim)
+        torch.nn.init.constant_(self.MLP.weight, 0); torch.nn.init.constant_(self.MLP.bias, 0)
 
-        self.reset_parameters()
+        device = torch.device("cuda:0")
+        factory_kwargs = {"device": device, "dtype": torch.float}
 
-        self.act = nn.GELU()
+        # 2. Các tham số Projection
+        self.w_down = nn.Parameter(torch.empty((in_dim, self.hidden_dim), **factory_kwargs))
+        self.w_up = nn.Parameter(torch.empty((self.hidden_dim, out_dim), **factory_kwargs))
+        nn.init.xavier_uniform_(self.w_down); nn.init.xavier_uniform_(self.w_up)
 
-        self.mu = nn.ModuleList()
-        self.sigmma = nn.ModuleList()
+        # [CHỈNH]: Đổi ModuleList thành Linear đơn (Sequential)
+        self.mu = nn.Linear(self.hidden_dim, self.hidden_dim).to(device)
+        self.sigmma = nn.Linear(self.hidden_dim, self.hidden_dim).to(device)
+        torch.nn.init.constant_(self.mu.weight, 0.); torch.nn.init.constant_(self.mu.bias, 0.)
+        torch.nn.init.constant_(self.sigmma.weight, 0.); torch.nn.init.constant_(self.sigmma.bias, 0.)
 
-        self.w_up = torch.empty((self.hidden_dim, out_dim), **factory_kwargs)
-        self.register_buffer("weight", self.w_up)
-        self.reset_parameters()
-
-        self.weight_noise = None
+        # MagMax: Lưu trọng số ban đầu
         self.base_mu_sd = {k: v.detach().clone() for k, v in self.mu.state_dict().items()}
-        self.base_sigmma_sd = {k: v.detach().clone() for k, v in self.sigmma.state_dict().items()}
-        self.history_tau_mu = []    
-        self.history_tau_sigmma = []
+        self.base_sig_sd = {k: v.detach().clone() for k, v in self.sigmma.state_dict().items()}
+        self.history_tau_mu = []; self.history_tau_sig = []
 
+    def after_task_training(self):
+        """Hàm MagMax chốt sổ sau mỗi task"""
+        t_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}
+        t_sig = {k: self.sigmma.state_dict()[k].detach().cpu() - self.base_sig_sd[k].cpu() for k in self.base_sig_sd.keys()}
+        self.history_tau_mu.append(t_mu); self.history_tau_sig.append(t_sig)
+        
+        def merge(base, hist, layer):
+            merged = {}
+            for k in base.keys():
+                s = torch.stack([h[k] for h in hist], dim=0)
+                best = torch.gather(s, 0, torch.abs(s).argmax(0, keepdim=True)).squeeze(0)
+                merged[k] = base[k].to(layer.weight.device) + best.to(layer.weight.device)
+            return merged
+        self.mu.load_state_dict(merge(self.base_mu_sd, self.history_tau_mu, self.mu))
+        self.sigmma.load_state_dict(merge(self.base_sig_sd, self.history_tau_sig, self.sigmma))
+
+    def forward(self, hyper_features):
+        x1 = self.MLP(hyper_features)
+        x_down = hyper_features @ self.w_down
+        # Gọi trực tiếp vì mu/sigmma giờ là Linear, không phải ModuleList
+        m = self.mu(x_down)
+        s = self.sigmma(x_down)
+        noise = (m + s) @ self.w_up
+        return x1 + noise + hyper_features
     def update_noise(self):
         # Chỉ đơn giản là mở khóa để học đè (Sequential)
         for param in self.mu.parameters(): param.requires_grad = True
         for param in self.sigmma.parameters(): param.requires_grad = True
 
-    def after_task_training(self):
-        """Gọi hàm này sau mỗi Task để merge MagMax"""
-        # 1. Tính Task Vector (Tau = W_current - W_base)
-        t_mu = {k: self.mu.state_dict()[k].detach().cpu() - self.base_mu_sd[k].cpu() for k in self.base_mu_sd.keys()}
-        t_sig = {k: self.sigmma.state_dict()[k].detach().cpu() - self.base_sigmma_sd[k].cpu() for k in self.base_sigmma_sd.keys()}
-        self.history_tau_mu.append(t_mu); self.history_tau_sigmma.append(t_sig)
-        
-        # 2. Merge bằng MagMax
-        def magmax_merge(base_sd, history):
-            merged = {}
-            for k in base_sd.keys():
-                stacked = torch.stack([h[k] for h in history], dim=0)
-                # Lấy giá trị có trị tuyệt đối lớn nhất
-                idx = torch.abs(stacked).argmax(dim=0, keepdim=True)
-                best_tau = torch.gather(stacked, 0, idx).squeeze(0)
-                merged[k] = base_sd[k].to(device="cuda:0") + best_tau.to(device="cuda:0")
-            return merged
-
-        self.mu.load_state_dict(magmax_merge(self.base_mu_sd, self.history_tau_mu))
-        self.sigmma.load_state_dict(magmax_merge(self.base_sigmma_sd, self.history_tau_sigmma))
             
     def unfreeze_noise(self):
 
@@ -145,16 +143,8 @@ class PiNoise(torch.nn.Linear):
         for param in self.sigmma[-1].parameters():
             param.requires_grad = True
 
-    def forward(self, hyper_features):
-        x1 = self.MLP(hyper_features)
-
-        x_down = hyper_features @ self.w_down
-
-        m = self.mu(x_down)
-        s = self.sigmma(x_down)
-        noise = (m + s) @ self.w_up
-        
-        return x1 + noise + hyper_features
+    
+    
     def forward_new(self, hyper_features):
         x1 = self.MLP(hyper_features)
 
