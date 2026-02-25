@@ -402,7 +402,7 @@ class MinNet(object):
                     x = self._network.backbone.noise_maker[j](x)
 
         # Ngưỡng động GPM (Set 0.92 để tối ưu cho 20 Tasks)
-        threshold = min(0.97, 0.92 + self.cur_task * 0.001)
+        threshold = min(0.97, 0.92 + self.cur_task * 0.005)
         info = f"Task {self.cur_task} - GPM Threshold: {threshold:.3f}"
         self.logger.info(info)
 
