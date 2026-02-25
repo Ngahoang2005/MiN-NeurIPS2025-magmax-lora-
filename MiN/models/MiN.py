@@ -372,7 +372,7 @@ class MinNet(object):
     def update_subspace(self, train_loader):
         self._network.eval()
         
-        # Tạo list chứa feature cho từng layer: [layer0_feats, layer1_feats, ...]
+        # Tạo list chứa feature cho từng layer
         num_layers = len(self._network.backbone.noise_maker)
         feats_mid_per_layer = [[] for _ in range(num_layers)]
 
@@ -386,31 +386,32 @@ class MinNet(object):
                 x = self._network.backbone._pos_embed(x)
                 x = self._network.backbone.norm_pre(x)
                 
-                # Cho dữ liệu chạy qua từng layer để lấy đúng x_down của layer đó
+                # =========================================================
+                # SỬA LỖI LOGIC: CHẠY QUA VIT BLOCK TRƯỚC RỒI MỚI LẤY x_down
+                # =========================================================
                 for j, block in enumerate(self._network.backbone.blocks):
-                    hyper_features = x
+                    # 1. Chạy ViT Block TRƯỚC
+                    x = block(x) 
                     
-                    # Tính x_down (đầu vào của mu/sigmma)
+                    # 2. Tính x_down từ output của ViT Block (tức là input của PiNoise)
                     w_down = self._network.backbone.noise_maker[j].w_down
-                    x_down = hyper_features @ w_down
-                    feats_mid_per_layer[j].append(x_down.cpu()) # Lưu vào list của layer j
+                    x_down = x @ w_down 
+                    feats_mid_per_layer[j].append(x_down.detach().cpu()) 
                     
-                    # Chạy qua block để lấy input cho layer tiếp theo
-                    x = self._network.backbone.noise_maker[j](block(x))
+                    # 3. Cuối cùng mới chạy PiNoise
+                    x = self._network.backbone.noise_maker[j](x)
 
-        threshold = min(0.98, 0.92 + self.cur_task * 0.003)
+        # Ngưỡng động GPM (Set 0.92 để tối ưu cho 20 Tasks)
+        threshold = min(0.97, 0.92 + self.cur_task * 0.001)
         info = f"Task {self.cur_task} - GPM Threshold: {threshold:.3f}"
         self.logger.info(info)
 
         for j, block in enumerate(self._network.backbone.noise_maker):
             
-            # =======================================================
-            # ĐOẠN ĐÃ FIX LỖI 3D (Đập bẹp Batch và Sequence Length)
-            # =======================================================
-            concat_feats = torch.cat(feats_mid_per_layer[j], dim=0) # [Batch*20, 197, 192]
-            flattened_feats = concat_feats.view(-1, concat_feats.shape[-1]) # [Batch*20*197, 192]
-            mat = flattened_feats.t().to(self.device) # [192, N] - Giờ .t() thoải mái không lỗi
-            # =======================================================
+            # --- Xử lý 3D thành 2D để không bị lỗi .t() ---
+            concat_feats = torch.cat(feats_mid_per_layer[j], dim=0) # [Batch*N, Seq, 192]
+            flattened_feats = concat_feats.view(-1, concat_feats.shape[-1]) # [(Batch*N*Seq), 192]
+            mat = flattened_feats.t().to(self.device) # [192, N_samples]
             
             if not hasattr(block, 'basis_mid') or block.basis_mid is None:
                 U, S, Vh = torch.linalg.svd(mat, full_matrices=False) 
@@ -439,18 +440,24 @@ class MinNet(object):
                     else:
                         break
                 
+                # --- [Hard Cap] Ép Task mới chỉ được lấy tối đa 8 rank ---
+                MAX_RANK = 8 
+                if r > MAX_RANK:
+                    r = MAX_RANK
+
                 if r == 0:
                     print(f'Layer {j}: Skip Updating GPM (Old basis is enough!)')
                 else:
                     Ui = torch.cat((U_old, U[:, 0:r]), dim=1)
-                    if Ui.shape[1] > block.hidden_dim: # Giới hạn không vượt quá 192
+                    if Ui.shape[1] > block.hidden_dim:
                         block.basis_mid = Ui[:, 0:block.hidden_dim] 
                     else:
                         block.basis_mid = Ui
             
+            # Tính ma trận chiếu P_mat cho việc train
             block.P_mat = block.basis_mid @ block.basis_mid.t()
 
-        # In báo cáo
+        # In báo cáo tổng kết
         print('\n' + '='*50)
         print(f'📊 TỔNG KẾT KHÔNG GIAN GPM (SAU TASK {self.cur_task})')
         print('='*50)
