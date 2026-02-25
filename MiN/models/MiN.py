@@ -388,7 +388,6 @@ class MinNet(object):
                 
                 # Cho dữ liệu chạy qua từng layer để lấy đúng x_down của layer đó
                 for j, block in enumerate(self._network.backbone.blocks):
-                    # Input của layer j
                     hyper_features = x
                     
                     # Tính x_down (đầu vào của mu/sigmma)
@@ -404,8 +403,14 @@ class MinNet(object):
         self.logger.info(info)
 
         for j, block in enumerate(self._network.backbone.noise_maker):
-            # Tính mat riêng cho layer j
-            mat = torch.cat(feats_mid_per_layer[j], dim=0).t().to(self.device) 
+            
+            # =======================================================
+            # ĐOẠN ĐÃ FIX LỖI 3D (Đập bẹp Batch và Sequence Length)
+            # =======================================================
+            concat_feats = torch.cat(feats_mid_per_layer[j], dim=0) # [Batch*20, 197, 192]
+            flattened_feats = concat_feats.view(-1, concat_feats.shape[-1]) # [Batch*20*197, 192]
+            mat = flattened_feats.t().to(self.device) # [192, N] - Giờ .t() thoải mái không lỗi
+            # =======================================================
             
             if not hasattr(block, 'basis_mid') or block.basis_mid is None:
                 U, S, Vh = torch.linalg.svd(mat, full_matrices=False) 
@@ -457,6 +462,7 @@ class MinNet(object):
                 used_percent = (occupied_rank / total_dim) * 100
                 print(f"Layer {j:2d} | Đã dùng: {occupied_rank:3d}/{total_dim} ({used_percent:5.1f}%) | Còn trống: {remaining_rank:3d} rank")
         print('='*50 + '\n')
+    
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
