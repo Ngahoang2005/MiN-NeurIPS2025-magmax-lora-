@@ -398,7 +398,7 @@ class MinNet(object):
                     # Chạy qua block để lấy input cho layer tiếp theo
                     x = self._network.backbone.noise_maker[j](block(x))
 
-        threshold = min(0.99, 0.95 + self.cur_task * 0.003)
+        threshold = min(0.98, 0.92 + self.cur_task * 0.003)
         info = f"Task {self.cur_task} - GPM Threshold: {threshold:.3f}"
         self.logger.info(info)
 
