@@ -126,20 +126,9 @@ class PiNoise(torch.nn.Linear):
         x1 = self.MLP(hyper_features)
         x_down = hyper_features @ self.w_down
         
-        # 1. Tính Noise thô
+        # Để nó tự do, dùng lại mọi tri thức cũ
         noise = (self.mu(x_down) + self.sigmma(x_down)) @ self.w_up
-        
-        # 2. ACTIVATION PROJECTION (Option 1)
-        # Chiếu trực tiếp trên output 768-d trước khi cộng vào x1
-        if hasattr(self, 'basis') and self.basis is not None:
-            # Công thức: h = h - (h @ U) @ U.T
-            # U là basis 768-d
-            #print(f"Raw noise norm: {noise.norm().item()}")
-            proj = (noise @ self.basis) @ self.basis.t()
-            noise = noise - proj
-            #print(f"Projected noise norm: {noise.norm().item()}")
             
-        return x1 + noise + hyper_features
         return x1 + noise + hyper_features
     def reset_to_base(self):
         """Đưa trọng số về trạng thái 'nguyên thủy' trước khi học Task mới"""

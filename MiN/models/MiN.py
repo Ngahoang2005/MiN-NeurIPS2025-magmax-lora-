@@ -329,7 +329,15 @@ class MinNet(object):
                 # [QUAN TRỌNG]: Giải nén gradient để project chính xác
                 self.scaler.unscale_(optimizer) 
                 
-              
+                for block in self._network.backbone.noise_maker:
+                    if hasattr(block, 'P_mat'):
+                        P = block.P_mat # Ma trận vuông [192, 192]
+                        
+                        # Chỉ chiếu mu và sigmma (vì chúng nó là 192-d)
+                        for param in [block.mu.weight, block.sigmma.weight]:
+                            if param.grad is not None:
+                                # grad = grad - grad @ P
+                                param.grad.data -= param.grad.data @ P
 
                 self.scaler.step(optimizer)
                 self.scaler.update()
@@ -363,29 +371,92 @@ class MinNet(object):
     
     def update_subspace(self, train_loader):
         self._network.eval()
-        features = []
+        
+        # Tạo list chứa feature cho từng layer: [layer0_feats, layer1_feats, ...]
+        num_layers = len(self._network.backbone.noise_maker)
+        feats_mid_per_layer = [[] for _ in range(num_layers)]
+
         with torch.no_grad():
             for i, (_, inputs, _) in enumerate(train_loader):
-                if i > 10: break # Lấy mẫu ít thôi cho nhanh
-                # Trích xuất hyper_features (768-d)
-                feat = self._network.extract_feature(inputs.to(self.device))
-                features.append(feat.cpu())
-        
-        X = torch.cat(features, dim=0).t() # [768, N]
-        U, S, V = torch.svd(X)
-        
-        # Lấy Basis đại diện 99% phương sai
-        k = (torch.cumsum(S**2, dim=0) / torch.sum(S**2) < 0.9).sum().item() + 1
-        new_basis = U[:, :k].to(self.device)
+                if i > 20: break
+                x = inputs.to(self.device)
+                
+                # Đi qua Patch Embedding
+                x = self._network.backbone.patch_embed(x)
+                x = self._network.backbone._pos_embed(x)
+                x = self._network.backbone.norm_pre(x)
+                
+                # Cho dữ liệu chạy qua từng layer để lấy đúng x_down của layer đó
+                for j, block in enumerate(self._network.backbone.blocks):
+                    # Input của layer j
+                    hyper_features = x
+                    
+                    # Tính x_down (đầu vào của mu/sigmma)
+                    w_down = self._network.backbone.noise_maker[j].w_down
+                    x_down = hyper_features @ w_down
+                    feats_mid_per_layer[j].append(x_down.cpu()) # Lưu vào list của layer j
+                    
+                    # Chạy qua block để lấy input cho layer tiếp theo
+                    x = self._network.backbone.noise_maker[j](block(x))
 
-        for block in self._network.backbone.noise_maker:
-            if block.basis is None:
-                block.basis = new_basis
+        threshold = min(0.99, 0.95 + self.cur_task * 0.003)
+        info = f"Task {self.cur_task} - GPM Threshold: {threshold:.3f}"
+        self.logger.info(info)
+
+        for j, block in enumerate(self._network.backbone.noise_maker):
+            # Tính mat riêng cho layer j
+            mat = torch.cat(feats_mid_per_layer[j], dim=0).t().to(self.device) 
+            
+            if not hasattr(block, 'basis_mid') or block.basis_mid is None:
+                U, S, Vh = torch.linalg.svd(mat, full_matrices=False) 
+                sval_total = (S**2).sum()
+                sval_ratio = (S**2) / sval_total
+                r = torch.sum(torch.cumsum(sval_ratio, dim=0) < threshold).item()
+                block.basis_mid = U[:, 0:r]
             else:
-                # Hợp nhất không gian cũ và mới
-                block.basis = torch.svd(torch.cat([block.basis, new_basis], dim=1))[0][:, :767]
-        
-    
+                activation = mat
+                U1, S1, Vh1 = torch.linalg.svd(activation, full_matrices=False)
+                sval_total = (S1**2).sum() 
+                
+                U_old = block.basis_mid
+                act_hat = activation - U_old @ (U_old.t() @ activation)
+                
+                U, S, Vh = torch.linalg.svd(act_hat, full_matrices=False)
+                sval_hat = (S**2).sum() 
+                sval_ratio = (S**2) / sval_total
+                accumulated_sval = (sval_total - sval_hat) / sval_total
+                
+                r = 0
+                for ii in range(sval_ratio.shape[0]):
+                    if accumulated_sval < threshold:
+                        accumulated_sval += sval_ratio[ii].item()
+                        r += 1
+                    else:
+                        break
+                
+                if r == 0:
+                    print(f'Layer {j}: Skip Updating GPM (Old basis is enough!)')
+                else:
+                    Ui = torch.cat((U_old, U[:, 0:r]), dim=1)
+                    if Ui.shape[1] > block.hidden_dim: # Giới hạn không vượt quá 192
+                        block.basis_mid = Ui[:, 0:block.hidden_dim] 
+                    else:
+                        block.basis_mid = Ui
+            
+            block.P_mat = block.basis_mid @ block.basis_mid.t()
+
+        # In báo cáo
+        print('\n' + '='*50)
+        print(f'📊 TỔNG KẾT KHÔNG GIAN GPM (SAU TASK {self.cur_task})')
+        print('='*50)
+        for j, block in enumerate(self._network.backbone.noise_maker):
+            if hasattr(block, 'basis_mid') and block.basis_mid is not None:
+                total_dim = block.hidden_dim 
+                occupied_rank = block.basis_mid.shape[1] 
+                remaining_rank = total_dim - occupied_rank 
+                used_percent = (occupied_rank / total_dim) * 100
+                print(f"Layer {j:2d} | Đã dùng: {occupied_rank:3d}/{total_dim} ({used_percent:5.1f}%) | Còn trống: {remaining_rank:3d} rank")
+        print('='*50 + '\n')
     def eval_task(self, test_loader):
         model = self._network.eval()
         pred, label = [], []
